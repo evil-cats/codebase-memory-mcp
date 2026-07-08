@@ -2,9 +2,9 @@
 # build.sh — Clean build of production binary (standard or with UI).
 #
 # Usage:
-#   scripts/build.sh                              # Standard binary
+#   scripts/build.sh                              # Standard binary (version=current branch)
 #   scripts/build.sh --with-ui                    # Binary with embedded UI
-#   scripts/build.sh --version v0.8.0             # With version stamp
+#   scripts/build.sh --version v0.8.0             # Override version stamp
 #   scripts/build.sh --arch x86_64                # Force x86_64 build
 #   scripts/build.sh CC=gcc-14 CXX=g++-14        # Override compiler
 #
@@ -38,6 +38,20 @@ WITH_UI=false
 VERSION=""
 EXTRA_MAKE_ARGS=()
 
+# Resolve the stamp used when --version is omitted.
+detect_default_version() {
+    local ref
+    if ref="$(git symbolic-ref --quiet --short HEAD 2>/dev/null)" && [[ -n "$ref" ]]; then
+        printf '%s\n' "$ref"
+        return
+    fi
+    if ref="$(git rev-parse --short HEAD 2>/dev/null)" && [[ -n "$ref" ]]; then
+        printf '%s\n' "$ref"
+        return
+    fi
+    printf '%s\n' "dev"
+}
+
 prev_arg=""
 for arg in "$@"; do
     # Skip --arch and its value (already handled)
@@ -55,8 +69,12 @@ for arg in "$@"; do
             ;;
         --arch|--arch=*)
             ;; # already handled
-        CC=*|CXX=*)
-            export "${arg}"
+        CC=*)
+            export CC="${arg#CC=}"
+            EXTRA_MAKE_ARGS+=("$arg")
+            ;;
+        CXX=*)
+            export CXX="${arg#CXX=}"
             EXTRA_MAKE_ARGS+=("$arg")
             ;;
         *)
@@ -72,6 +90,10 @@ for arg in "$@"; do
 done
 
 # Version flag
+if [[ -z "$VERSION" ]]; then
+    VERSION="$(detect_default_version)"
+fi
+
 CFLAGS_EXTRA=""
 if [[ -n "$VERSION" ]]; then
     CLEAN_VERSION="${VERSION#v}"
