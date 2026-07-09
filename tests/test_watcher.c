@@ -155,12 +155,28 @@ TEST(watcher_null_safety) {
 
 /* Index callback counter */
 static int index_call_count = 0;
-static int index_callback(const char *name, const char *path, void *ud) {
+static cbm_watcher_index_result_t index_callback(const char *name, const char *path, void *ud) {
     (void)name;
     (void)path;
     (void)ud;
     index_call_count++;
-    return 0;
+    return CBM_WATCHER_INDEX_OK;
+}
+
+typedef struct {
+    int calls;
+    int retry_budget;
+} retry_callback_state_t;
+
+static cbm_watcher_index_result_t retry_then_ok_callback(const char *name, const char *path, void *ud) {
+    (void)name;
+    (void)path;
+    retry_callback_state_t *state = (retry_callback_state_t *)ud;
+    state->calls++;
+    if (state->calls <= state->retry_budget) {
+        return CBM_WATCHER_INDEX_RETRY;
+    }
+    return CBM_WATCHER_INDEX_OK;
 }
 
 TEST(watcher_poll_no_projects) {
@@ -501,6 +517,115 @@ TEST(watcher_detects_git_commit) {
     ASSERT_EQ(index_call_count, 1); /* still 1, no new changes */
 
     /* Cleanup */
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(watcher_retries_head_change_after_index_retry) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_retry_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    retry_callback_state_t retry_state = {.calls = 0, .retry_budget = 1};
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, retry_then_ok_callback, &retry_state);
+
+    cbm_watcher_watch(w, "retry-repo", tmpdir);
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(retry_state.calls, 0);
+
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "world\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m add-world");
+
+    cbm_watcher_touch(w, "retry-repo");
+    int reindexed = cbm_watcher_poll_once(w);
+    ASSERT_EQ(retry_state.calls, 1);
+    ASSERT_EQ(reindexed, 0);
+
+    cbm_watcher_touch(w, "retry-repo");
+    reindexed = cbm_watcher_poll_once(w);
+    ASSERT_EQ(retry_state.calls, 2);
+    ASSERT_EQ(reindexed, 1);
+
+    cbm_watcher_touch(w, "retry-repo");
+    reindexed = cbm_watcher_poll_once(w);
+    ASSERT_EQ(retry_state.calls, 2);
+    ASSERT_EQ(reindexed, 0);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(watcher_reindexes_when_dirty_worktree_returns_clean) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_clean_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+
+    cbm_watcher_watch(w, "clean-repo", tmpdir);
+    index_call_count = 0;
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "dirty\n");
+    }
+    cbm_watcher_touch(w, "clean-repo");
+    int reindexed = cbm_watcher_poll_once(w);
+    ASSERT_EQ(reindexed, 1);
+    ASSERT_EQ(index_call_count, 1);
+
+    if (wt_git(tmpdir, "checkout -- file.txt") != 0) {
+        cbm_watcher_free(w);
+        cbm_store_close(store);
+        th_rmtree(tmpdir);
+        FAIL("git checkout failed");
+    }
+    cbm_watcher_touch(w, "clean-repo");
+    reindexed = cbm_watcher_poll_once(w);
+    ASSERT_EQ(reindexed, 1);
+    ASSERT_EQ(index_call_count, 2);
+
+    cbm_watcher_touch(w, "clean-repo");
+    reindexed = cbm_watcher_poll_once(w);
+    ASSERT_EQ(reindexed, 0);
+    ASSERT_EQ(index_call_count, 2);
+
     cbm_watcher_free(w);
     cbm_store_close(store);
     th_rmtree(tmpdir);
@@ -880,7 +1005,7 @@ TEST(watcher_git_removed_no_crash) {
         th_rmtree(_p);
     }
 
-    /* Poll — should not crash, git_head() and git_is_dirty() fail gracefully */
+    /* Poll — should not crash when git HEAD/status commands fail gracefully */
     cbm_watcher_touch(w, "rmgit-repo");
     cbm_watcher_poll_once(w);
     /* No assertion on index_call_count — behavior is implementation-defined.
@@ -1765,11 +1890,11 @@ TEST(watcher_watch_unwatch_rapid_cycle) {
 static int g_cbdata_value = 42;
 static int *g_cbdata_received = NULL;
 
-static int capture_data_callback(const char *name, const char *path, void *ud) {
+static cbm_watcher_index_result_t capture_data_callback(const char *name, const char *path, void *ud) {
     (void)name;
     (void)path;
     g_cbdata_received = (int *)ud;
-    return 0;
+    return CBM_WATCHER_INDEX_OK;
 }
 
 TEST(watcher_callback_data_passed) {
@@ -1911,6 +2036,8 @@ SUITE(watcher) {
 
     /* Git change detection */
     RUN_TEST(watcher_detects_git_commit);
+    RUN_TEST(watcher_retries_head_change_after_index_retry);
+    RUN_TEST(watcher_reindexes_when_dirty_worktree_returns_clean);
     RUN_TEST(watcher_detects_dirty_worktree);
     RUN_TEST(watcher_detects_new_file);
     RUN_TEST(watcher_no_change_no_reindex);

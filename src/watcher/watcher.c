@@ -23,6 +23,7 @@
 #include "foundation/compat_thread.h"
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
+#include "foundation/sha256.h"
 #include "foundation/str_util.h"
 
 #include <errno.h>
@@ -38,7 +39,9 @@
 typedef struct {
     char *project_name;
     char *root_path;
-    char last_head[CBM_SZ_64]; /* git HEAD hash */
+    char last_head[CBM_SZ_64];                         /* git HEAD hash */
+    char last_status_sig[CBM_SHA256_HEX_LEN + SKIP_ONE];
+    bool last_status_valid;
     bool is_git;               /* false → skip polling */
     bool baseline_done;        /* true after first poll */
     int missing_root_count;    /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
@@ -47,6 +50,14 @@ typedef struct {
     int interval_ms;           /* adaptive poll interval */
     int64_t next_poll_ns;      /* next poll time (monotonic ns) */
 } project_state_t;
+
+typedef struct {
+    char head[CBM_SZ_64];
+    bool head_valid;
+    char status_sig[CBM_SHA256_HEX_LEN + SKIP_ONE];
+    bool status_valid;
+    bool status_dirty;
+} git_snapshot_t;
 
 /* ── Watcher struct ─────────────────────────────────────────────── */
 
@@ -150,35 +161,48 @@ static int git_head(const char *root_path, char *out, size_t out_size) {
     return CBM_NOT_FOUND;
 }
 
-/* Returns true if working tree has changes (modified, untracked, etc.).
- * Also checks submodules via `git submodule foreach` to detect uncommitted
- * changes inside submodules that `git status` alone would not report. */
-static bool git_is_dirty(const char *root_path) {
+static void sha256_digest_to_hex(const uint8_t digest[CBM_SHA256_DIGEST_LEN],
+                                 char out[CBM_SHA256_HEX_LEN + SKIP_ONE]) {
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * PAIR_LEN] = hex[(digest[i] >> 4) & 0x0f];
+        out[i * PAIR_LEN + SKIP_ONE] = hex[digest[i] & 0x0f];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+}
+
+static int hash_command_output(const char *cmd, cbm_sha256_ctx *ctx, bool *saw_output) {
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return CBM_NOT_FOUND;
+    }
+
+    char buf[CBM_SZ_1K];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        *saw_output = true;
+        cbm_sha256_update(ctx, buf, n);
+    }
+    int rc = cbm_pclose(fp);
+    return rc == 0 ? 0 : CBM_NOT_FOUND;
+}
+
+/* Hash git status output so the watcher can recognize when a successfully
+ * indexed dirty tree becomes clean again without storing an unbounded status
+ * buffer in project state. */
+static int git_status_signature(const char *root_path, char out[CBM_SHA256_HEX_LEN + SKIP_ONE],
+                                bool *out_dirty) {
+    cbm_sha256_ctx ctx;
+    cbm_sha256_init(&ctx);
+    bool dirty = false;
+
     char cmd[CBM_SZ_1K];
     snprintf(cmd, sizeof(cmd),
              "git --no-optional-locks -C \"%s\" status --porcelain "
              "--untracked-files=normal 2>%s",
              root_path, WATCHER_NULDEV);
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        return false;
-    }
-
-    char line[CBM_SZ_256];
-    bool dirty = false;
-    if (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len > 0) {
-            dirty = true;
-        }
-    }
-    cbm_pclose(fp);
-
-    if (dirty) {
-        return true;
+    if (hash_command_output(cmd, &ctx, &dirty) != 0) {
+        return CBM_NOT_FOUND;
     }
 
 #if !defined(_WIN32)
@@ -187,27 +211,25 @@ static bool git_is_dirty(const char *root_path) {
      * fallback (Apple Git lacks --recurse-submodules). POSIX-only: foreach takes
      * an inner shell command that cmd.exe cannot pass intact; the parent-repo
      * status check above already covers the common (non-submodule) case. */
+    static const char submodule_sep[] = "\n--submodules--\n";
+    cbm_sha256_update(&ctx, submodule_sep, sizeof(submodule_sep) - SKIP_ONE);
     snprintf(cmd, sizeof(cmd),
-             "git --no-optional-locks -C '%s' submodule foreach --quiet --recursive "
+             "git --no-optional-locks -C \"%s\" submodule foreach --quiet --recursive "
              "'git status --porcelain --untracked-files=normal 2>/dev/null' "
              "2>/dev/null",
              root_path);
-    fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        return false;
+    if (hash_command_output(cmd, &ctx, &dirty) != 0) {
+        return CBM_NOT_FOUND;
     }
-    if (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len > 0) {
-            dirty = true;
-        }
-    }
-    cbm_pclose(fp);
 #endif
-    return dirty;
+
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&ctx, digest);
+    sha256_digest_to_hex(digest, out);
+    if (out_dirty) {
+        *out_dirty = dirty;
+    }
+    return 0;
 }
 
 /* Count tracked files via git ls-files */
@@ -233,6 +255,36 @@ static int git_file_count(const char *root_path) {
     }
     cbm_pclose(fp);
     return count;
+}
+
+static void git_snapshot_capture(const char *root_path, git_snapshot_t *snap) {
+    memset(snap, 0, sizeof(*snap));
+    snap->head_valid = git_head(root_path, snap->head, sizeof(snap->head)) == 0;
+    snap->status_valid = git_status_signature(root_path, snap->status_sig, &snap->status_dirty) == 0;
+}
+
+static void state_mark_indexed(project_state_t *s, const git_snapshot_t *snap) {
+    if (snap->head_valid) {
+        strncpy(s->last_head, snap->head, sizeof(s->last_head) - SKIP_ONE);
+        s->last_head[sizeof(s->last_head) - SKIP_ONE] = '\0';
+    }
+    if (snap->status_valid) {
+        strncpy(s->last_status_sig, snap->status_sig, sizeof(s->last_status_sig) - SKIP_ONE);
+        s->last_status_sig[sizeof(s->last_status_sig) - SKIP_ONE] = '\0';
+        s->last_status_valid = true;
+    }
+}
+
+static void state_mark_baseline(project_state_t *s, const git_snapshot_t *snap) {
+    if (snap->head_valid) {
+        strncpy(s->last_head, snap->head, sizeof(s->last_head) - SKIP_ONE);
+        s->last_head[sizeof(s->last_head) - SKIP_ONE] = '\0';
+    }
+    if (snap->status_valid && !snap->status_dirty) {
+        strncpy(s->last_status_sig, snap->status_sig, sizeof(s->last_status_sig) - SKIP_ONE);
+        s->last_status_sig[sizeof(s->last_status_sig) - SKIP_ONE] = '\0';
+        s->last_status_valid = true;
+    }
 }
 
 /* ── Project state lifecycle ────────────────────────────────────── */
@@ -496,7 +548,9 @@ static void init_baseline(project_state_t *s) {
     s->baseline_done = true;
 
     if (s->is_git) {
-        git_head(s->root_path, s->last_head, sizeof(s->last_head));
+        git_snapshot_t snap;
+        git_snapshot_capture(s->root_path, &snap);
+        state_mark_baseline(s, &snap);
         s->file_count = git_file_count(s->root_path);
         s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "git", "files",
@@ -509,24 +563,28 @@ static void init_baseline(project_state_t *s) {
 }
 
 /* Check if a project has changes. Returns true if reindex needed. */
-static bool check_changes(project_state_t *s) {
+static bool check_changes(project_state_t *s, const git_snapshot_t *snap) {
     if (!s->is_git) {
         return false;
     }
 
-    /* Check HEAD movement */
-    char head[CBM_SZ_64] = {0};
-    if (git_head(s->root_path, head, sizeof(head)) == 0) {
-        if (s->last_head[0] != '\0' && strcmp(head, s->last_head) != 0) {
-            /* HEAD moved — commit, checkout, pull */
-            strncpy(s->last_head, head, sizeof(s->last_head) - 1);
-            return true;
-        }
-        strncpy(s->last_head, head, sizeof(s->last_head) - 1);
+    if (snap->head_valid && (s->last_head[0] == '\0' || strcmp(snap->head, s->last_head) != 0)) {
+        return true;
     }
 
-    /* Check working tree */
-    return git_is_dirty(s->root_path);
+    /* A dirty porcelain line does not change when the same file is edited again,
+     * so dirty trees stay pending on every poll. The signature below is for
+     * clean transitions, especially dirty -> clean after a successful index. */
+    if (snap->status_valid && snap->status_dirty) {
+        return true;
+    }
+
+    if (snap->status_valid &&
+        (!s->last_status_valid || strcmp(snap->status_sig, s->last_status_sig) != 0)) {
+        return true;
+    }
+
+    return false;
 }
 
 /* Context for poll_once foreach callback */
@@ -625,7 +683,9 @@ static void poll_project(const char *key, void *val, void *ud) {
     }
 
     /* Check for changes */
-    bool changed = check_changes(s);
+    git_snapshot_t snap;
+    git_snapshot_capture(s->root_path, &snap);
+    bool changed = check_changes(s, &snap);
     if (!changed) {
         s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
         return;
@@ -634,14 +694,15 @@ static void poll_project(const char *key, void *val, void *ud) {
     /* Trigger reindex */
     cbm_log_info("watcher.changed", "project", s->project_name, "strategy", "git");
     if (ctx->w->index_fn) {
-        int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
-        if (rc == 0) {
+        cbm_watcher_index_result_t rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
+        if (rc == CBM_WATCHER_INDEX_OK) {
             ctx->reindexed++;
-            /* Update HEAD after successful reindex */
-            git_head(s->root_path, s->last_head, sizeof(s->last_head));
+            state_mark_indexed(s, &snap);
             /* Refresh file count for interval */
             s->file_count = git_file_count(s->root_path);
             s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
+        } else if (rc == CBM_WATCHER_INDEX_RETRY) {
+            cbm_log_info("watcher.index.retry", "project", s->project_name);
         } else {
             cbm_log_warn("watcher.index.err", "project", s->project_name);
         }

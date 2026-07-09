@@ -156,19 +156,20 @@ static void *http_thread(void *arg) {
 
 /* ── Index callback for watcher ─────────────────────────────────── */
 
-static int watcher_index_fn(const char *project_name, const char *root_path, void *user_data) {
+static cbm_watcher_index_result_t watcher_index_fn(const char *project_name, const char *root_path,
+                                                   void *user_data) {
     (void)user_data;
 
     /* Skip indexing if shutdown is in progress */
     if (atomic_load(&g_shutdown)) {
-        return 0;
+        return CBM_WATCHER_INDEX_RETRY;
     }
 
     /* Non-blocking: skip if another pipeline is already running.
      * Watcher will retry on next poll cycle (5-60s). */
     if (!cbm_pipeline_try_lock()) {
         cbm_log_info("watcher.skip", "project", project_name, "reason", "pipeline_busy");
-        return 0;
+        return CBM_WATCHER_INDEX_RETRY;
     }
 
     cbm_log_info("watcher.reindex", "project", project_name, "path", root_path);
@@ -185,7 +186,7 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
         if (resp) {
             free(resp);
             cbm_pipeline_unlock();
-            return 0;
+            return CBM_WATCHER_INDEX_OK;
         }
         /* resp == NULL → spawn-failure degrade → fall through to in-process. */
     }
@@ -193,13 +194,13 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
     cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
     if (!p) {
         cbm_pipeline_unlock();
-        return CBM_NOT_FOUND;
+        return CBM_WATCHER_INDEX_ERROR;
     }
 
     int rc = cbm_pipeline_run(p);
     cbm_pipeline_free(p);
     cbm_pipeline_unlock();
-    return rc;
+    return rc == 0 ? CBM_WATCHER_INDEX_OK : CBM_WATCHER_INDEX_ERROR;
 }
 
 /* ── CLI mode ───────────────────────────────────────────────────── */

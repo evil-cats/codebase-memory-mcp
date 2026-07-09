@@ -22,10 +22,18 @@ typedef struct cbm_watcher cbm_watcher_t;
 
 /* ── Index callback ─────────────────────────────────────────────── */
 
-/* Called when file changes are detected. Return 0 on success, -1 on error.
+typedef enum {
+    CBM_WATCHER_INDEX_ERROR = -1,
+    CBM_WATCHER_INDEX_OK = 0,
+    CBM_WATCHER_INDEX_RETRY = 1,
+} cbm_watcher_index_result_t;
+
+/* Called when file changes are detected. Only CBM_WATCHER_INDEX_OK means the
+ * watched git state was successfully indexed and may become the new baseline.
+ * RETRY/ERROR keep the change pending for a later poll.
  * project_name: project identifier
  * root_path: absolute path to the repository root */
-typedef int (*cbm_index_fn)(const char *project_name, const char *root_path, void *user_data);
+typedef cbm_watcher_index_result_t (*cbm_index_fn)(const char *project_name, const char *root_path, void *user_data);
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
