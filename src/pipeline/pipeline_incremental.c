@@ -13,7 +13,6 @@
 
 enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24, INCR_WAL_BUF = 1040 };
 #include "pipeline/pipeline.h"
-#include "pipeline/artifact.h"
 #include <stdio.h>
 #include <time.h>
 #include "pipeline/pipeline_internal.h"
@@ -668,10 +667,7 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
         cbm_store_close(hash_store);
     }
 
-    /* Auto-update artifact if one already exists (persistence was enabled previously) */
-    if (repo_path && cbm_artifact_exists(repo_path)) {
-        cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST);
-    }
+    (void)repo_path;
 }
 
 /* ── Incremental pipeline entry point ────────────────────────────── */
@@ -859,8 +855,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     /* Step 7: Dump to disk (preserves mode-skipped hash rows so the next
      * reindex can correctly classify those files instead of seeing them
-     * as never-existed; also exports a fast-mode artifact when one is
-     * already present alongside the repo). */
+     * as never-existed). */
     /* Record committed counts before dump_and_persist (whose dump frees the
      * gbuf node index, zeroing the count) so the #334 plausibility gate also
      * covers incremental reindexes, not just full ones. */

@@ -632,6 +632,62 @@ TEST(watcher_reindexes_when_dirty_worktree_returns_clean) {
     PASS();
 }
 
+TEST(watcher_retries_dirty_then_clean_after_index_retry) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_dirty_retry_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    retry_callback_state_t retry_state = {.calls = 0, .retry_budget = 1};
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, retry_then_ok_callback, &retry_state);
+
+    cbm_watcher_watch(w, "dirty-retry-repo", tmpdir);
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(retry_state.calls, 0);
+
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "dirty\n");
+    }
+    cbm_watcher_touch(w, "dirty-retry-repo");
+    int reindexed = cbm_watcher_poll_once(w);
+    ASSERT_EQ(retry_state.calls, 1);
+    ASSERT_EQ(reindexed, 0);
+
+    if (wt_git(tmpdir, "checkout -- file.txt") != 0) {
+        cbm_watcher_free(w);
+        cbm_store_close(store);
+        th_rmtree(tmpdir);
+        FAIL("git checkout failed");
+    }
+    cbm_watcher_touch(w, "dirty-retry-repo");
+    reindexed = cbm_watcher_poll_once(w);
+    ASSERT_EQ(retry_state.calls, 2);
+    ASSERT_EQ(reindexed, 1);
+
+    cbm_watcher_touch(w, "dirty-retry-repo");
+    reindexed = cbm_watcher_poll_once(w);
+    ASSERT_EQ(retry_state.calls, 2);
+    ASSERT_EQ(reindexed, 0);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 TEST(watcher_detects_dirty_worktree) {
     /* Create a temporary git repo */
     char tmpdir[256];
@@ -2038,6 +2094,7 @@ SUITE(watcher) {
     RUN_TEST(watcher_detects_git_commit);
     RUN_TEST(watcher_retries_head_change_after_index_retry);
     RUN_TEST(watcher_reindexes_when_dirty_worktree_returns_clean);
+    RUN_TEST(watcher_retries_dirty_then_clean_after_index_retry);
     RUN_TEST(watcher_detects_dirty_worktree);
     RUN_TEST(watcher_detects_new_file);
     RUN_TEST(watcher_no_change_no_reindex);

@@ -4,9 +4,16 @@
 #include "test_framework.h"
 #include "../src/foundation/compat.h" /* cbm_setenv / cbm_unsetenv (Windows-portable) */
 #include "../src/foundation/platform.h"
+#include "../src/foundation/project_write_lock.h"
 #include "../src/foundation/system_info_internal.h"
+#include "test_helpers.h"
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
+
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 
 #ifdef __linux__
 /* Linux-only cgroup tests need stdio for FILE*, stdlib for mkdtemp,
@@ -14,7 +21,6 @@
  * shell-free recursive teardown. */
 #include <dirent.h>
 #include <stdio.h>
-#include <string.h>
 #include <sys/stat.h>
 #endif
 
@@ -304,6 +310,132 @@ TEST(cgroup_no_mem_files) {
 
 #endif /* __linux__ */
 
+typedef struct {
+    char cache[256];
+    char saved_cache[1024];
+    bool had_cache;
+} lock_fixture_t;
+
+static bool lock_fixture_setup(lock_fixture_t *f) {
+    memset(f, 0, sizeof(*f));
+    snprintf(f->cache, sizeof(f->cache), "/tmp/cbm_project_lock_XXXXXX");
+    if (!cbm_mkdtemp(f->cache)) {
+        return false;
+    }
+    f->had_cache =
+        cbm_safe_getenv("CBM_CACHE_DIR", f->saved_cache, sizeof(f->saved_cache), NULL) != NULL;
+    cbm_setenv("CBM_CACHE_DIR", f->cache, 1);
+    return true;
+}
+
+static void lock_fixture_teardown(lock_fixture_t *f) {
+    if (f->had_cache) {
+        cbm_setenv("CBM_CACHE_DIR", f->saved_cache, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(f->cache);
+}
+
+TEST(project_write_lock_same_project_busy) {
+    lock_fixture_t f;
+    ASSERT_TRUE(lock_fixture_setup(&f));
+
+    char err[256];
+    cbm_project_write_lock_t *a = NULL;
+    cbm_project_write_lock_t *b = NULL;
+    ASSERT_EQ(cbm_project_write_lock_try_acquire("same-project", &a, err, sizeof(err)),
+              CBM_PROJECT_WRITE_LOCK_OK);
+    ASSERT_EQ(cbm_project_write_lock_try_acquire("same-project", &b, err, sizeof(err)),
+              CBM_PROJECT_WRITE_LOCK_BUSY);
+    ASSERT_NULL(b);
+    cbm_project_write_lock_release(a);
+
+    ASSERT_EQ(cbm_project_write_lock_try_acquire("same-project", &b, err, sizeof(err)),
+              CBM_PROJECT_WRITE_LOCK_OK);
+    cbm_project_write_lock_release(b);
+    lock_fixture_teardown(&f);
+    PASS();
+}
+
+TEST(project_write_lock_different_projects_independent) {
+    lock_fixture_t f;
+    ASSERT_TRUE(lock_fixture_setup(&f));
+
+    char err[256];
+    cbm_project_write_lock_t *a = NULL;
+    cbm_project_write_lock_t *b = NULL;
+    ASSERT_EQ(cbm_project_write_lock_try_acquire("project-a", &a, err, sizeof(err)),
+              CBM_PROJECT_WRITE_LOCK_OK);
+    ASSERT_EQ(cbm_project_write_lock_try_acquire("project-b", &b, err, sizeof(err)),
+              CBM_PROJECT_WRITE_LOCK_OK);
+    cbm_project_write_lock_release(b);
+    cbm_project_write_lock_release(a);
+    lock_fixture_teardown(&f);
+    PASS();
+}
+
+TEST(project_write_lock_released_when_owner_process_exits) {
+#ifdef _WIN32
+    SKIP_PLATFORM("process-death lock release probe uses POSIX fork");
+#else
+    lock_fixture_t f;
+    ASSERT_TRUE(lock_fixture_setup(&f));
+
+    int ready[2];
+    int done[2];
+    ASSERT_EQ(pipe(ready), 0);
+    ASSERT_EQ(pipe(done), 0);
+
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(ready[0]);
+        close(done[1]);
+        char err[256];
+        cbm_project_write_lock_t *lock = NULL;
+        if (cbm_project_write_lock_try_acquire("dead-owner", &lock, err, sizeof(err)) !=
+            CBM_PROJECT_WRITE_LOCK_OK) {
+            _exit(61);
+        }
+        char ok = '1';
+        (void)write(ready[1], &ok, 1);
+        char stop = 0;
+        (void)read(done[0], &stop, 1);
+        _exit(0); /* намеренно без release: ОС должна освободить lock. */
+    }
+    ASSERT_TRUE(pid > 0);
+    close(ready[1]);
+    close(done[0]);
+
+    char ok = 0;
+    ASSERT_EQ(read(ready[0], &ok, 1), 1);
+    ASSERT_EQ(ok, '1');
+
+    char err[256];
+    cbm_project_write_lock_t *parent_lock = NULL;
+    ASSERT_EQ(cbm_project_write_lock_try_acquire("dead-owner", &parent_lock, err, sizeof(err)),
+              CBM_PROJECT_WRITE_LOCK_BUSY);
+    ASSERT_NULL(parent_lock);
+
+    char stop = 'x';
+    ASSERT_EQ(write(done[1], &stop, 1), 1);
+    int status = 0;
+    ASSERT_EQ(waitpid(pid, &status, 0), pid);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+
+    ASSERT_EQ(cbm_project_write_lock_try_acquire("dead-owner", &parent_lock, err, sizeof(err)),
+              CBM_PROJECT_WRITE_LOCK_OK);
+    cbm_project_write_lock_release(parent_lock);
+
+    close(ready[0]);
+    close(done[1]);
+    lock_fixture_teardown(&f);
+    PASS();
+#endif
+}
+
 SUITE(platform) {
     RUN_TEST(platform_now_ns);
     RUN_TEST(platform_now_ms);
@@ -316,6 +448,9 @@ SUITE(platform) {
     RUN_TEST(platform_default_workers_env_override);
     RUN_TEST(platform_default_workers_env_invalid);
     RUN_TEST(platform_default_workers_env_unset);
+    RUN_TEST(project_write_lock_same_project_busy);
+    RUN_TEST(project_write_lock_different_projects_independent);
+    RUN_TEST(project_write_lock_released_when_owner_process_exits);
 #ifdef __linux__
     RUN_TEST(cgroup_v2_cpu_quota);
     RUN_TEST(cgroup_v2_cpu_quota_rounds_up);

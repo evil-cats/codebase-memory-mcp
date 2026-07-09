@@ -13,6 +13,7 @@
 #include <mcp/index_supervisor.h> /* spawn-count hook — #845 in-process guard */
 #include <mcp/mcp.h>
 #include <pipeline/pipeline.h>
+#include <foundation/project_write_lock.h>
 #include <store/store.h>
 #include <watcher/watcher.h>
 #include <yyjson/yyjson.h>
@@ -78,6 +79,21 @@ static void cleanup_project_db(const char *cache, const char *project) {
     cbm_unlink(path);
     snprintf(path, sizeof(path), "%s/%s.db-shm", cache, project);
     cbm_unlink(path);
+}
+
+static bool make_minimal_source_repo(char *tmp, size_t tmp_sz, const char *prefix) {
+    snprintf(tmp, tmp_sz, "/tmp/%s_XXXXXX", prefix);
+    if (!cbm_mkdtemp(tmp)) {
+        return false;
+    }
+    char src[CBM_SZ_512];
+    snprintf(src, sizeof(src), "%s/main.c", tmp);
+    if (th_write_file(src, "int main(void) { return 0; }\n") != 0) {
+        th_rmtree(tmp);
+        tmp[0] = '\0';
+        return false;
+    }
+    return true;
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -276,6 +292,15 @@ TEST(mcp_index_repository_declares_name_override_issue571) {
     ASSERT_NOT_NULL(strstr(json, "\"index_repository\""));
     ASSERT_NOT_NULL(strstr(json, "\"name\":{\"type\":\"string\""));
     ASSERT_NOT_NULL(strstr(json, "Non-ASCII bytes are encoded"));
+    free(json);
+    PASS();
+}
+
+TEST(mcp_index_repository_schema_omits_persistence) {
+    char *json = cbm_mcp_tools_list();
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "\"index_repository\""));
+    ASSERT_NULL(strstr(json, "\"persistence\""));
     free(json);
     PASS();
 }
@@ -1214,6 +1239,48 @@ TEST(tool_delete_project_not_found) {
     PASS();
 }
 
+TEST(tool_delete_project_lock_busy) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm_mcp_delete_lock_cache_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "delete-lock-project";
+    char db_path[CBM_SZ_512];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    FILE *fp = fopen(db_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fclose(fp);
+
+    char lock_err[CBM_SZ_512];
+    cbm_project_write_lock_t *lock = NULL;
+    ASSERT_EQ(cbm_project_write_lock_try_acquire(project, &lock, lock_err, sizeof(lock_err)),
+              CBM_PROJECT_WRITE_LOCK_OK);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"delete_project\","
+             "\"arguments\":{\"project\":\"delete-lock-project\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(response_contains_json_fragment(resp, "\"status\":\"lock_busy\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    struct stat st;
+    ASSERT_EQ(stat(db_path, &st), 0);
+
+    cbm_project_write_lock_release(lock);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_rmtree(cache);
+    PASS();
+}
+
 TEST(tool_get_architecture_empty) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -1586,6 +1653,142 @@ TEST(tool_index_repository_missing_path) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_index_repository_rejects_legacy_persistence) {
+    char tmp[256];
+    ASSERT_TRUE(make_minimal_source_repo(tmp, sizeof(tmp), "cbm_mcp_persistence"));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char args[700];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"persistence\":true}", tmp);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "unsupported field: persistence"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    char art_dir[CBM_SZ_512];
+    snprintf(art_dir, sizeof(art_dir), "%s/.codebase-memory", tmp);
+    struct stat st;
+    ASSERT_NEQ(stat(art_dir, &st), 0);
+
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(tool_index_repository_lock_busy) {
+    char tmp[256];
+    ASSERT_TRUE(make_minimal_source_repo(tmp, sizeof(tmp), "cbm_mcp_lock_repo"));
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm_mcp_lock_cache_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char *project = cbm_project_name_from_path(tmp);
+    ASSERT_NOT_NULL(project);
+    char lock_err[CBM_SZ_512];
+    cbm_project_write_lock_t *lock = NULL;
+    ASSERT_EQ(cbm_project_write_lock_try_acquire(project, &lock, lock_err, sizeof(lock_err)),
+              CBM_PROJECT_WRITE_LOCK_OK);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[700];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", tmp);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(response_contains_json_fragment(resp, "\"status\":\"lock_busy\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    cbm_project_write_lock_release(lock);
+    free(project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_rmtree(cache);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(tool_index_repository_name_override_uses_lock_key) {
+    char tmp[256];
+    ASSERT_TRUE(make_minimal_source_repo(tmp, sizeof(tmp), "cbm_mcp_lock_name"));
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm_mcp_lock_name_cache_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *override_name = "shared-lock-name";
+    char lock_err[CBM_SZ_512];
+    cbm_project_write_lock_t *lock = NULL;
+    ASSERT_EQ(cbm_project_write_lock_try_acquire(override_name, &lock, lock_err, sizeof(lock_err)),
+              CBM_PROJECT_WRITE_LOCK_OK);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[800];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"%s\",\"mode\":\"fast\"}", tmp,
+             override_name);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(response_contains_json_fragment(resp, "\"status\":\"lock_busy\""));
+    ASSERT_NOT_NULL(strstr(resp, override_name));
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    cbm_project_write_lock_release(lock);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_rmtree(cache);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(tool_index_repository_cross_repo_target_lock_busy) {
+    char tmp[256];
+    ASSERT_TRUE(make_minimal_source_repo(tmp, sizeof(tmp), "cbm_mcp_cross_lock"));
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm_mcp_cross_lock_cache_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *target_project = "target-project";
+    char lock_err[CBM_SZ_512];
+    cbm_project_write_lock_t *lock = NULL;
+    ASSERT_EQ(cbm_project_write_lock_try_acquire(target_project, &lock, lock_err, sizeof(lock_err)),
+              CBM_PROJECT_WRITE_LOCK_OK);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[900];
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"mode\":\"cross-repo-intelligence\","
+             "\"target_projects\":[\"%s\"]}",
+             tmp, target_project);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(response_contains_json_fragment(resp, "\"status\":\"lock_busy\""));
+    ASSERT_NOT_NULL(strstr(resp, target_project));
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    cbm_project_write_lock_release(lock);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_rmtree(cache);
+    th_rmtree(tmp);
     PASS();
 }
 
@@ -2119,6 +2322,53 @@ TEST(tool_manage_adr_unified_backend_issue256) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_manage_adr_update_lock_busy) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm_mcp_adr_lock_cache_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char db_path[CBM_SZ_512];
+    snprintf(db_path, sizeof(db_path), "%s/adr-lock-project.db", cache);
+    cbm_store_t *st = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(st);
+    cbm_store_upsert_project(st, "adr-lock-project", "/tmp/adr-lock-project");
+    cbm_store_close(st);
+
+    char lock_err[CBM_SZ_512];
+    cbm_project_write_lock_t *lock = NULL;
+    ASSERT_EQ(cbm_project_write_lock_try_acquire("adr-lock-project", &lock, lock_err,
+                                                sizeof(lock_err)),
+              CBM_PROJECT_WRITE_LOCK_OK);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":122,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_adr\",\"arguments\":{\"project\":\"adr-lock-project\","
+             "\"mode\":\"update\",\"content\":\"## PURPOSE\\nShould not write.\\n\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(response_contains_json_fragment(resp, "\"status\":\"lock_busy\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    st = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(st);
+    ASSERT_NEQ(cbm_store_adr_get(st, "adr-lock-project", &adr), CBM_STORE_OK);
+    cbm_store_close(st);
+
+    cbm_project_write_lock_release(lock);
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_rmtree(cache);
     PASS();
 }
 
@@ -4992,6 +5242,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_tools_list);
     RUN_TEST(mcp_tools_list_latest_metadata);
     RUN_TEST(mcp_index_repository_declares_name_override_issue571);
+    RUN_TEST(mcp_index_repository_schema_omits_persistence);
     RUN_TEST(mcp_tools_array_schemas_have_items);
     RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);
     RUN_TEST(mcp_get_architecture_aspects_schema_enum_pr560);
@@ -5055,6 +5306,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_distinct_defs_not_over_unioned);
     RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);
     RUN_TEST(tool_delete_project_not_found);
+    RUN_TEST(tool_delete_project_lock_busy);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
     RUN_TEST(tool_get_architecture_overview_compact_subset_pr560);
@@ -5066,6 +5318,10 @@ SUITE(mcp) {
 
     /* Pipeline-dependent tool handlers */
     RUN_TEST(tool_index_repository_missing_path);
+    RUN_TEST(tool_index_repository_rejects_legacy_persistence);
+    RUN_TEST(tool_index_repository_lock_busy);
+    RUN_TEST(tool_index_repository_name_override_uses_lock_key);
+    RUN_TEST(tool_index_repository_cross_repo_target_lock_busy);
     RUN_TEST(tool_get_code_snippet_missing_qn);
     RUN_TEST(tool_get_code_snippet_not_found);
     RUN_TEST(tool_search_code_missing_pattern);
@@ -5081,6 +5337,7 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
     RUN_TEST(tool_manage_adr_unified_backend_issue256);
+    RUN_TEST(tool_manage_adr_update_lock_busy);
     RUN_TEST(tool_index_repository_reports_store_backed_adr);
     RUN_TEST(tool_index_repository_dot_uses_absolute_project_key_and_preserves_adr);
     RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);

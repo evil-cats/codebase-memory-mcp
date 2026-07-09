@@ -695,7 +695,7 @@ static int match_typed_routes(cbm_store_t *src_store, const char *src_project,
 /* ── Collect target projects ─────────────────────────────────────── */
 
 /* When target_projects = ["*"], scan the cache directory for all .db files. */
-static int collect_all_projects(char ***out) {
+int cbm_cross_repo_collect_projects(char ***out) {
     const char *dir = cr_cache_dir();
     cbm_dir_t *d = cbm_opendir(dir);
     if (!d) {
@@ -706,6 +706,11 @@ static int collect_all_projects(char ***out) {
     int cap = CR_INIT_CAP;
     int count = 0;
     char **projects = malloc((size_t)cap * sizeof(char *));
+    if (!projects) {
+        cbm_closedir(d);
+        *out = NULL;
+        return 0;
+    }
 
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
@@ -739,7 +744,7 @@ static int collect_all_projects(char ***out) {
     return count;
 }
 
-static void free_project_list(char **projects, int count) {
+void cbm_cross_repo_free_project_list(char **projects, int count) {
     for (int i = 0; i < count; i++) {
         free(projects[i]);
     }
@@ -771,7 +776,7 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
     bool own_list = false;
 
     if (target_count == SKIP_ONE && strcmp(target_projects[0], "*") == 0) {
-        resolved_count = collect_all_projects(&resolved);
+        resolved_count = cbm_cross_repo_collect_projects(&resolved);
         own_list = true;
     } else {
         resolved = (char **)target_projects;
@@ -821,7 +826,7 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
     cbm_store_close(src_store);
 
     if (own_list) {
-        free_project_list(resolved, resolved_count);
+        cbm_cross_repo_free_project_list(resolved, resolved_count);
     }
 
     struct timespec t1;

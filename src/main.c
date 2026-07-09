@@ -35,6 +35,7 @@ enum {
 #include "foundation/log.h"
 #include "foundation/diagnostics.h"
 #include "foundation/platform.h"
+#include "foundation/project_write_lock.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
@@ -184,8 +185,13 @@ static cbm_watcher_index_result_t watcher_index_fn(const char *project_name, con
     if (cbm_index_supervisor_should_wrap()) {
         char *resp = cbm_mcp_index_run_supervised_path(root_path);
         if (resp) {
+            bool worker_error = cbm_mcp_result_is_error(resp);
+            bool lock_busy = worker_error && strstr(resp, "lock_busy") != NULL;
             free(resp);
             cbm_pipeline_unlock();
+            if (worker_error) {
+                return lock_busy ? CBM_WATCHER_INDEX_RETRY : CBM_WATCHER_INDEX_ERROR;
+            }
             return CBM_WATCHER_INDEX_OK;
         }
         /* resp == NULL → spawn-failure degrade → fall through to in-process. */
@@ -197,7 +203,24 @@ static cbm_watcher_index_result_t watcher_index_fn(const char *project_name, con
         return CBM_WATCHER_INDEX_ERROR;
     }
 
+    cbm_project_write_lock_t *write_lock = NULL;
+    char lock_err[CBM_SZ_512] = "";
+    const char *pipeline_project = cbm_pipeline_project_name(p);
+    cbm_project_write_lock_result_t lock_rc =
+        cbm_project_write_lock_try_acquire(pipeline_project, &write_lock, lock_err, sizeof(lock_err));
+    if (lock_rc != CBM_PROJECT_WRITE_LOCK_OK) {
+        cbm_log_info("watcher.skip", "project", pipeline_project ? pipeline_project : project_name,
+                     "reason",
+                     lock_rc == CBM_PROJECT_WRITE_LOCK_BUSY ? "project_writer_lock_busy"
+                                                            : "project_writer_lock_error");
+        cbm_pipeline_free(p);
+        cbm_pipeline_unlock();
+        return lock_rc == CBM_PROJECT_WRITE_LOCK_BUSY ? CBM_WATCHER_INDEX_RETRY
+                                                      : CBM_WATCHER_INDEX_ERROR;
+    }
+
     int rc = cbm_pipeline_run(p);
+    cbm_project_write_lock_release(write_lock);
     cbm_pipeline_free(p);
     cbm_pipeline_unlock();
     return rc == 0 ? CBM_WATCHER_INDEX_OK : CBM_WATCHER_INDEX_ERROR;

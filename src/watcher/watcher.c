@@ -42,6 +42,7 @@ typedef struct {
     char last_head[CBM_SZ_64];                         /* git HEAD hash */
     char last_status_sig[CBM_SHA256_HEX_LEN + SKIP_ONE];
     bool last_status_valid;
+    bool index_pending;        /* true after a detected change failed/retried indexing */
     bool is_git;               /* false → skip polling */
     bool baseline_done;        /* true after first poll */
     int missing_root_count;    /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
@@ -264,6 +265,7 @@ static void git_snapshot_capture(const char *root_path, git_snapshot_t *snap) {
 }
 
 static void state_mark_indexed(project_state_t *s, const git_snapshot_t *snap) {
+    s->index_pending = false;
     if (snap->head_valid) {
         strncpy(s->last_head, snap->head, sizeof(s->last_head) - SKIP_ONE);
         s->last_head[sizeof(s->last_head) - SKIP_ONE] = '\0';
@@ -276,6 +278,7 @@ static void state_mark_indexed(project_state_t *s, const git_snapshot_t *snap) {
 }
 
 static void state_mark_baseline(project_state_t *s, const git_snapshot_t *snap) {
+    s->index_pending = false;
     if (snap->head_valid) {
         strncpy(s->last_head, snap->head, sizeof(s->last_head) - SKIP_ONE);
         s->last_head[sizeof(s->last_head) - SKIP_ONE] = '\0';
@@ -568,6 +571,10 @@ static bool check_changes(project_state_t *s, const git_snapshot_t *snap) {
         return false;
     }
 
+    if (s->index_pending) {
+        return true;
+    }
+
     if (snap->head_valid && (s->last_head[0] == '\0' || strcmp(snap->head, s->last_head) != 0)) {
         return true;
     }
@@ -702,8 +709,10 @@ static void poll_project(const char *key, void *val, void *ud) {
             s->file_count = git_file_count(s->root_path);
             s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
         } else if (rc == CBM_WATCHER_INDEX_RETRY) {
+            s->index_pending = true;
             cbm_log_info("watcher.index.retry", "project", s->project_name);
         } else {
+            s->index_pending = true;
             cbm_log_warn("watcher.index.err", "project", s->project_name);
         }
     }

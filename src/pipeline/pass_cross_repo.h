@@ -29,4 +29,12 @@ typedef struct {
 cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **target_projects,
                                              int target_count);
 
+/* Собрать project names из cache dir для target_projects=["*"].
+ * Возвращает malloc'd массив malloc'd строк; освобождать через
+ * cbm_cross_repo_free_project_list(). */
+int cbm_cross_repo_collect_projects(char ***out);
+
+/* Освободить список, полученный из cbm_cross_repo_collect_projects(). */
+void cbm_cross_repo_free_project_list(char **projects, int count);
+
 #endif /* CBM_PASS_CROSS_REPO_H */

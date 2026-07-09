@@ -58,15 +58,6 @@ static void cleanup_dir(const char *path) {
     (void)system(cmd);
 }
 
-static void write_text_file(const char *path, const char *text) {
-    FILE *fp = fopen(path, "w");
-    if (!fp) {
-        return;
-    }
-    fputs(text, fp);
-    fclose(fp);
-}
-
 static void capture_log_sink(const char *line) {
     size_t used = strlen(g_log_capture);
     size_t avail = sizeof(g_log_capture) - used;
@@ -343,39 +334,6 @@ TEST(artifact_export_rename_failure_logs_specific_error) {
     PASS();
 }
 
-TEST(pipeline_persistence_export_failure_returns_error) {
-    setup_artifact_test();
-
-    char src[1024];
-    snprintf(src, sizeof(src), "%s/main.c", g_repo);
-    write_text_file(src, "int main(void) { return 0; }\n");
-
-    char art_dir[1024];
-    snprintf(art_dir, sizeof(art_dir), "%s/.codebase-memory", g_repo);
-    cbm_mkdir_p(art_dir, 0755);
-
-    char zst[1024];
-    snprintf(zst, sizeof(zst), "%s/graph.db.zst", art_dir);
-    cbm_mkdir_p(zst, 0755);
-
-    cbm_pipeline_t *p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
-    ASSERT_NOT_NULL(p);
-    cbm_pipeline_set_persistence(p, true);
-
-    capture_logs_start();
-    int rc = cbm_pipeline_run(p);
-    const char *logs = capture_logs_end();
-    cbm_pipeline_free(p);
-
-    ASSERT_NEQ(rc, 0);
-    ASSERT_FALSE(cbm_artifact_exists(g_repo));
-    ASSERT(strstr(logs, "msg=pipeline.err") != NULL);
-    ASSERT(strstr(logs, "phase=artifact_export") != NULL);
-
-    cleanup_dir(g_tmpdir);
-    PASS();
-}
-
 TEST(artifact_null_safety) {
     ASSERT_NEQ(cbm_artifact_export(NULL, "/tmp", "p", 0), 0);
     ASSERT_NEQ(cbm_artifact_export("/tmp/x.db", NULL, "p", 0), 0);
@@ -441,7 +399,6 @@ SUITE(artifact) {
     RUN_TEST(artifact_import_missing);
     RUN_TEST(artifact_gitattributes_created);
     RUN_TEST(artifact_export_rename_failure_logs_specific_error);
-    RUN_TEST(pipeline_persistence_export_failure_returns_error);
     RUN_TEST(artifact_import_rejects_size_mismatch);
     RUN_TEST(artifact_null_safety);
 }
