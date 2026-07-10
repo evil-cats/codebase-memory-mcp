@@ -6,6 +6,7 @@
 #include "lsp/go_lsp.h"
 #include "lsp/c_lsp.h"
 #include "lsp/php_lsp.h"
+#include "lsp/perl_lsp.h"
 #include "lsp/py_lsp.h"
 #include "lsp/ts_lsp.h"
 #include "lsp/cs_lsp.h"
@@ -683,10 +684,168 @@ static void cbm_test_fault_inject(const char *rel_path) {
     }
 }
 
+/* Pre-parse nesting guard for pathologically nested input. tree-sitter's GLR
+ * parser recurses once per nesting level inside stack_node_add_link
+ * (vendored ts_runtime/src/stack.c) while merging ambiguous parse-stack heads.
+ * The Perl grammar is genuinely ambiguous for `f(...)` (function call vs.
+ * bareword), so a deeply nested call chain `f(f(f(...)))` drives that recursion
+ * as deep as the nesting and overflows a small (1 MB Windows) stack *during the
+ * parse* — before any of the LSP walk-depth guards can fire. Unambiguous
+ * grammars (C/Java/Python) keep a single stack head and don't hit this, which is
+ * why only Perl crashed on the Windows/ARM CI runners.
+ *
+ * This is a workaround: the proper fix is bounding the GLR stack-merge recursion
+ * inside the vendored tree-sitter runtime, tracked upstream as #913. Remove this
+ * guard once that lands.
+ *
+ * cbm_source_nesting_exceeds scans the raw bytes for the maximum bracket-nesting
+ * depth and returns true as soon as it passes the cap (early-exit, O(n)). Real
+ * source never nests brackets this deep, so a file that does is skipped as a
+ * parse error (zero edges — graceful degradation, never a crash). Brackets in
+ * strings/comments are counted too: the only consequence of a false positive is
+ * skipping one absurd file, so string-awareness is not worth the cost. */
+#define CBM_PERL_MAX_PARSE_NESTING 128
+
+static bool cbm_source_nesting_exceeds(const char *source, int source_len, int cap) {
+    int depth = 0;
+    for (int i = 0; i < source_len; i++) {
+        char c = source[i];
+        if (c == '(' || c == '[' || c == '{') {
+            if (++depth > cap) {
+                return true;
+            }
+        } else if ((c == ')' || c == ']' || c == '}') && depth > 0) {
+            depth--;
+        }
+    }
+    return false;
+}
+
 static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                                             CBMLanguage language, const char *project,
                                             const char *rel_path, int64_t timeout_micros,
                                             const char **extra_defines, const char **include_paths);
+
+/* Best-effort parse-coverage collection (#963). Walks only the has_error paths
+ * of the tree and records the 1-based line ranges of the TOP-MOST ERROR/MISSING
+ * nodes (does not descend into an error subtree — one range per failed region).
+ * Bounded by CBM_MAX_ERROR_REGIONS so pathological input can't blow up the
+ * output. The ranges mark where constructs were dropped; they are a detection
+ * aid, never a completeness proof. */
+#define CBM_MAX_ERROR_REGIONS 64
+typedef struct {
+    uint32_t starts[CBM_MAX_ERROR_REGIONS];
+    uint32_t ends[CBM_MAX_ERROR_REGIONS];
+    int count;
+} cbm_error_regions_t;
+
+static void cbm_error_regions_push(cbm_error_regions_t *acc, TSNode n) {
+    if (acc->count >= CBM_MAX_ERROR_REGIONS) {
+        return;
+    }
+    acc->starts[acc->count] = ts_node_start_point(n).row + 1;
+    acc->ends[acc->count] = ts_node_end_point(n).row + 1;
+    acc->count++;
+}
+
+static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc) {
+    if (acc->count >= CBM_MAX_ERROR_REGIONS) {
+        return;
+    }
+    uint32_t k = ts_node_child_count(n);
+    for (uint32_t i = 0; i < k && acc->count < CBM_MAX_ERROR_REGIONS; i++) {
+        TSNode c = ts_node_child(n, i);
+        if (ts_node_is_missing(c) || strcmp(ts_node_type(c), "ERROR") == 0) {
+            cbm_error_regions_push(acc, c); /* top-most region; do not descend */
+        } else if (ts_node_has_error(c)) {
+            cbm_collect_error_regions(c, acc);
+        }
+    }
+}
+
+/* Recovery subtraction (#963): tree-sitter error recovery plus the
+ * ERROR-descending def walker often still extract constructs INSIDE a failed
+ * region (verified: a function in an #ifdef-split ERROR region and even a
+ * `def broken(:` both came back as defs). A region whose every line is
+ * covered by definitions that START inside it is definitely recovered — its
+ * constructs ARE in the graph — so flagging it would be a false miss.
+ * Container defs (Module/Package) are ignored: a file-spanning Module node is
+ * not evidence the region's constructs survived. Conservative: partially
+ * covered regions stay flagged. */
+static bool cbm_region_is_recovered(uint32_t rs, uint32_t re, const CBMDefArray *defs) {
+    enum { MAX_COVER_DEFS = 256 };
+    uint32_t starts[MAX_COVER_DEFS];
+    uint32_t ends[MAX_COVER_DEFS];
+    int n = 0;
+    for (int i = 0; i < defs->count && n < MAX_COVER_DEFS; i++) {
+        const CBMDefinition *d = &defs->items[i];
+        if (!d->label || strcmp(d->label, "Module") == 0 || strcmp(d->label, "Package") == 0) {
+            continue;
+        }
+        if (d->start_line < rs || d->start_line > re) {
+            continue; /* recovery evidence must originate inside the region */
+        }
+        starts[n] = d->start_line;
+        ends[n] = d->end_line < d->start_line ? d->start_line : d->end_line;
+        n++;
+    }
+    if (n == 0) {
+        return false;
+    }
+    /* Insertion-sort by start, then sweep for gaps in [rs, re]. */
+    for (int i = 1; i < n; i++) {
+        uint32_t s = starts[i];
+        uint32_t e = ends[i];
+        int j = i - 1;
+        while (j >= 0 && starts[j] > s) {
+            starts[j + 1] = starts[j];
+            ends[j + 1] = ends[j];
+            j--;
+        }
+        starts[j + 1] = s;
+        ends[j + 1] = e;
+    }
+    uint32_t covered_to = rs - 1;
+    for (int i = 0; i < n; i++) {
+        if (starts[i] > covered_to + 1) {
+            return false; /* uncovered gap */
+        }
+        if (ends[i] > covered_to) {
+            covered_to = ends[i];
+        }
+    }
+    return covered_to >= re;
+}
+
+static void cbm_subtract_recovered_regions(cbm_error_regions_t *regs, const CBMDefArray *defs) {
+    int kept = 0;
+    for (int i = 0; i < regs->count; i++) {
+        if (!cbm_region_is_recovered(regs->starts[i], regs->ends[i], defs)) {
+            regs->starts[kept] = regs->starts[i];
+            regs->ends[kept] = regs->ends[i];
+            kept++;
+        }
+    }
+    regs->count = kept;
+}
+
+/* Serialize collected regions as "start-end,start-end,..." into the arena. */
+static const char *cbm_error_ranges_str(CBMArena *a, const cbm_error_regions_t *regs) {
+    if (regs->count <= 0) {
+        return NULL;
+    }
+    enum { RANGE_MAX = 24 }; /* "4294967295-4294967295," */
+    char *buf = (char *)cbm_arena_alloc(a, (size_t)regs->count * RANGE_MAX);
+    if (!buf) {
+        return NULL;
+    }
+    size_t off = 0;
+    for (int i = 0; i < regs->count; i++) {
+        off += (size_t)snprintf(buf + off, RANGE_MAX, "%s%u-%u", i ? "," : "", regs->starts[i],
+                                regs->ends[i]);
+    }
+    return buf;
+}
 
 /* Public entry: run the extraction and journal completion. The DONE mark on
  * every ordinary return (including error/timeout results) tells the crash
@@ -743,6 +902,17 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     if (!ts_lang) {
         result->has_error = true;
         result->error_msg = cbm_arena_strdup(a, "no tree-sitter grammar");
+        return result;
+    }
+
+    // Skip pathologically nested Perl before tree-sitter's recursive GLR stack
+    // merge overflows a small stack during the parse (see
+    // cbm_source_nesting_exceeds). Scoped to Perl: its ambiguous call grammar is
+    // the only one that drives that recursion to the nesting depth.
+    if (language == CBM_LANG_PERL &&
+        cbm_source_nesting_exceeds(source, source_len, CBM_PERL_MAX_PARSE_NESTING)) {
+        result->has_error = true;
+        result->error_msg = cbm_arena_strdup(a, "perl source nesting too deep; skipped");
         return result;
     }
 
@@ -835,6 +1005,9 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         }
         if (language == CBM_LANG_PHP) {
             cbm_run_php_lsp(a, result, source, source_len, root);
+        }
+        if (language == CBM_LANG_PERL) {
+            cbm_run_perl_lsp(a, result, source, source_len, root);
         }
         if (language == CBM_LANG_PYTHON) {
             cbm_run_py_lsp(a, result, source, source_len, root);
@@ -1036,6 +1209,26 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     free(has_guarded);
 
     uint64_t t2 = now_ns();
+
+    /* Best-effort parse-coverage signal (#963): flag files whose tree contains
+     * ERROR/MISSING regions. Computed AFTER extraction so definite recovery is
+     * subtracted first — a region fully re-extracted as definitions is not a
+     * miss, and a fully recovered file is not flagged at all. Detection aid
+     * only: the absence of this flag is NOT a completeness guarantee. */
+    if (ts_node_has_error(root)) {
+        cbm_error_regions_t regs = {{0}, {0}, 0};
+        if (strcmp(ts_node_type(root), "ERROR") == 0) {
+            cbm_error_regions_push(&regs, root); /* whole file unparseable */
+        } else {
+            cbm_collect_error_regions(root, &regs);
+        }
+        cbm_subtract_recovered_regions(&regs, &result->defs);
+        if (regs.count > 0) {
+            result->parse_incomplete = true;
+            result->error_region_count = regs.count;
+            result->error_ranges = cbm_error_ranges_str(a, &regs);
+        }
+    }
 
     result->imports_count = result->imports.count;
 

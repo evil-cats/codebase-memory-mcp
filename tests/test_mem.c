@@ -16,6 +16,7 @@
 #include "cbm.h"
 
 #include <stdatomic.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #include <mimalloc.h>
 #ifndef _WIN32
@@ -402,6 +403,112 @@ TEST(mem_init_second_call_noop) {
     ASSERT_EQ(budget_before, budget_after);
     PASS();
 }
+
+/* ── CBM_MEM_BUDGET_MB budget override (pure resolver) ────────────
+ * cbm_mem_init is one-shot per process, so the override logic lives in the
+ * pure cbm_mem_resolve_budget() helper which we can exercise directly. */
+
+#define CBM_TEST_MB ((size_t)1024 * 1024)
+
+TEST(resolve_budget_no_override_uses_fraction) {
+    /* No env override → ram_fraction × total_ram, source=ram_fraction. */
+    size_t total = 8192 * CBM_TEST_MB;
+    cbm_mem_budget_t r = cbm_mem_resolve_budget(total, 0.5, NULL);
+    ASSERT_EQ(r.budget, 4096 * CBM_TEST_MB);
+    ASSERT_STR_EQ(r.source, "ram_fraction");
+    ASSERT_FALSE(r.clamped);
+    ASSERT_FALSE(r.invalid);
+    ASSERT_EQ(cbm_mem_resolve_budget(total, 0.25, "").budget, 2048 * CBM_TEST_MB);
+    PASS();
+}
+
+TEST(resolve_budget_invalid_fraction_defaults) {
+    /* Out-of-range fractions fall back to the 0.5 default. */
+    size_t total = 8192 * CBM_TEST_MB;
+    ASSERT_EQ(cbm_mem_resolve_budget(total, 0.0, NULL).budget, 4096 * CBM_TEST_MB);
+    ASSERT_EQ(cbm_mem_resolve_budget(total, -1.0, NULL).budget, 4096 * CBM_TEST_MB);
+    ASSERT_EQ(cbm_mem_resolve_budget(total, 1.5, NULL).budget, 4096 * CBM_TEST_MB);
+    PASS();
+}
+
+TEST(resolve_budget_override_wins) {
+    /* The key use case: pin a budget *below* the fraction default. */
+    size_t total = 8192 * CBM_TEST_MB;
+    cbm_mem_budget_t below = cbm_mem_resolve_budget(total, 0.5, "2048");
+    ASSERT_EQ(below.budget, 2048 * CBM_TEST_MB);
+    ASSERT_STR_EQ(below.source, "CBM_MEM_BUDGET_MB");
+    ASSERT_FALSE(below.clamped);
+    ASSERT_FALSE(below.invalid);
+    /* Override above the fraction default is also honored (up to total_ram). */
+    ASSERT_EQ(cbm_mem_resolve_budget(total, 0.5, "6144").budget, 6144 * CBM_TEST_MB);
+    PASS();
+}
+
+TEST(resolve_budget_override_clamped_to_total) {
+    /* Override larger than physical/cgroup RAM clamps to total_ram. */
+    size_t total = 1024 * CBM_TEST_MB;
+    cbm_mem_budget_t r = cbm_mem_resolve_budget(total, 0.5, "100000");
+    ASSERT_EQ(r.budget, total);
+    ASSERT_TRUE(r.clamped);
+    ASSERT_STR_EQ(r.source, "CBM_MEM_BUDGET_MB");
+    PASS();
+}
+
+TEST(resolve_budget_override_when_total_unknown) {
+    /* Detection failed (total_ram == 0): override still yields a usable budget
+     * and is not clamped to zero. */
+    cbm_mem_budget_t r = cbm_mem_resolve_budget(0, 0.5, "512");
+    ASSERT_EQ(r.budget, 512 * CBM_TEST_MB);
+    ASSERT_FALSE(r.clamped);
+    ASSERT_FALSE(r.invalid);
+    PASS();
+}
+
+TEST(resolve_budget_invalid_override_falls_back) {
+    /* Non-numeric, zero, negative, trailing-garbage, and ERANGE-overflow
+     * overrides are all rejected (invalid=true) → fraction budget, source
+     * stays ram_fraction. Strict parse matches src/foundation/limits.c. */
+    size_t total = 8192 * CBM_TEST_MB;
+    size_t fraction_budget = 4096 * CBM_TEST_MB;
+    const char *bad[] = {
+        "abc", "0", "-512", "512MB", "512x", "0x400", "99999999999999999999999999",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        cbm_mem_budget_t r = cbm_mem_resolve_budget(total, 0.5, bad[i]);
+        ASSERT_EQ(r.budget, fraction_budget);
+        ASSERT_TRUE(r.invalid);
+        ASSERT_STR_EQ(r.source, "ram_fraction");
+    }
+    PASS();
+}
+
+/* Abuse guard: a ~2^44 MiB request (14 digits — fits the 31-char env buffer) is
+ * a VALID long long, so it passes the strict parse; the unguarded want_mb × MiB
+ * byte multiply would then overflow size_t and wrap to 0 (0 is not > total_ram,
+ * so a naive clamp misses it), pinning cbm_mem_over_budget() permanently true.
+ * The MiB-space clamp must instead clamp to total_ram. */
+TEST(resolve_budget_override_overflow_clamps_to_total) {
+    size_t total = 2048 * CBM_TEST_MB;
+    /* 2^44 MiB: (size_t)2^44 * (2^20 bytes/MiB) == 2^64 == 0 on wrap. */
+    cbm_mem_budget_t r = cbm_mem_resolve_budget(total, 0.5, "17592186044416");
+    ASSERT_EQ(r.budget, total);
+    ASSERT_TRUE(r.clamped);
+    ASSERT_FALSE(r.invalid);
+    PASS();
+}
+
+/* Abuse guard: RAM detection failed (total_ram == 0, so no clamp target) AND
+ * the request is a valid-but-astronomical value. The multiply must not wrap to
+ * a small budget — cap at SIZE_MAX instead. */
+TEST(resolve_budget_override_overflow_total_unknown_caps) {
+    /* 1e17 MiB: valid long long (< LLONG_MAX) but > SIZE_MAX / MiB. */
+    cbm_mem_budget_t r = cbm_mem_resolve_budget(0, 0.5, "99999999999999999");
+    ASSERT_EQ(r.budget, SIZE_MAX);
+    ASSERT_FALSE(r.invalid);
+    PASS();
+}
+
+#undef CBM_TEST_MB
 
 /* ── Arena integration tests ──────────────────────────────────── */
 
@@ -1049,6 +1156,15 @@ SUITE(mem) {
     RUN_TEST(mem_init_negative_fraction);
     RUN_TEST(mem_init_over_one_fraction);
     RUN_TEST(mem_init_second_call_noop);
+    /* CBM_MEM_BUDGET_MB budget override */
+    RUN_TEST(resolve_budget_no_override_uses_fraction);
+    RUN_TEST(resolve_budget_invalid_fraction_defaults);
+    RUN_TEST(resolve_budget_override_wins);
+    RUN_TEST(resolve_budget_override_clamped_to_total);
+    RUN_TEST(resolve_budget_override_when_total_unknown);
+    RUN_TEST(resolve_budget_invalid_override_falls_back);
+    RUN_TEST(resolve_budget_override_overflow_clamps_to_total);
+    RUN_TEST(resolve_budget_override_overflow_total_unknown_caps);
     /* Arena integration */
     RUN_TEST(arena_alloc_and_destroy);
     RUN_TEST(arena_grow_tracks_sizes);

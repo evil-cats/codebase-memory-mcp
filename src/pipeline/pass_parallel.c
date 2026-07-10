@@ -902,6 +902,14 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             pp_err_add(errs, fi->rel_path, result->error_msg ? result->error_msg : "extract failed",
                        "extract");
             ws->errors++;
+        } else if (result->parse_incomplete) {
+            /* Best-effort parse-coverage signal (#963): the file WAS indexed,
+             * but its tree contains ERROR/MISSING regions whose constructs are
+             * silently absent from the graph. Not a skip — recorded under the
+             * distinct "parse_partial" phase (reason = the line-range list) so
+             * the MCP layer reports it separately from skipped[]. */
+            pp_err_add(errs, fi->rel_path, result->error_ranges ? result->error_ranges : "unknown",
+                       "parse_partial");
         }
 
         /* Create definition nodes in local gbuf */
@@ -2299,6 +2307,20 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
                                   module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
                                   imp_count, false);
+            } else if (cbm_service_pattern_is_global_fetch(call->callee_name)) {
+                /* Native `fetch()` (#856): only the global API once resolution
+                 * has failed to find a local/imported `fetch`. Call the low-level
+                 * emitter directly — emit_service_edge re-derives its own kind
+                 * from res->qualified_name via cbm_service_pattern_match, which
+                 * "fetch" deliberately never matches (mirrors pass_calls.c). */
+                const char *u = call->first_string_arg;
+                if (u && u[0] != '\0' && (u[0] == '/' || strstr(u, "://") != NULL)) {
+                    cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
+                                                 .confidence = PP_HALF_CONF,
+                                                 .strategy = "service_pattern"};
+                    emit_http_async_service_edge(ws->local_edge_buf, source_node, call, &fake_res,
+                                                 CBM_SVC_HTTP, u);
+                }
             }
             continue;
         }
@@ -2384,14 +2406,18 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
 
 /* Resolve throws/raises for one file. */
 static void resolve_file_throws(resolve_ctx_t *rc, resolve_worker_state_t *ws,
-                                CBMFileResult *result, const char *module_qn, const char **imp_keys,
-                                const char **imp_vals, int imp_count) {
+                                CBMFileResult *result, const char *rel, const char *module_qn,
+                                const char **imp_keys, const char **imp_vals, int imp_count) {
     for (int t = 0; t < result->throws.count; t++) {
         CBMThrow *thr = &result->throws.items[t];
         if (!thr->exception_name || !thr->enclosing_func_qn) {
             continue;
         }
-        const cbm_gbuf_node_t *src = cbm_gbuf_find_by_qn(rc->main_gbuf, thr->enclosing_func_qn);
+        /* find_source_node falls back to the per-file File node when the
+         * lookup lands on a shared Folder/Project node (#787, #842) — same
+         * guard resolve_file_calls/usages/rw already use. */
+        const cbm_gbuf_node_t *src =
+            find_source_node(rc->main_gbuf, rc->project_name, rel, thr->enclosing_func_qn);
         if (!src) {
             continue;
         }
@@ -2800,7 +2826,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         /* ── THROWS / RAISES ───────────────────────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_throws(rc, ws, result, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_file_throws(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count);
         atomic_fetch_add_explicit(&rc->time_ns_throws, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
 

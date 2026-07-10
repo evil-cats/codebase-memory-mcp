@@ -164,6 +164,7 @@ extern const TSLanguage *tree_sitter_apex(void);
 extern const TSLanguage *tree_sitter_soql(void);
 extern const TSLanguage *tree_sitter_sosl(void);
 extern const TSLanguage *tree_sitter_pine(void);
+extern const TSLanguage *tree_sitter_mojo(void);
 
 // -- Empty sentinel --
 static const char *empty_types[] = {NULL};
@@ -1596,6 +1597,21 @@ static const char *pine_var_types[] = {"variable_definition_statement",
 static const char *pine_branch_types[] = {"if_statement",     "switch_statement", "for_statement",
                                           "for_in_statement", "while_statement",  NULL};
 static const char *pine_assign_types[] = {"reassignment_statement", NULL};
+static const char *mojo_func_types[] = {"function_definition", NULL};
+static const char *mojo_class_types[] = {"class_definition", "trait_definition", NULL};
+static const char *mojo_module_types[] = {"module", NULL};
+static const char *mojo_call_types[] = {"call", NULL};
+static const char *mojo_import_types[] = {"import_statement", "import_from_statement",
+                                          "future_import_statement", NULL};
+static const char *mojo_branch_types[] = {"if_statement",
+                                          "match_statement",
+                                          "for_statement",
+                                          "while_statement",
+                                          "try_statement",
+                                          "with_statement",
+                                          NULL};
+static const char *mojo_var_types[] = {"assignment", NULL};
+static const char *mojo_assign_types[] = {"assignment", "augmented_assignment", NULL};
 // ==================== SPEC TABLE ====================
 
 static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
@@ -2570,6 +2586,12 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                        pine_module_types, pine_call_types, empty_types, empty_types,
                        pine_branch_types, pine_var_types, pine_assign_types, empty_types, NULL,
                        empty_types, NULL, NULL, tree_sitter_pine, NULL},
+
+    // CBM_LANG_MOJO
+    [CBM_LANG_MOJO] = {CBM_LANG_MOJO, mojo_func_types, mojo_class_types, empty_types,
+                       mojo_module_types, mojo_call_types, mojo_import_types, mojo_import_types,
+                       mojo_branch_types, mojo_var_types, mojo_assign_types, empty_types, NULL,
+                       empty_types, NULL, NULL, tree_sitter_mojo, NULL},
 
 };
 

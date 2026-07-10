@@ -14,9 +14,12 @@
 
 #define MAX_RAM_FRACTION 1.0
 #define DEFAULT_RAM_FRACTION 0.5
+#include <errno.h>
 #include <mimalloc.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -121,6 +124,55 @@ double cbm_mem_ram_fraction_for_total(size_t total_ram_bytes) {
     return RAM_FRACTION_DEFAULT;
 }
 
+cbm_mem_budget_t cbm_mem_resolve_budget(size_t total_ram, double ram_fraction,
+                                        const char *budget_mb) {
+    if (ram_fraction <= 0.0 || ram_fraction > MAX_RAM_FRACTION) {
+        ram_fraction = DEFAULT_RAM_FRACTION;
+    }
+    cbm_mem_budget_t result = {
+        .budget = (size_t)((double)total_ram * ram_fraction),
+        .source = "ram_fraction",
+        .clamped = false,
+        .invalid = false,
+    };
+
+    if (budget_mb == NULL || budget_mb[0] == '\0') {
+        return result; /* no override → fraction-derived budget */
+    }
+
+    /* Strict parse, matching the src/foundation/limits.c convention: reject
+     * trailing garbage (`*end`), overflow (errno==ERANGE), and non-positive
+     * values. This turns a fat-fingered value (e.g. "8GB", or a 20-digit typo)
+     * into a clean fallback-with-warning rather than a silently wrong budget. */
+    errno = 0;
+    char *end = NULL;
+    long long want_mb = strtoll(budget_mb, &end, CBM_DECIMAL_BASE);
+    if (errno != 0 || end == budget_mb || *end != '\0' || want_mb <= 0) {
+        result.invalid = true; /* keep the fraction-derived budget */
+        return result;
+    }
+
+    result.source = "CBM_MEM_BUDGET_MB";
+    size_t want = (size_t)want_mb;
+    if (total_ram > 0) {
+        /* Compare in MiB space so a valid-but-huge request (e.g. 2^44 MiB, which
+         * would overflow the ×MiB byte multiply) clamps cleanly to total_ram. */
+        if (want > total_ram / MB_DIVISOR) {
+            result.budget = total_ram;
+            result.clamped = true;
+        } else {
+            result.budget = want * MB_DIVISOR;
+        }
+    } else if (want > SIZE_MAX / MB_DIVISOR) {
+        /* RAM detection failed (no clamp target) and the request is
+         * astronomically large — cap at SIZE_MAX rather than wrap. */
+        result.budget = SIZE_MAX;
+    } else {
+        result.budget = want * MB_DIVISOR;
+    }
+    return result;
+}
+
 void cbm_mem_init(double ram_fraction) {
     int expected = 0;
     if (!atomic_compare_exchange_strong(&g_initialized, &expected, 1)) {
@@ -150,28 +202,33 @@ void cbm_mem_init(double ram_fraction) {
     /* CBM_MEM_BUDGET_MB env override (memory analogue of CBM_WORKERS).
      * Lets users cap the budget directly without an enclosing cgroup —
      * useful on bare-metal hosts where cgroup memory limits are absent
-     * (#363). Explicit override > implicit RAM/cgroup detection. */
-    char env_buf[CBM_SZ_32];
-    if (cbm_safe_getenv("CBM_MEM_BUDGET_MB", env_buf, sizeof(env_buf), NULL) != NULL) {
-        long mb = strtol(env_buf, NULL, CBM_DECIMAL_BASE);
-        if (mb > 0) {
-            g_budget = (size_t)mb * MB_DIVISOR;
-            char ovr_mb[CBM_SZ_32];
-            snprintf(ovr_mb, sizeof(ovr_mb), "%ld", mb);
-            cbm_log_info("mem.init", "budget_mb", ovr_mb, "source", "CBM_MEM_BUDGET_MB");
-            return;
-        }
-        cbm_log_warn("mem.budget.env.invalid", "value", env_buf, "fallback", "ram_fraction");
-    }
-
+     * (#363). Explicit override > implicit RAM/cgroup detection. The budget
+     * math (fraction default, override, clamp-to-total) lives in the pure,
+     * testable cbm_mem_resolve_budget(); this path only reads the env and
+     * emits the log/warn lines. */
     cbm_system_info_t info = cbm_system_info();
-    g_budget = (size_t)((double)info.total_ram * ram_fraction);
+
+    char env_buf[CBM_SZ_32];
+    const char *env = cbm_safe_getenv("CBM_MEM_BUDGET_MB", env_buf, sizeof(env_buf), NULL);
+    cbm_mem_budget_t resolved = cbm_mem_resolve_budget(info.total_ram, ram_fraction, env);
+    g_budget = resolved.budget;
+
+    /* The resolver is the single source of truth for the parse + clamp; this
+     * path only surfaces its outcome as log lines. */
+    if (resolved.invalid) {
+        cbm_log_warn("mem.budget.env.invalid", "value", env, "fallback", "ram_fraction");
+    } else if (resolved.clamped) {
+        char cap_mb[CBM_SZ_32];
+        snprintf(cap_mb, sizeof(cap_mb), "%zu", info.total_ram / MB_DIVISOR);
+        cbm_log_warn("mem.budget.clamped", "requested_mb", env, "cap_mb", cap_mb);
+    }
 
     char budget_mb[CBM_SZ_32];
     char ram_mb[CBM_SZ_32];
     snprintf(budget_mb, sizeof(budget_mb), "%zu", g_budget / MB_DIVISOR);
     snprintf(ram_mb, sizeof(ram_mb), "%zu", info.total_ram / MB_DIVISOR);
-    cbm_log_info("mem.init", "budget_mb", budget_mb, "total_ram_mb", ram_mb);
+    cbm_log_info("mem.init", "budget_mb", budget_mb, "total_ram_mb", ram_mb, "source",
+                 resolved.source);
 }
 
 size_t cbm_mem_rss(void) {

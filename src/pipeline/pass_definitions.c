@@ -425,6 +425,12 @@ static int create_env_configures_for_file(cbm_pipeline_ctx_t *ctx, const CBMFile
         const cbm_gbuf_node_t *src = NULL;
         if (ea->enclosing_func_qn && ea->enclosing_func_qn[0]) {
             src = cbm_gbuf_find_by_qn(ctx->gbuf, ea->enclosing_func_qn);
+            /* A class-level env access in a directory-module language carries
+             * the DIRECTORY module QN, which hits the shared Folder/Project
+             * node — attribute to this file's File node instead (#787, #842). */
+            if (cbm_pipeline_node_is_dir_container(src)) {
+                src = NULL;
+            }
         }
         if (!src) {
             if (!file_qn) {
@@ -581,6 +587,12 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                                         result->error_msg ? result->error_msg : "extract failed",
                                         "extract");
             errors++;
+        } else if (result->parse_incomplete) {
+            /* Best-effort parse-coverage signal (#963): indexed, but with
+             * ERROR/MISSING regions — see pass_parallel.c (keep in sync). */
+            cbm_pipeline_add_file_error(ctx->pipeline, rel,
+                                        result->error_ranges ? result->error_ranges : "unknown",
+                                        "parse_partial");
         }
 
         /* Create nodes for each definition */

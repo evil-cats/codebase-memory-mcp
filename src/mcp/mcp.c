@@ -331,7 +331,15 @@ static const tool_def_t TOOLS[] = {
      "Index a repository into the knowledge graph. "
      "Special mode 'cross-repo-intelligence': skip extraction, only match Routes/Channels "
      "across projects to create CROSS_HTTP_CALLS/CROSS_ASYNC_CALLS/CROSS_CHANNEL edges. "
-     "Requires target_projects param. Ensure target projects have fresh indexes first.",
+     "Requires target_projects param. Ensure target projects have fresh indexes first. "
+     "COVERAGE: the response reports files that were NOT fully indexed — 'skipped' (not "
+     "indexed at all: oversized/read/parse failures) and 'parse_partial' (indexed, but "
+     "constructs inside the listed line ranges could not be parsed and MAY be missing from "
+     "the graph). Query the persisted signal any time via index_status or "
+     "structurally via query_graph(graph=\"missed\"). Both signals are best-effort: absence "
+     "of a flag is NOT a completeness guarantee; prefer grep inside flagged ranges. "
+     "Separately, 'excluded' + 'not_indexed_files' list what was deliberately NOT indexed "
+     "(gitignore/.cbmignore/skip-lists) — by design, not failures.",
      "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\",\"description\":"
      "\"Path to the repository\"},"
      "\"mode\":{\"type\":\"string\","
@@ -400,9 +408,20 @@ static const tool_def_t TOOLS[] = {
      "no conditionally-guarded base case), param_count and max_access_depth (structure smells). "
      "Find all hot-path candidates in one query, e.g. MATCH (f:Function) WHERE "
      "f.transitive_loop_depth >= 3 OR f.linear_scan_in_loop >= 1 RETURN f.qualified_name, "
-     "f.transitive_loop_depth, f.linear_scan_in_loop ORDER BY f.transitive_loop_depth DESC.",
+     "f.transitive_loop_depth, f.linear_scan_in_loop ORDER BY f.transitive_loop_depth DESC. "
+     "MISSED GRAPH: pass graph=\"missed\" to query the best-effort miss graph instead — the "
+     "file structure of ONLY the files the indexer could NOT fully index (Project → Folder → "
+     "File nodes with CONTAINS_FOLDER/CONTAINS_FILE edges; each File carries kind "
+     "(\"parse_partial\" = indexed but constructs in the flagged line ranges MAY be missing; "
+     "or a skip phase) and detail (the line ranges / reason)). Example: MATCH (f:File) WHERE "
+     "f.kind = \\\"parse_partial\\\" RETURN f.file_path, f.detail. Absence from this graph is "
+     "NOT a completeness guarantee.",
      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Cypher "
-     "query\"},\"project\":{\"type\":\"string\"},\"max_rows\":{\"type\":\"integer\","
+     "query\"},\"project\":{\"type\":\"string\"},"
+     "\"graph\":{\"type\":\"string\",\"enum\":[\"code\",\"missed\"],\"default\":\"code\","
+     "\"description\":\"Which graph to query: the code knowledge graph (default) or the "
+     "missed graph (only files not fully indexed, laid out as their file structure).\"},"
+     "\"max_rows\":{\"type\":\"integer\","
      "\"description\":"
      "\"Optional row limit. Default: unlimited up to a 100k row "
      "ceiling. No offset support — use search_graph for paginated browsing.\"}},"
@@ -432,7 +451,10 @@ static const tool_def_t TOOLS[] = {
     {"get_code_snippet", "Get code snippet",
      "Read source code for a function/class/symbol. IMPORTANT: First call search_graph to find the "
      "exact qualified_name, then pass it here. This is a read tool, not a search tool. Accepts "
-     "full qualified_name (exact match) or short function name (returns suggestions if ambiguous).",
+     "full qualified_name (exact match) or short function name (returns suggestions if ambiguous). "
+     "If the response carries a 'coverage_note', the file was only partially indexed — constructs "
+     "in the noted line ranges may be missing from the graph (best-effort signal); prefer grep "
+     "there and treat the returned source as ground truth.",
      "{\"type\":\"object\",\"properties\":{\"qualified_name\":{\"type\":\"string\",\"description\":"
      "\"Full qualified_name from search_graph, or short function name\"},\"project\":{"
      "\"type\":\"string\"},\"include_neighbors\":{"
@@ -490,7 +512,18 @@ static const tool_def_t TOOLS[] = {
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
      "\"project\"]}"},
 
-    {"index_status", "Index status", "Get the indexing status of a project",
+    {"index_status", "Index status",
+     "Get the indexing status of a project: node/edge counts, root path, git context, and the "
+     "indexing-COVERAGE report — which files the indexer could NOT fully cover (best-effort "
+     "signal): 'parse_partial' files WERE indexed but contain line ranges tree-sitter could not "
+     "parse — constructs there MAY be missing from the graph (some are still recovered); "
+     "'skipped' files were not indexed at all (oversized/read/parse failure). Use this before "
+     "trusting graph completeness on a file: if a file is listed, ALSO grep it (especially the "
+     "flagged ranges). IMPORTANT: absence from these lists is NOT a completeness guarantee — the "
+     "signal only marks what the indexer can detect. For structural queries over the misses use "
+     "query_graph(graph=\"missed\"). The report also carries 'not_indexed' — files/dirs excluded "
+     "BY DESIGN (gitignore/.cbmignore/skip-lists): deliberate and deterministic, not failures; "
+     "change the ignore rules and re-index to include them.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
      "\"project\"]}"},
 
@@ -600,7 +633,10 @@ const char *cbm_mcp_tool_input_schema(const char *tool_name) {
     return NULL;
 }
 
-static int mcp_tools_cursor_offset(const char *params_json) {
+static int mcp_tools_cursor_offset(const char *params_json, bool *has_cursor_out) {
+    if (has_cursor_out) {
+        *has_cursor_out = false;
+    }
     if (!params_json) {
         return 0;
     }
@@ -614,6 +650,9 @@ static int mcp_tools_cursor_offset(const char *params_json) {
     yyjson_val *root = yyjson_doc_get_root(doc);
     yyjson_val *cursor = root ? yyjson_obj_get(root, "cursor") : NULL;
     if (cursor) {
+        if (has_cursor_out) {
+            *has_cursor_out = true;
+        }
         offset = TOOL_COUNT;
         if (yyjson_is_str(cursor)) {
             const char *cursor_str = yyjson_get_str(cursor);
@@ -633,8 +672,12 @@ static int mcp_tools_cursor_offset(const char *params_json) {
 }
 
 static char *cbm_mcp_tools_list_page(const char *params_json) {
-    return cbm_mcp_tools_list_range(mcp_tools_cursor_offset(params_json), MCP_TOOLS_PAGE_SIZE,
-                                    true);
+    bool has_cursor = false;
+    int offset = mcp_tools_cursor_offset(params_json, &has_cursor);
+    if (!has_cursor) {
+        return cbm_mcp_tools_list();
+    }
+    return cbm_mcp_tools_list_range(offset, MCP_TOOLS_PAGE_SIZE, true);
 }
 
 /* Supported protocol versions, newest first. The server picks the newest
@@ -2072,9 +2115,20 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_t *store = resolve_store(srv, project);
     int max_rows = cbm_mcp_get_int_arg(args, "max_rows", 0);
 
+    /* graph="missed" (#963): run the SAME cypher against the derived
+     * miss-graph view (shadow project "<project>::missed") instead of the
+     * code graph — file structure of not-fully-indexed files only. */
+    char *graph_arg = cbm_mcp_get_string_arg(args, "graph");
+    bool missed_graph = graph_arg && strcmp(graph_arg, "missed") == 0;
+    free(graph_arg);
+
     if (!query) {
         free(project);
         return cbm_mcp_text_result("query is required", true);
+    }
+    if (missed_graph && !project) {
+        free(query);
+        return cbm_mcp_text_result("project is required when graph=\"missed\"", true);
     }
     if (!store) {
         char *_err = build_project_list_error("project not found or not indexed");
@@ -2092,8 +2146,15 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         return not_indexed;
     }
 
+    char covproj[CBM_SZ_512];
+    const char *cypher_project = project;
+    if (missed_graph) {
+        cbm_store_coverage_shadow_project(covproj, sizeof(covproj), project);
+        cypher_project = covproj;
+    }
+
     cbm_cypher_result_t result = {0};
-    int rc = cbm_cypher_execute(store, query, project, max_rows, &result);
+    int rc = cbm_cypher_execute(store, query, cypher_project, max_rows, &result);
 
     if (rc < 0) {
         char *err_msg = result.error ? result.error : "query execution failed";
@@ -2145,6 +2206,105 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     return res;
 }
 
+/* Indexing-coverage report (#963), attached to index_status: the best-effort
+ * signal from the separate index_coverage table (coverage is metadata ABOUT
+ * the graph, stored outside it). Full per-project list, capped generously. */
+enum { COVERAGE_FILE_CAP = 500 };
+
+static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_store_t *store,
+                                const char *project) {
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    (void)cbm_store_coverage_get(store, project, &rows, &count);
+
+    yyjson_mut_val *pp_files = yyjson_mut_arr(doc);
+    yyjson_mut_val *sk_files = yyjson_mut_arr(doc);
+    yyjson_mut_val *ni_dirs = yyjson_mut_arr(doc);
+    yyjson_mut_val *ni_files = yyjson_mut_arr(doc);
+    int pp_n = 0;
+    int sk_n = 0;
+    int ni_dir_n = 0;
+    int ni_file_n = 0;
+    for (int i = 0; i < count; i++) {
+        const char *kind = rows[i].kind ? rows[i].kind : "";
+        if (strcmp(kind, "parse_partial") == 0) {
+            if (pp_n < COVERAGE_FILE_CAP) {
+                yyjson_mut_val *fe = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, fe, "path", rows[i].rel_path);
+                yyjson_mut_obj_add_strcpy(doc, fe, "error_ranges",
+                                          rows[i].detail ? rows[i].detail : "");
+                yyjson_mut_arr_add_val(pp_files, fe);
+            }
+            pp_n++;
+        } else if (strcmp(kind, "not_indexed_dir") == 0) {
+            if (ni_dir_n < COVERAGE_FILE_CAP) {
+                yyjson_mut_arr_add_strcpy(doc, ni_dirs, rows[i].rel_path);
+            }
+            ni_dir_n++;
+        } else if (strcmp(kind, "not_indexed_file") == 0) {
+            if (ni_file_n < COVERAGE_FILE_CAP) {
+                yyjson_mut_val *fe = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, fe, "path", rows[i].rel_path);
+                yyjson_mut_obj_add_strcpy(doc, fe, "reason", rows[i].detail ? rows[i].detail : "");
+                yyjson_mut_arr_add_val(ni_files, fe);
+            }
+            ni_file_n++;
+        } else {
+            if (sk_n < COVERAGE_FILE_CAP) {
+                yyjson_mut_val *fe = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, fe, "path", rows[i].rel_path);
+                yyjson_mut_obj_add_strcpy(doc, fe, "reason", rows[i].detail ? rows[i].detail : "");
+                yyjson_mut_obj_add_strcpy(doc, fe, "phase", rows[i].kind ? rows[i].kind : "");
+                yyjson_mut_arr_add_val(sk_files, fe);
+            }
+            sk_n++;
+        }
+    }
+    cbm_store_free_coverage(rows, count);
+
+    yyjson_mut_val *pp = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_val(doc, pp, "files", pp_files);
+    yyjson_mut_obj_add_int(doc, pp, "count", pp_n);
+    yyjson_mut_obj_add_bool(doc, pp, "truncated", pp_n > COVERAGE_FILE_CAP);
+    yyjson_mut_obj_add_val(doc, root, "parse_partial", pp);
+
+    yyjson_mut_val *sk = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_val(doc, sk, "files", sk_files);
+    yyjson_mut_obj_add_int(doc, sk, "count", sk_n);
+    yyjson_mut_obj_add_bool(doc, sk, "truncated", sk_n > COVERAGE_FILE_CAP);
+    yyjson_mut_obj_add_val(doc, root, "skipped", sk);
+
+    /* By-design exclusions (#963 "purposely not indexed"): a deliberate,
+     * deterministic class — NOT a failure and NOT best-effort. Dirs are
+     * exhaustive; per-file entries are capped in discovery (2000) with the
+     * truncation explicit. */
+    yyjson_mut_val *ni = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_val(doc, ni, "dirs", ni_dirs);
+    yyjson_mut_obj_add_int(doc, ni, "dirs_count", ni_dir_n);
+    yyjson_mut_obj_add_val(doc, ni, "files", ni_files);
+    yyjson_mut_obj_add_int(doc, ni, "files_count", ni_file_n);
+    yyjson_mut_obj_add_bool(doc, ni, "truncated",
+                            ni_dir_n > COVERAGE_FILE_CAP || ni_file_n > COVERAGE_FILE_CAP);
+    if (ni_dir_n > 0 || ni_file_n > 0) {
+        yyjson_mut_obj_add_str(doc, ni, "note",
+                               "Purposely not indexed — excluded BY DESIGN via "
+                               "gitignore/.cbmignore/skip-lists (see each file's reason). Not an "
+                               "error: change the ignore rules and re-index to include them.");
+    }
+    yyjson_mut_obj_add_val(doc, root, "not_indexed", ni);
+
+    if (pp_n > 0 || sk_n > 0) {
+        yyjson_mut_obj_add_str(
+            doc, root, "coverage_note",
+            "Best-effort signal, not a completeness guarantee: parse_partial files WERE indexed, "
+            "but constructs inside the listed line ranges (1-based) MAY be missing from the graph "
+            "(tree-sitter error recovery still salvages some). skipped files were not indexed at "
+            "all. Prefer text search (grep) for flagged files/ranges. Files absent from this list "
+            "are NOT guaranteed to be fully indexed. (not_indexed entries are a separate, "
+            "BY-DESIGN class — deliberate ignore rules, not failures.)");
+    }
+}
+
 static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     cbm_store_t *store = resolve_store(srv, project);
@@ -2170,6 +2330,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
             safe_str_free(&proj_info.indexed_at);
             safe_str_free(&proj_info.root_path);
         }
+        add_coverage_report(doc, root, store, project);
         if (nodes == 0) {
             yyjson_mut_obj_add_str(
                 doc, root, "hint",
@@ -3519,36 +3680,136 @@ static void add_excluded_summary(yyjson_mut_doc *doc, yyjson_mut_val *root, char
  * the JSON carries "count" + "truncated" so nothing is silently hidden. */
 enum { INDEX_SKIPPED_FILE_CAP = 50 };
 
+/* Attach the by-design ignored-FILES summary (#963 "purposely not indexed").
+ * Individual files dropped by ignore rules — deliberate, not failures; whole
+ * excluded subtrees are reported separately via "excluded". Always emits
+ * "not_indexed_files_count" (the uncapped total); the list itself is capped
+ * like skipped[] and marked truncated when discovery hit its storage cap. */
+static void add_not_indexed_files_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                          cbm_pipeline_t *p) {
+    cbm_ignored_file_t *ignored = NULL;
+    int stored = 0;
+    int total = 0;
+    cbm_pipeline_get_ignored(p, &ignored, &stored, &total);
+    yyjson_mut_obj_add_int(doc, root, "not_indexed_files_count", total);
+    if (!ignored || stored <= 0) {
+        return;
+    }
+    yyjson_mut_val *ni = yyjson_mut_obj(doc);
+    yyjson_mut_val *files = yyjson_mut_arr(doc);
+    int shown = stored < INDEX_SKIPPED_FILE_CAP ? stored : INDEX_SKIPPED_FILE_CAP;
+    for (int i = 0; i < shown; i++) {
+        yyjson_mut_val *fe = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, fe, "path", ignored[i].rel_path ? ignored[i].rel_path : "");
+        yyjson_mut_obj_add_strcpy(doc, fe, "reason", ignored[i].reason ? ignored[i].reason : "");
+        yyjson_mut_arr_add_val(files, fe);
+    }
+    yyjson_mut_obj_add_val(doc, ni, "files", files);
+    yyjson_mut_obj_add_int(doc, ni, "count", total);
+    yyjson_mut_obj_add_bool(doc, ni, "truncated", total > shown);
+    yyjson_mut_obj_add_str(doc, ni, "note",
+                           "Purposely not indexed — excluded BY DESIGN via "
+                           "gitignore/.cbmignore/skip-lists (see each file's reason). Not an "
+                           "error: change the ignore rules and re-index to include them. Whole "
+                           "excluded subtrees are listed separately under \"excluded\".");
+    yyjson_mut_obj_add_val(doc, root, "not_indexed_files", ni);
+}
+
+/* True when a recorded per-file entry is the parse-partial coverage signal
+ * (#963) rather than a genuine skip. Kept out of skipped[]/skipped_count so
+ * the "skipped" contract (file NOT indexed) stays exact. */
+static bool is_parse_partial(const cbm_file_error_t *e) {
+    return e->phase && strcmp(e->phase, "parse_partial") == 0;
+}
+
 /* Attach a summary of per-file skips (Stage 2 / Track B). Always emits a
  * top-level "skipped_count" (0 on clean runs) so consumers can rely on it.
  * When there are skips, also emits:
  *   "skipped": {"files":[{path,reason,phase}..(<=50)], "count":N, "truncated":bool}
  * and, if a per-run logfile was written, "logfile": "<path>".
  * The run status stays "indexed" — a skipped file is the expected handled
- * outcome, not a failure. errs[] is borrowed (copied into doc). */
+ * outcome, not a failure. errs[] is borrowed (copied into doc) and may contain
+ * parse_partial entries, which are filtered out here (reported separately by
+ * add_parse_partial_summary). */
 static void add_skipped_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                 const cbm_file_error_t *errs, int count, const char *logfile) {
-    yyjson_mut_obj_add_int(doc, root, "skipped_count", count < 0 ? 0 : count);
-    if (!errs || count <= 0) {
+    int skips = 0;
+    for (int i = 0; i < count; i++) {
+        if (!is_parse_partial(&errs[i])) {
+            skips++;
+        }
+    }
+    yyjson_mut_obj_add_int(doc, root, "skipped_count", skips);
+    if (logfile && logfile[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "logfile", logfile);
+    }
+    if (!errs || skips <= 0) {
         return;
     }
     yyjson_mut_val *skipped = yyjson_mut_obj(doc);
     yyjson_mut_val *files = yyjson_mut_arr(doc);
-    int shown = count < INDEX_SKIPPED_FILE_CAP ? count : INDEX_SKIPPED_FILE_CAP;
-    for (int i = 0; i < shown; i++) {
+    int shown = 0;
+    for (int i = 0; i < count && shown < INDEX_SKIPPED_FILE_CAP; i++) {
+        if (is_parse_partial(&errs[i])) {
+            continue;
+        }
         yyjson_mut_val *fe = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_strcpy(doc, fe, "path", errs[i].path ? errs[i].path : "");
         yyjson_mut_obj_add_strcpy(doc, fe, "reason", errs[i].reason ? errs[i].reason : "");
         yyjson_mut_obj_add_strcpy(doc, fe, "phase", errs[i].phase ? errs[i].phase : "");
         yyjson_mut_arr_add_val(files, fe);
+        shown++;
     }
     yyjson_mut_obj_add_val(doc, skipped, "files", files);
-    yyjson_mut_obj_add_int(doc, skipped, "count", count);
-    yyjson_mut_obj_add_bool(doc, skipped, "truncated", count > INDEX_SKIPPED_FILE_CAP);
+    yyjson_mut_obj_add_int(doc, skipped, "count", skips);
+    yyjson_mut_obj_add_bool(doc, skipped, "truncated", skips > INDEX_SKIPPED_FILE_CAP);
     yyjson_mut_obj_add_val(doc, root, "skipped", skipped);
-    if (logfile && logfile[0]) {
-        yyjson_mut_obj_add_strcpy(doc, root, "logfile", logfile);
+}
+
+/* Attach the best-effort parse-coverage summary (#963). Always emits a
+ * top-level "parse_partial_count" (0 on clean runs). When files were flagged:
+ *   "parse_partial": {"files":[{path,error_ranges}..(<=50)], "count":N,
+ *                     "truncated":bool, "note":"..."}
+ * These files WERE indexed — constructs inside the listed 1-based line ranges
+ * are missing from the graph because tree-sitter could not parse them. The
+ * note spells out the best-effort framing: absence from this list is NOT a
+ * completeness guarantee. */
+static void add_parse_partial_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                      const cbm_file_error_t *errs, int count) {
+    int partials = 0;
+    for (int i = 0; i < count; i++) {
+        if (is_parse_partial(&errs[i])) {
+            partials++;
+        }
     }
+    yyjson_mut_obj_add_int(doc, root, "parse_partial_count", partials);
+    if (!errs || partials <= 0) {
+        return;
+    }
+    yyjson_mut_val *pp = yyjson_mut_obj(doc);
+    yyjson_mut_val *files = yyjson_mut_arr(doc);
+    int shown = 0;
+    for (int i = 0; i < count && shown < INDEX_SKIPPED_FILE_CAP; i++) {
+        if (!is_parse_partial(&errs[i])) {
+            continue;
+        }
+        yyjson_mut_val *fe = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, fe, "path", errs[i].path ? errs[i].path : "");
+        yyjson_mut_obj_add_strcpy(doc, fe, "error_ranges", errs[i].reason ? errs[i].reason : "");
+        yyjson_mut_arr_add_val(files, fe);
+        shown++;
+    }
+    yyjson_mut_obj_add_val(doc, pp, "files", files);
+    yyjson_mut_obj_add_int(doc, pp, "count", partials);
+    yyjson_mut_obj_add_bool(doc, pp, "truncated", partials > INDEX_SKIPPED_FILE_CAP);
+    yyjson_mut_obj_add_str(doc, pp, "note",
+                           "Best-effort signal, not a completeness guarantee: these files WERE "
+                           "indexed, but constructs inside the listed line ranges (1-based) could "
+                           "not be parsed and MAY be missing from the graph (tree-sitter error "
+                           "recovery still salvages some). Prefer text search (grep) for those "
+                           "regions. Files absent from this list are NOT guaranteed to be fully "
+                           "indexed. Query the persisted signal via index_status.");
+    yyjson_mut_obj_add_val(doc, root, "parse_partial", pp);
 }
 
 /* Write the FULL (uncapped) skip list to a per-run logfile — ONLY when >=1 file
@@ -3580,8 +3841,15 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
         cbm_log_warn("index.logfile_open_fail", "path", path);
         return false;
     }
-    (void)fprintf(f, "# codebase-memory-mcp index skip report\n");
-    (void)fprintf(f, "# project=%s skipped=%d\n", project ? project : "", count);
+    int partials = 0;
+    for (int i = 0; i < count; i++) {
+        if (is_parse_partial(&errs[i])) {
+            partials++;
+        }
+    }
+    (void)fprintf(f, "# codebase-memory-mcp index coverage report\n");
+    (void)fprintf(f, "# project=%s skipped=%d parse_partial=%d\n", project ? project : "",
+                  count - partials, partials);
     (void)fprintf(f, "# columns: phase\treason\tpath\n");
     for (int i = 0; i < count; i++) {
         (void)fprintf(f, "%s\t%s\t%s\n", errs[i].phase ? errs[i].phase : "",
@@ -3604,6 +3872,8 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
                                           const char *logfile) {
     add_excluded_summary(doc, root, excluded_dirs, excluded_count);
     add_skipped_summary(doc, root, file_errors, file_error_count, logfile);
+    add_parse_partial_summary(doc, root, file_errors, file_error_count);
+    add_not_indexed_files_summary(doc, root, p);
 
     int exp_nodes = -1;
     int exp_edges = -1;
@@ -4333,20 +4603,34 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
  * the search path (attach_result_source) route through it, so a result whose
  * indexed path escapes the project root — via a `..` segment, or a symlink /
  * Windows junction picked up during discovery — is never read back out. */
+/* Canonicalize `path` (resolve symlinks/junctions and `..`) into `out`
+ * (>= CBM_SZ_4K bytes); returns true on success. Isolating the per-OS resolver
+ * keeps cbm_path_within_root's control flow unconditional: the previous `#ifdef`
+ * opened the `if (...) {` brace in one branch and a different one in the other,
+ * sharing a single close brace — legal C, but it splits the function's braces
+ * across preprocessor branches, which defeats source-level tooling that parses
+ * without the preprocessor (and left this function unindexed in the graph). */
+static bool resolve_canonical_path(const char *path, char *out, size_t out_sz) {
+#ifdef _WIN32
+    if (!_fullpath(out, path, out_sz)) {
+        return false;
+    }
+    cbm_normalize_path_sep(out);
+    return true;
+#else
+    (void)out_sz;
+    return realpath(path, out) != NULL;
+#endif
+}
+
 bool cbm_path_within_root(const char *root_path, const char *abs_path) {
     if (!root_path || !abs_path) {
         return false;
     }
     char real_root[CBM_SZ_4K];
     char real_file[CBM_SZ_4K];
-#ifdef _WIN32
-    if (_fullpath(real_root, root_path, sizeof(real_root)) &&
-        _fullpath(real_file, abs_path, sizeof(real_file))) {
-        cbm_normalize_path_sep(real_root);
-        cbm_normalize_path_sep(real_file);
-#else
-    if (realpath(root_path, real_root) && realpath(abs_path, real_file)) {
-#endif
+    if (resolve_canonical_path(root_path, real_root, sizeof(real_root)) &&
+        resolve_canonical_path(abs_path, real_file, sizeof(real_file))) {
         size_t root_len = strlen(real_root);
         if (strncmp(real_file, real_root, root_len) == 0 &&
             (real_file[root_len] == '/' || real_file[root_len] == '\0')) {
@@ -4456,6 +4740,38 @@ static void add_string_array(yyjson_mut_doc *doc, yyjson_mut_val *obj, const cha
     yyjson_mut_obj_add_val(doc, obj, key, arr);
 }
 
+/* get_code_snippet coverage note (#963): if the resolved node's file is
+ * flagged parse_partial, warn that the graph may under-report this file.
+ * Correlated by construction — the result names its file. (An entirely-
+ * skipped file cannot appear here: it has no nodes to resolve a snippet
+ * from.) */
+static void add_snippet_coverage_note(yyjson_mut_doc *doc, yyjson_mut_val *root_obj,
+                                      cbm_store_t *store, const cbm_node_t *node) {
+    if (!node->file_path || !node->file_path[0] || !node->project) {
+        return;
+    }
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    if (cbm_store_coverage_get(store, node->project, &rows, &count) != CBM_STORE_OK) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        if (rows[i].rel_path && strcmp(rows[i].rel_path, node->file_path) == 0 && rows[i].kind &&
+            strcmp(rows[i].kind, "parse_partial") == 0) {
+            char note[CBM_SZ_1K];
+            snprintf(note, sizeof(note),
+                     "This file was only PARTIALLY indexed — line range(s) %s could not be "
+                     "parsed, so constructs there may be missing from the graph (callers/callees "
+                     "and search results can under-report this file). The source above is ground "
+                     "truth. (best-effort signal)",
+                     rows[i].detail && rows[i].detail[0] ? rows[i].detail : "?");
+            yyjson_mut_obj_add_strcpy(doc, root_obj, "coverage_note", note);
+            break;
+        }
+    }
+    cbm_store_free_coverage(rows, count);
+}
+
 static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
                                     const char *match_method, bool include_neighbors,
                                     cbm_node_t *alternatives, int alt_count) {
@@ -4512,6 +4828,8 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     cbm_store_node_degree(store, node->id, &in_deg, &out_deg);
     yyjson_mut_obj_add_int(doc, root_obj, "callers", in_deg);
     yyjson_mut_obj_add_int(doc, root_obj, "callees", out_deg);
+
+    add_snippet_coverage_note(doc, root_obj, store, node);
 
     char **nb_callers = NULL;
     int nb_caller_count = 0;
@@ -4726,8 +5044,9 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
         if (file_pattern) {
             snprintf(
                 cmd, cmd_sz,
-                "powershell -Command \"$pat = Get-Content '%s'; "
-                "Get-Content '%s' | ForEach-Object { Select-String -LiteralPath $_ -Pattern $pat%s "
+                "powershell -Command \"$pat = Get-Content -Encoding UTF8 -LiteralPath '%s'; "
+                "Get-Content -Encoding UTF8 -LiteralPath '%s' | ForEach-Object { Select-String "
+                "-LiteralPath $_ -Pattern $pat%s "
                 "-ErrorAction SilentlyContinue }"
                 " | Where-Object { $_.Path -like '*%s' }"
                 " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
@@ -4735,8 +5054,9 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
         } else {
             snprintf(
                 cmd, cmd_sz,
-                "powershell -Command \"$pat = Get-Content '%s'; "
-                "Get-Content '%s' | ForEach-Object { Select-String -LiteralPath $_ -Pattern $pat%s "
+                "powershell -Command \"$pat = Get-Content -Encoding UTF8 -LiteralPath '%s'; "
+                "Get-Content -Encoding UTF8 -LiteralPath '%s' | ForEach-Object { Select-String "
+                "-LiteralPath $_ -Pattern $pat%s "
                 "-ErrorAction SilentlyContinue }"
                 " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
                 tmpfile, filelist, sm);
@@ -4747,7 +5067,8 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
                 cmd, cmd_sz,
                 "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -Include '%s' -File "
                 "-ErrorAction SilentlyContinue"
-                " | Select-String -Pattern (Get-Content '%s')%s -ErrorAction SilentlyContinue"
+                " | Select-String -Pattern (Get-Content -Encoding UTF8 -LiteralPath '%s')%s "
+                "-ErrorAction SilentlyContinue"
                 " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
                 root_path, file_pattern, tmpfile, sm);
         } else {
@@ -4755,7 +5076,8 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
                 cmd, cmd_sz,
                 "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -File -ErrorAction "
                 "SilentlyContinue"
-                " | Select-String -Pattern (Get-Content '%s')%s -ErrorAction SilentlyContinue"
+                " | Select-String -Pattern (Get-Content -Encoding UTF8 -LiteralPath '%s')%s "
+                "-ErrorAction SilentlyContinue"
                 " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
                 root_path, tmpfile, sm);
         }
