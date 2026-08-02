@@ -1549,6 +1549,15 @@ static int failing_index_callback(const char *name, const char *path, void *ud) 
     return 0;
 }
 
+static int retrying_index_calls = 0;
+static int retrying_index_callback(const char *name, const char *path, void *ud) {
+    (void)name;
+    (void)path;
+    (void)ud;
+    retrying_index_calls++;
+    return retrying_index_calls == 1 ? 1 : 0;
+}
+
 TEST(watcher_failed_reindex_retries_issue937) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_rty_XXXXXX");
@@ -1601,6 +1610,60 @@ TEST(watcher_failed_reindex_retries_issue937) {
     cbm_watcher_touch(w, "rty-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(failing_index_calls, 2);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(watcher_retries_dirty_then_clean_after_index_retry) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_pending_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, retrying_index_callback, NULL);
+
+    cbm_watcher_watch(w, "pending-repo", tmpdir);
+    retrying_index_calls = 0;
+
+    /* Чистый исходный baseline. */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(retrying_index_calls, 0);
+
+    /* Новое грязное состояние обнаружено, но индексация просит повтор. */
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "dirty\n");
+    }
+    cbm_watcher_touch(w, "pending-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(retrying_index_calls, 1);
+
+    /* Дерево вернулось к старому baseline, но незавершённая индексация
+     * всё равно должна быть повторена и успешно закрыта. */
+    wt_git(tmpdir, "checkout -- file.txt");
+    cbm_watcher_touch(w, "pending-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(retrying_index_calls, 2);
+
+    /* После успеха стабильное чистое дерево больше не запускает callback. */
+    cbm_watcher_touch(w, "pending-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(retrying_index_calls, 2);
 
     cbm_watcher_free(w);
     cbm_store_close(store);
@@ -3048,6 +3111,7 @@ SUITE(watcher) {
     RUN_TEST(watcher_no_change_no_reindex);
     RUN_TEST(watcher_dirty_state_reindexes_once_issue937);
     RUN_TEST(watcher_failed_reindex_retries_issue937);
+    RUN_TEST(watcher_retries_dirty_then_clean_after_index_retry);
     RUN_TEST(watcher_multiple_projects);
 
     /* Non-git project */

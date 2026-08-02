@@ -13,8 +13,9 @@
  *   - Last poll time + adaptive interval
  *   - Whether the project is a git repo
  *
- * Baselines are committed only after a successful reindex; busy-skips and
- * failed runs leave them untouched so the change is retried, never lost.
+ * Baseline фиксируется только после успешной переиндексации. Отдельный
+ * pending-флаг сохраняет необходимость повтора после busy-skip или ошибки,
+ * даже если Git-состояние успело вернуться к прежнему baseline.
  *
  * Adaptive interval: 5s base + 1s per 500 files, capped at 60s.
  * Matches the Go watcher's `pollInterval()` logic.
@@ -67,14 +68,15 @@ typedef struct {
     int file_count;             /* approximate, for interval calc */
     int interval_ms;            /* adaptive poll interval */
     int64_t next_poll_ns;       /* next poll time (monotonic ns) */
-    /* Dirty-state signature (#937): a persistently dirty worktree must
-     * reindex once per DISTINCT dirty state, not on every poll. Baselines
-     * are committed only after a SUCCESSFUL reindex (busy-skips and failed
-     * runs retry); check_changes stages its observations in the pending_*
-     * fields. 0 = clean tree. */
+    /* Сигнатура dirty-состояния (#937): неизменное грязное дерево должно
+     * индексироваться один раз, а не на каждом poll. Baseline фиксируется
+     * только после успешной индексации; pending-поля хранят наблюдения,
+     * index_pending — саму обязанность повторить незавершённую попытку.
+     * Нулевая сигнатура означает чистое дерево. */
     uint64_t last_dirty_sig;       /* committed dirty-state signature */
     uint64_t pending_dirty_sig;    /* observed at check time */
     char pending_head[CBM_SZ_128]; /* HEAD observed at check time */
+    bool index_pending;
 } project_state_t;
 
 /* ── Watcher struct ─────────────────────────────────────────────── */
@@ -1092,11 +1094,9 @@ static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
     return true;
 }
 
-/* Check if a project has changes. Returns true if reindex needed.
- * Must NOT mutate the committed baselines (last_head, last_dirty_sig):
- * poll_project commits them only after a SUCCESSFUL reindex so that
- * busy-skips and failed runs retry instead of silently losing the change
- * (#937). Observations are staged in the pending_* fields. */
+/* Проверяет изменения проекта, не меняя зафиксированные baseline.
+ * poll_project фиксирует pending-наблюдения только после успешной индексации.
+ * index_pending удерживает незавершённую попытку независимо от нового снимка. */
 static bool check_changes(cbm_watcher_t *w, project_state_t *s, bool *changed_out) {
     if (!changed_out) {
         return false;
@@ -1106,7 +1106,7 @@ static bool check_changes(cbm_watcher_t *w, project_state_t *s, bool *changed_ou
         return true;
     }
 
-    bool changed = false;
+    bool changed = s->index_pending;
 
     /* Check HEAD movement (commit, checkout, pull) */
     s->pending_head[0] = '\0';
@@ -1310,6 +1310,7 @@ static void poll_project(const char *key, void *val, void *ud) {
                 snprintf(s->last_head, sizeof(s->last_head), "%s", s->pending_head);
             }
             s->last_dirty_sig = s->pending_dirty_sig;
+            s->index_pending = false;
             /* Refresh file count for interval */
             int file_count = 0;
             if (git_file_count(ctx->w, s, &file_count) == WATCHER_GIT_OK) {
@@ -1318,8 +1319,10 @@ static void poll_project(const char *key, void *val, void *ud) {
             }
         } else if (rc > 0) {
             /* Busy-skip: baseline stays uncommitted, next poll retries. */
+            s->index_pending = true;
             cbm_log_info("watcher.index.retry", "project", s->project_name);
         } else {
+            s->index_pending = true;
             cbm_log_warn("watcher.index.err", "project", s->project_name);
         }
     }
