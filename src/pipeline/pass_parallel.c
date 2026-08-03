@@ -535,7 +535,7 @@ static int build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, co
     *out_vals = NULL;
     *out_count = 0;
 
-    char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
+    char *file_qn = cbm_pipeline_fqn_compute(rel_path, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(gbuf, file_qn);
     free(file_qn);
     if (!file_node) {
@@ -1054,7 +1054,7 @@ static void merge_pkg_entries(cbm_pipeline_ctx_t *ctx, cbm_pkg_entries_t *pkg_en
      * IGNORED_JSON_FILES) still feed pkgmap. Append into worker 0's
      * array so the existing merge below sees them. */
     cbm_pkgmap_scan_repo(ctx->repo_path, &pkg_entries[0], ctx->excluded_dirs, ctx->excluded_count);
-    cbm_pipeline_set_pkgmap(cbm_pkgmap_build(pkg_entries, worker_count, ctx->project_name));
+    cbm_pipeline_set_pkgmap(cbm_pkgmap_build(pkg_entries, worker_count));
     for (int i = 0; i < worker_count; i++) {
         cbm_pkg_entries_free(&pkg_entries[i]);
     }
@@ -1263,7 +1263,7 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
         cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
         (*reg_entries)++;
     }
-    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+    char *file_qn = cbm_pipeline_fqn_compute(rel, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
     const cbm_gbuf_node_t *def_node = cbm_gbuf_find_by_qn(ctx->gbuf, def->qualified_name);
     if (file_node && def_node) {
@@ -1284,7 +1284,7 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
 static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                 const char *rel, CBMHashTable *namespace_map) {
     int count = 0;
-    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+    char *file_qn = cbm_pipeline_fqn_compute(rel, "__file__");
     const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
     if (!source_node) {
         free(file_qn);
@@ -1318,7 +1318,7 @@ static const cbm_gbuf_node_t *find_channel_src(cbm_pipeline_ctx_t *ctx, const CB
         node = cbm_gbuf_find_by_qn(ctx->gbuf, ch->enclosing_func_qn);
     }
     if (!node) {
-        char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+        char *file_qn = cbm_pipeline_fqn_compute(rel, "__file__");
         node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
         free(file_qn);
     }
@@ -1371,8 +1371,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             rels[i] = files[i].rel_path;
         }
     }
-    CBMHashTable *namespace_map =
-        cbm_pipeline_namespace_map_build(ctx->project_name, result_cache, rels, file_count);
+    CBMHashTable *namespace_map = cbm_pipeline_namespace_map_build(result_cache, rels, file_count);
     free(rels);
 
     for (int i = 0; i < file_count; i++) {
@@ -2100,11 +2099,11 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
     detect_url_in_args(gbuf, source, call);
 }
 
-/* Find the source node for an edge: enclosing function or file node. */
-static const cbm_gbuf_node_t *find_source_node(const cbm_gbuf_t *gbuf, const char *project,
-                                               const char *rel, const char *enclosing_qn) {
+/* Находит исходный узел ребра: содержащую функцию либо файл. */
+static const cbm_gbuf_node_t *find_source_node(const cbm_gbuf_t *gbuf, const char *rel,
+                                               const char *enclosing_qn) {
     const cbm_gbuf_node_t *src = NULL;
-    if (enclosing_qn) {
+    if (enclosing_qn && enclosing_qn[0]) {
         src = cbm_gbuf_find_by_qn(gbuf, enclosing_qn);
         /* A class-level reference in a directory-module language carries the
          * DIRECTORY module QN, which hits the shared Folder/Project node —
@@ -2114,7 +2113,7 @@ static const cbm_gbuf_node_t *find_source_node(const cbm_gbuf_t *gbuf, const cha
         }
     }
     if (!src) {
-        char *file_qn = cbm_pipeline_fqn_compute(project, rel, "__file__");
+        char *file_qn = cbm_pipeline_fqn_compute(rel, "__file__");
         src = cbm_gbuf_find_by_qn(gbuf, file_qn);
         free(file_qn);
     }
@@ -2234,7 +2233,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
         uint64_t _rc_t0 = extract_now_ns();
         const cbm_gbuf_node_t *source_node =
-            find_source_node(rc->main_gbuf, rc->project_name, rel, call->enclosing_func_qn);
+            find_source_node(rc->main_gbuf, rel, call->enclosing_func_qn);
         atomic_fetch_add_explicit(&rc->time_ns_rc_source, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         if (!source_node) {
@@ -2272,11 +2271,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         _rc_t0 = extract_now_ns();
         const cbm_gbuf_node_t *lsp_target = NULL;
         if (lsp) {
-            /* Canonicalise to the gbuf node's QN so res.qualified_name matches
-             * the gbuf even when the cross-file fallback had to prefix the
-             * project name. */
-            lsp_target = cbm_pipeline_lsp_target_node(rc->main_gbuf, rc->project_name,
-                                                      lsp->callee_qn, allow_tail);
+            /* Канонизируем результат по локальному QN узла в основном буфере. */
+            lsp_target = cbm_pipeline_lsp_target_node(rc->main_gbuf, lsp->callee_qn, allow_tail);
             if (lsp_target) {
                 res.qualified_name = lsp_target->qualified_name;
                 res.strategy = lsp->strategy ? lsp->strategy : "lsp_override";
@@ -2443,8 +2439,7 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!usage->ref_name) {
             continue;
         }
-        const cbm_gbuf_node_t *src =
-            find_source_node(rc->main_gbuf, rc->project_name, rel, usage->enclosing_func_qn);
+        const cbm_gbuf_node_t *src = find_source_node(rc->main_gbuf, rel, usage->enclosing_func_qn);
         if (!src) {
             continue;
         }
@@ -2478,8 +2473,7 @@ static void resolve_file_throws(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         /* find_source_node falls back to the per-file File node when the
          * lookup lands on a shared Folder/Project node (#787, #842) — same
          * guard resolve_file_calls/usages/rw already use. */
-        const cbm_gbuf_node_t *src =
-            find_source_node(rc->main_gbuf, rc->project_name, rel, thr->enclosing_func_qn);
+        const cbm_gbuf_node_t *src = find_source_node(rc->main_gbuf, rel, thr->enclosing_func_qn);
         if (!src) {
             continue;
         }
@@ -2506,8 +2500,7 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         if (!rw->var_name) {
             continue;
         }
-        const cbm_gbuf_node_t *src =
-            find_source_node(rc->main_gbuf, rc->project_name, rel, rw->enclosing_func_qn);
+        const cbm_gbuf_node_t *src = find_source_node(rc->main_gbuf, rel, rw->enclosing_func_qn);
         if (!src) {
             continue;
         }
@@ -2795,8 +2788,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
          * 98.7% hot spot in resolve_file_calls (881 of 893s CPU). */
         cbm_registry_resolve_cache_begin(result->calls.count + result->usages.count + 64);
 
-        char *module_qn =
-            cbm_pipeline_fqn_module_dir(rc->project_name, rel, pp_module_is_dir(lang));
+        char *module_qn = cbm_pipeline_fqn_module_dir(rel, pp_module_is_dir(lang));
 
         /* ── Cross-file LSP (FUSED) ─────────────────────────────
          * Runs BEFORE resolve_file_calls so its additions to

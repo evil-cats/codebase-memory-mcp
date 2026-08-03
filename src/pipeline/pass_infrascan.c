@@ -1209,9 +1209,8 @@ int cbm_parse_terraform_source(const char *source, cbm_terraform_result_t *out) 
 
 /* ── Infra QN helper ────────────────────────────────────────────── */
 
-char *cbm_infra_qn(const char *project_name, const char *rel_path, const char *infra_type,
-                   const char *service_name) {
-    char *base = cbm_pipeline_fqn_compute(project_name, rel_path, "");
+char *cbm_infra_qn(const char *rel_path, const char *infra_type, const char *service_name) {
+    char *base = cbm_pipeline_fqn_compute(rel_path, "");
     if (!base) {
         return NULL;
     }

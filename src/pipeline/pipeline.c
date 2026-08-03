@@ -187,7 +187,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->db_path = db_path ? strdup(db_path) : NULL;
     p->project_name = cbm_project_name_from_path(repo_path);
     (void)cbm_git_context_resolve(repo_path, &p->git_ctx);
-    p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
+    p->branch_qn = cbm_git_context_branch_qn(&p->git_ctx);
     p->mode = mode;
     p->persistence = false;
     p->committed_nodes = -1;
@@ -221,7 +221,7 @@ bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
     free(p->project_name);
     p->project_name = normalized;
     free(p->branch_qn);
-    p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
+    p->branch_qn = cbm_git_context_branch_qn(&p->git_ctx);
     return true;
 }
 
@@ -460,7 +460,7 @@ static void create_folder_chain(cbm_pipeline_t *p, const char *dir, CBMHashTable
     char *walk = strdup(dir);
     while (walk[0] != '\0' && !cbm_ht_get(seen_dirs, walk)) {
         cbm_ht_set(seen_dirs, strdup(walk), intptr_to_ptr(SKIP_ONE));
-        char *folder_qn = cbm_pipeline_fqn_folder(p->project_name, walk);
+        char *folder_qn = cbm_pipeline_fqn_folder(walk);
         const char *dir_base = strrchr(walk, '/');
         dir_base = dir_base ? dir_base + SKIP_ONE : walk;
         cbm_gbuf_upsert_node(p->gbuf, "Folder", dir_base, folder_qn, walk, 0, 0, "{}");
@@ -476,9 +476,9 @@ static void create_folder_chain(cbm_pipeline_t *p, const char *dir, CBMHashTable
         const char *pqn;
         char *pqn_heap = NULL;
         if (pdir[0] == '\0') {
-            pqn = p->branch_qn ? p->branch_qn : p->project_name;
+            pqn = p->branch_qn ? p->branch_qn : CBM_PROJECT_NODE_QN;
         } else {
-            pqn_heap = cbm_pipeline_fqn_folder(p->project_name, pdir);
+            pqn_heap = cbm_pipeline_fqn_folder(pdir);
             pqn = pqn_heap;
         }
         const cbm_gbuf_node_t *fn = cbm_gbuf_find_by_qn(p->gbuf, folder_qn);
@@ -503,8 +503,9 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
     cbm_log_info("pass.start", "pass", "structure", "files", itoa_buf(file_count));
 
     /* Project node */
-    cbm_gbuf_upsert_node(p->gbuf, "Project", p->project_name, p->project_name, NULL, 0, 0, "{}");
-    const char *branch_qn = p->branch_qn ? p->branch_qn : p->project_name;
+    cbm_gbuf_upsert_node(p->gbuf, "Project", p->project_name, CBM_PROJECT_NODE_QN, NULL, 0, 0,
+                         "{}");
+    const char *branch_qn = p->branch_qn ? p->branch_qn : CBM_PROJECT_NODE_QN;
     const char *branch_name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
     char branch_props[CBM_SZ_2K];
     const char *branch_props_json = "{}";
@@ -514,7 +515,7 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
     if (p->branch_qn) {
         int64_t branch_id = cbm_gbuf_upsert_node(p->gbuf, "Branch", branch_name, branch_qn, NULL, 0,
                                                  0, branch_props_json);
-        const cbm_gbuf_node_t *project_node = cbm_gbuf_find_by_qn(p->gbuf, p->project_name);
+        const cbm_gbuf_node_t *project_node = cbm_gbuf_find_by_qn(p->gbuf, CBM_PROJECT_NODE_QN);
         if (project_node && branch_id > 0) {
             cbm_gbuf_insert_edge(p->gbuf, project_node->id, branch_id, "HAS_BRANCH",
                                  branch_props_json);
@@ -531,7 +532,7 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
         }
 
         /* Create File node */
-        char *file_qn = cbm_pipeline_fqn_compute(p->project_name, rel, "__file__");
+        char *file_qn = cbm_pipeline_fqn_compute(rel, "__file__");
         /* Extract basename */
         const char *slash = strrchr(rel, '/');
         const char *basename = slash ? slash + SKIP_ONE : rel;
@@ -561,7 +562,7 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
         if (dir[0] == '\0') {
             parent_qn = branch_qn;
         } else {
-            parent_qn_heap = cbm_pipeline_fqn_folder(p->project_name, dir);
+            parent_qn_heap = cbm_pipeline_fqn_folder(dir);
             parent_qn = parent_qn_heap;
         }
 
@@ -930,8 +931,7 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * discoverer (package.json, composer.json) still feed pkgmap and let
      * workspace imports like `@my/pkg` resolve to their target Module. */
     cbm_pipeline_set_pkgmap(cbm_pkgmap_build_from_repo(ctx->repo_path, files, file_count,
-                                                       ctx->project_name, ctx->excluded_dirs,
-                                                       ctx->excluded_count));
+                                                       ctx->excluded_dirs, ctx->excluded_count));
 
     CBMFileResult **seq_cache = (CBMFileResult **)calloc(file_count, sizeof(CBMFileResult *));
     if (seq_cache) {
@@ -1155,8 +1155,8 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     return check_cancel(p) ? CBM_NOT_FOUND : 0;
 }
 
-/* Try incremental pipeline or delete old DB for reindex.
- * Returns >= 0 if incremental was used (the return code), or -1 to proceed with full. */
+/* Пытается продолжить инкрементально либо удаляет старую БД для полной переиндексации.
+ * Возвращает код >= 0, если выбран инкрементальный путь, иначе -1. */
 static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count) {
     char *db_path = resolve_db_path(p);
     if (!db_path) {
@@ -1171,17 +1171,21 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     if (check_store && cbm_store_check_integrity(check_store)) {
         cbm_file_hash_t *hashes = NULL;
         int hash_count = 0;
-        cbm_store_get_file_hashes(check_store, p->project_name, &hashes, &hash_count);
+        bool qn_format_current = cbm_store_qn_format_is_current(check_store);
+        if (qn_format_current) {
+            cbm_store_get_file_hashes(check_store, p->project_name, &hashes, &hash_count);
+        }
         cbm_store_free_file_hashes(hashes, hash_count);
         cbm_store_close(check_store);
-        if (hash_count > 0 && file_count <= hash_count + (hash_count / PAIR_LEN)) {
+        if (!qn_format_current) {
+            cbm_log_info("pipeline.route", "path", "qn_format_reindex", "stored_version", "legacy");
+        } else if (hash_count > 0 && file_count <= hash_count + (hash_count / PAIR_LEN)) {
             cbm_log_info("pipeline.route", "path", "incremental", "stored_hashes",
                          itoa_buf(hash_count));
             int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count);
             free(db_path);
             return rc;
-        }
-        if (hash_count > 0) {
+        } else if (hash_count > 0) {
             cbm_log_info("pipeline.route", "path", "mode_change_reindex", "stored_hashes",
                          itoa_buf(hash_count), "discovered", itoa_buf(file_count));
         }

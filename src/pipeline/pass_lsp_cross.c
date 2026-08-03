@@ -289,7 +289,7 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
         if (!cache[fi])
             continue;
         if (!def_modules[fi]) {
-            def_modules[fi] = cbm_pipeline_fqn_module_dir(project_name, files[fi].rel_path,
+            def_modules[fi] = cbm_pipeline_fqn_module_dir(files[fi].rel_path,
                                                           pxc_module_is_dir(files[fi].language));
         }
         const char *namespace_name = cache[fi]->namespace_name;
@@ -322,7 +322,7 @@ static int pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name
     *out_vals = NULL;
     *out_count = 0;
 
-    char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
+    char *file_qn = cbm_pipeline_fqn_compute(rel_path, "__file__");
     if (!file_qn)
         return 0;
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(gbuf, file_qn);
@@ -870,7 +870,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         }
 
         if (!def_modules[i]) {
-            def_modules[i] = cbm_pipeline_fqn_module_dir(ctx->project_name, files[i].rel_path,
+            def_modules[i] = cbm_pipeline_fqn_module_dir(files[i].rel_path,
                                                          pxc_module_is_dir(files[i].language));
         }
 

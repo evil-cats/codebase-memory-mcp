@@ -13,59 +13,59 @@
 /* ── FQN computation ──────────────────────────────────────────────── */
 
 TEST(fqn_simple) {
-    char *qn = cbm_pipeline_fqn_compute("myproj", "cmd/server/main.go", "HandleRequest");
+    char *qn = cbm_pipeline_fqn_compute("cmd/server/main.go", "HandleRequest");
     ASSERT_NOT_NULL(qn);
-    ASSERT_STR_EQ(qn, "myproj.cmd.server.main.HandleRequest");
+    ASSERT_STR_EQ(qn, "cmd.server.main.HandleRequest");
     free(qn);
     PASS();
 }
 
 TEST(fqn_no_name) {
-    char *qn = cbm_pipeline_fqn_compute("myproj", "pkg/service.go", NULL);
+    char *qn = cbm_pipeline_fqn_compute("pkg/service.go", NULL);
     ASSERT_NOT_NULL(qn);
-    ASSERT_STR_EQ(qn, "myproj.pkg.service");
+    ASSERT_STR_EQ(qn, "pkg.service");
     free(qn);
     PASS();
 }
 
 TEST(fqn_python_init) {
     /* __init__.py should be stripped */
-    char *qn = cbm_pipeline_fqn_compute("myproj", "pkg/__init__.py", "Foo");
+    char *qn = cbm_pipeline_fqn_compute("pkg/__init__.py", "Foo");
     ASSERT_NOT_NULL(qn);
-    ASSERT_STR_EQ(qn, "myproj.pkg.Foo");
+    ASSERT_STR_EQ(qn, "pkg.Foo");
     free(qn);
     PASS();
 }
 
 TEST(fqn_js_index) {
     /* index.js should be stripped */
-    char *qn = cbm_pipeline_fqn_compute("myproj", "src/index.ts", "App");
+    char *qn = cbm_pipeline_fqn_compute("src/index.ts", "App");
     ASSERT_NOT_NULL(qn);
-    ASSERT_STR_EQ(qn, "myproj.src.App");
+    ASSERT_STR_EQ(qn, "src.App");
     free(qn);
     PASS();
 }
 
 TEST(fqn_module) {
-    char *qn = cbm_pipeline_fqn_module("myproj", "cmd/server/main.go");
+    char *qn = cbm_pipeline_fqn_module("cmd/server/main.go");
     ASSERT_NOT_NULL(qn);
-    ASSERT_STR_EQ(qn, "myproj.cmd.server.main");
+    ASSERT_STR_EQ(qn, "cmd.server.main");
     free(qn);
     PASS();
 }
 
 TEST(fqn_folder) {
-    char *qn = cbm_pipeline_fqn_folder("myproj", "cmd/server");
+    char *qn = cbm_pipeline_fqn_folder("cmd/server");
     ASSERT_NOT_NULL(qn);
-    ASSERT_STR_EQ(qn, "myproj.cmd.server");
+    ASSERT_STR_EQ(qn, "cmd.server");
     free(qn);
     PASS();
 }
 
 TEST(fqn_root_file) {
-    char *qn = cbm_pipeline_fqn_compute("proj", "main.go", "main");
+    char *qn = cbm_pipeline_fqn_compute("main.go", "main");
     ASSERT_NOT_NULL(qn);
-    ASSERT_STR_EQ(qn, "proj.main.main");
+    ASSERT_STR_EQ(qn, "main.main");
     free(qn);
     PASS();
 }
@@ -77,11 +77,11 @@ TEST(fqn_root_file) {
 
 TEST(fqn_init_module_distinct_from_folder) {
     /* Module QN for __init__.py must differ from Folder QN for same dir */
-    char *mod_qn = cbm_pipeline_fqn_module("proj", "pkg/__init__.py");
-    char *folder_qn = cbm_pipeline_fqn_folder("proj", "pkg");
+    char *mod_qn = cbm_pipeline_fqn_module("pkg/__init__.py");
+    char *folder_qn = cbm_pipeline_fqn_folder("pkg");
     ASSERT_NOT_NULL(mod_qn);
     ASSERT_NOT_NULL(folder_qn);
-    /* These MUST be different — the old bug was they were both "proj.pkg" */
+    /* Значения должны различаться: раньше оба узла получали QN "pkg". */
     ASSERT_STR_NEQ(mod_qn, folder_qn);
     /* Module should contain __init__ as disambiguator */
     ASSERT_NOT_NULL(strstr(mod_qn, "__init__"));
@@ -94,9 +94,8 @@ TEST(fqn_init_module_distinct_from_folder) {
 
 TEST(fqn_init_nested_module_distinct) {
     /* Same collision test for deeply nested __init__.py */
-    char *mod_qn =
-        cbm_pipeline_fqn_module("proj", "docker-images/cloud-runs/bq-sync-api/__init__.py");
-    char *folder_qn = cbm_pipeline_fqn_folder("proj", "docker-images/cloud-runs/bq-sync-api");
+    char *mod_qn = cbm_pipeline_fqn_module("docker-images/cloud-runs/bq-sync-api/__init__.py");
+    char *folder_qn = cbm_pipeline_fqn_folder("docker-images/cloud-runs/bq-sync-api");
     ASSERT_NOT_NULL(mod_qn);
     ASSERT_NOT_NULL(folder_qn);
     ASSERT_STR_NEQ(mod_qn, folder_qn);
@@ -107,8 +106,8 @@ TEST(fqn_init_nested_module_distinct) {
 
 TEST(fqn_index_ts_module_distinct_from_folder) {
     /* Same collision for JS/TS index.ts */
-    char *mod_qn = cbm_pipeline_fqn_module("proj", "src/components/index.ts");
-    char *folder_qn = cbm_pipeline_fqn_folder("proj", "src/components");
+    char *mod_qn = cbm_pipeline_fqn_module("src/components/index.ts");
+    char *folder_qn = cbm_pipeline_fqn_folder("src/components");
     ASSERT_NOT_NULL(mod_qn);
     ASSERT_NOT_NULL(folder_qn);
     ASSERT_STR_NEQ(mod_qn, folder_qn);
@@ -118,11 +117,11 @@ TEST(fqn_index_ts_module_distinct_from_folder) {
 }
 
 TEST(fqn_init_symbols_get_clean_package_qn) {
-    /* Symbols inside __init__.py must NOT have __init__ in their QN.
-     * "proj.pkg.Foo" not "proj.pkg.__init__.Foo" */
-    char *sym_qn = cbm_pipeline_fqn_compute("proj", "pkg/__init__.py", "Foo");
+    /* У символа из __init__.py не должно быть __init__ внутри QN:
+     * "pkg.Foo", а не "pkg.__init__.Foo". */
+    char *sym_qn = cbm_pipeline_fqn_compute("pkg/__init__.py", "Foo");
     ASSERT_NOT_NULL(sym_qn);
-    ASSERT_STR_EQ(sym_qn, "proj.pkg.Foo");
+    ASSERT_STR_EQ(sym_qn, "pkg.Foo");
     ASSERT_EQ(strstr(sym_qn, "__init__"), NULL);
     free(sym_qn);
     PASS();
@@ -130,17 +129,17 @@ TEST(fqn_init_symbols_get_clean_package_qn) {
 
 TEST(fqn_index_symbols_get_clean_qn) {
     /* Symbols inside index.ts must NOT have index in their QN */
-    char *sym_qn = cbm_pipeline_fqn_compute("proj", "src/index.ts", "App");
+    char *sym_qn = cbm_pipeline_fqn_compute("src/index.ts", "App");
     ASSERT_NOT_NULL(sym_qn);
-    ASSERT_STR_EQ(sym_qn, "proj.src.App");
+    ASSERT_STR_EQ(sym_qn, "src.App");
     free(sym_qn);
     PASS();
 }
 
 TEST(fqn_init_file_node_distinct) {
     /* File node QN (name="__file__") for __init__.py must be distinct from Folder */
-    char *file_qn = cbm_pipeline_fqn_compute("proj", "pkg/__init__.py", "__file__");
-    char *folder_qn = cbm_pipeline_fqn_folder("proj", "pkg");
+    char *file_qn = cbm_pipeline_fqn_compute("pkg/__init__.py", "__file__");
+    char *folder_qn = cbm_pipeline_fqn_folder("pkg");
     ASSERT_NOT_NULL(file_qn);
     ASSERT_NOT_NULL(folder_qn);
     ASSERT_STR_NEQ(file_qn, folder_qn);
@@ -151,9 +150,9 @@ TEST(fqn_init_file_node_distinct) {
 
 TEST(fqn_regular_module_unchanged) {
     /* Non-init modules should be unaffected by the fix */
-    char *qn = cbm_pipeline_fqn_module("proj", "pkg/utils.py");
+    char *qn = cbm_pipeline_fqn_module("pkg/utils.py");
     ASSERT_NOT_NULL(qn);
-    ASSERT_STR_EQ(qn, "proj.pkg.utils");
+    ASSERT_STR_EQ(qn, "pkg.utils");
     free(qn);
     PASS();
 }
@@ -301,8 +300,7 @@ TEST(resolve_qualified_disambiguates_same_name) {
     ASSERT_TRUE(!nomatch.strategy || strcmp(nomatch.strategy, "qualified_suffix") != 0);
 
     /* A bare call stays ambiguous (no qualifier → no disambiguation signal). */
-    cbm_resolution_t bare =
-        cbm_registry_resolve(r, "save", "proj.lib.App.Caller", NULL, NULL, 0);
+    cbm_resolution_t bare = cbm_registry_resolve(r, "save", "proj.lib.App.Caller", NULL, NULL, 0);
     ASSERT_TRUE(!bare.strategy || strcmp(bare.strategy, "qualified_suffix") != 0);
 
     cbm_registry_free(r);

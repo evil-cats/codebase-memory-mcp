@@ -1897,7 +1897,7 @@ static void write_sqlite_file_header(uint8_t *page1, uint32_t total_pages) {
     put_u32(page1 + HDR_OFF_DEFAULT_CACHE, 0);
     put_u32(page1 + HDR_OFF_AUTOVAC_TOP, 0);
     put_u32(page1 + HDR_OFF_TEXT_ENCODING, SKIP_ONE);
-    put_u32(page1 + HDR_OFF_USER_VERSION, 0);
+    put_u32(page1 + HDR_OFF_USER_VERSION, CBM_QN_FORMAT_VERSION);
     put_u32(page1 + HDR_OFF_INCR_VACUUM, 0);
     put_u32(page1 + HDR_OFF_APP_ID, 0);
     put_u32(page1 + HDR_OFF_VERSION_VALID, SKIP_ONE);

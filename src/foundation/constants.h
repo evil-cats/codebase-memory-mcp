@@ -76,6 +76,10 @@ enum {
  * offset+limit or narrow with label/file_pattern when has_more is true. */
 enum { CBM_DEFAULT_SEARCH_LIMIT = 50 };
 
+/* Формат qualified_name внутри индексной БД. Нулевое значение принадлежит
+ * старым индексам с проектным префиксом; локальные QN начинаются с версии 1. */
+enum { CBM_QN_FORMAT_VERSION = 1 };
+
 /* ── Time conversion factors ─────────────────────────────────── */
 #define CBM_NSEC_PER_SEC 1000000000ULL
 #define CBM_USEC_PER_SEC 1000000ULL

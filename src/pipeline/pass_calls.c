@@ -125,7 +125,7 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
             if (!imp->local_name || !imp->local_name[0] || !imp->module_path) {
                 continue;
             }
-            char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
+            char *target_qn = cbm_pipeline_fqn_module(imp->module_path);
             const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
             free(target_qn);
             if (!target) {
@@ -143,7 +143,7 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
     }
 
     /* Slow path: scan graph buffer IMPORTS edges + parse JSON properties */
-    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
+    char *file_qn = cbm_pipeline_fqn_compute(rel_path, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
     free(file_qn);
     if (!file_node) {
@@ -447,7 +447,7 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
         }
     }
     if (!src) {
-        char *fqn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+        char *fqn = cbm_pipeline_fqn_compute(rel, "__file__");
         src = cbm_gbuf_find_by_qn(ctx->gbuf, fqn);
         free(fqn);
     }
@@ -470,11 +470,10 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution(lsp_calls, call, allow_tail);
     if (lsp) {
         const cbm_gbuf_node_t *target_node =
-            cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name, lsp->callee_qn, allow_tail);
+            cbm_pipeline_lsp_target_node(ctx->gbuf, lsp->callee_qn, allow_tail);
         if (target_node && source_node->id != target_node->id) {
             cbm_resolution_t res = {0};
-            /* Use the gbuf node's QN so downstream edge props show the canonical
-             * project-qualified form even when fallback prefixed the project. */
+            /* Используем канонический локальный QN узла из графового буфера. */
             res.qualified_name = target_node->qualified_name;
             res.confidence = lsp->confidence;
             res.strategy = lsp->strategy;
@@ -759,8 +758,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
         /* Compute module QN for same-module resolution (directory-based for
          * Java/Go so it matches their def-node QNs in the registry). */
-        char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
-                                                      pc_module_is_dir(files[i].language));
+        char *module_qn = cbm_pipeline_fqn_module_dir(rel, pc_module_is_dir(files[i].language));
 
         /* Resolve each call */
         for (int c = 0; c < result->calls.count; c++) {
@@ -906,8 +904,8 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
             continue;
         }
 
-        char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, files[i].rel_path,
-                                                      pc_module_is_dir(files[i].language));
+        char *module_qn =
+            cbm_pipeline_fqn_module_dir(files[i].rel_path, pc_module_is_dir(files[i].language));
 
         /* Build import map for alias resolution */
         const char **imp_keys = NULL;

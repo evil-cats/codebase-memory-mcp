@@ -2905,34 +2905,33 @@ TEST(markdown_no_headings) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * Python __init__.py Module QN collision regression
+ * Регрессия коллизии QN модуля Python для __init__.py
  * ═══════════════════════════════════════════════════════════════════ */
 
 TEST(python_init_module_qn_not_collide_with_folder) {
-    /* Bug: __init__.py Module QN was identical to the Folder QN for the
-     * same directory, causing the Folder node to be overwritten when the
-     * Module was upserted. The Module QN must contain "__init__" to
-     * distinguish it from the Folder QN. */
+    /* Раньше QN модуля __init__.py совпадал с QN каталога, поэтому upsert
+     * модуля перезаписывал узел Folder. QN модуля должен содержать
+     * "__init__", чтобы отличаться от QN каталога. */
     CBMFileResult *r = extract("class Config:\n    DEBUG = True\n\ndef setup():\n    pass\n",
                                CBM_LANG_PYTHON, "proj", "mypackage/__init__.py");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
 
-    /* Module node must exist */
+    /* Узел Module должен существовать. */
     ASSERT_GTE(r->defs.count, 1);
     ASSERT_STR_EQ(r->defs.items[0].label, "Module");
 
-    /* Module QN must contain __init__ (not be stripped to just "proj.mypackage") */
+    /* QN модуля должен содержать __init__, а не сокращаться до "mypackage". */
     ASSERT_NOT_NULL(r->module_qn);
     ASSERT_NOT_NULL(strstr(r->module_qn, "__init__"));
 
-    /* But symbols inside __init__.py should NOT have __init__ in their QN */
+    /* У символов внутри __init__.py сегмента __init__ в QN быть не должно. */
     int found_config = 0;
     for (int i = 0; i < r->defs.count; i++) {
         if (strcmp(r->defs.items[i].name, "Config") == 0) {
             ASSERT_NOT_NULL(r->defs.items[i].qualified_name);
-            /* Should be "proj.mypackage.Config", NOT "proj.mypackage.__init__.Config" */
-            ASSERT_STR_EQ(r->defs.items[i].qualified_name, "proj.mypackage.Config");
+            /* Нужен "mypackage.Config", а не "mypackage.__init__.Config". */
+            ASSERT_STR_EQ(r->defs.items[i].qualified_name, "mypackage.Config");
             found_config = 1;
         }
     }
@@ -2943,40 +2942,40 @@ TEST(python_init_module_qn_not_collide_with_folder) {
 }
 
 TEST(python_init_nested_module_qn) {
-    /* Deeply nested __init__.py — same collision must not happen */
+    /* Для вложенного __init__.py коллизии также быть не должно. */
     CBMFileResult *r = extract("def greet():\n    return 'hello'\n", CBM_LANG_PYTHON, "proj",
                                "docker-images/cloud-runs/bq-sync-api/__init__.py");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_NOT_NULL(r->module_qn);
-    /* Must contain __init__ to not collide with Folder QN */
+    /* __init__ отличает QN модуля от QN каталога. */
     ASSERT_NOT_NULL(strstr(r->module_qn, "__init__"));
     cbm_free_result(r);
     PASS();
 }
 
 TEST(js_index_module_qn_not_collide_with_folder) {
-    /* Same bug for JS/TS index.ts files */
+    /* Та же коллизия возможна для файлов index.ts в JS/TS. */
     CBMFileResult *r = extract("export function App() { return null; }\n", CBM_LANG_TYPESCRIPT,
                                "proj", "src/components/index.ts");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_NOT_NULL(r->module_qn);
-    /* Must contain "index" to not collide with Folder QN */
+    /* index отличает QN модуля от QN каталога. */
     ASSERT_NOT_NULL(strstr(r->module_qn, "index"));
     cbm_free_result(r);
     PASS();
 }
 
-TEST(python_regular_module_qn_unchanged) {
-    /* Non-__init__.py Python files should be unaffected */
+TEST(python_regular_module_qn_keeps_local_structure) {
+    /* Обычный Python-модуль сохраняет структуру пути без имени проекта. */
     CBMFileResult *r =
         extract("def helper():\n    pass\n", CBM_LANG_PYTHON, "proj", "mypackage/utils.py");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_NOT_NULL(r->module_qn);
-    /* Regular module QN should not contain __init__ or index */
-    ASSERT_STR_EQ(r->module_qn, "proj.mypackage.utils");
+    /* QN обычного модуля не содержит __init__ или index. */
+    ASSERT_STR_EQ(r->module_qn, "mypackage.utils");
     cbm_free_result(r);
     PASS();
 }
@@ -3063,11 +3062,11 @@ static const CBMCall *find_call_by_callee(CBMFileResult *r, const char *callee) 
     return NULL;
 }
 
-/* Reproduce-first: Java module QN must derive from the CONTAINING DIRECTORY, not
- * the filename stem, so a top-level class `Outer` in `Outer.java` is `t.Outer`,
- * NOT the doubled `t.Outer.Outer`. The nested method def QN must also equal the
- * QN the textual calls-enclosing path records for an in-body call (the
- * lsp_resolve join keys on exact caller_qn == enclosing_func_qn equality). */
+/* QN модуля Java строится по каталогу, а не по основе имени файла. Поэтому
+ * класс Outer из корневого Outer.java имеет локальный QN Outer, а не
+ * дублированный Outer.Outer. QN вложенного метода также должен совпадать с QN,
+ * записанным для охватывающей функции текстового вызова: lsp_resolve связывает
+ * их по точному равенству caller_qn и enclosing_func_qn. */
 TEST(extract_java_no_double_class_qn) {
     CBMFileResult *r = extract("class Outer {\n"
                                "    int helper(int x) { return x + 2; }\n"
@@ -3079,11 +3078,11 @@ TEST(extract_java_no_double_class_qn) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
 
-    /* Module QN is the directory (root) → just the project. */
+    /* Корневой каталог задаёт пустой локальный QN модуля. */
     ASSERT_NOT_NULL(r->module_qn);
-    ASSERT_STR_EQ(r->module_qn, "t");
+    ASSERT_STR_EQ(r->module_qn, "");
 
-    /* No def QN anywhere may double the top-level class name. */
+    /* Ни один QN определения не должен дублировать имя верхнего класса. */
     for (int i = 0; i < r->defs.count; i++) {
         const char *qn = r->defs.items[i].qualified_name;
         if (qn) {
@@ -3091,18 +3090,18 @@ TEST(extract_java_no_double_class_qn) {
         }
     }
 
-    /* The nested class and its method carry the single-form QN. */
+    /* Вложенный класс и его метод используют QN без дублирования. */
     const CBMDefinition *outer = find_def_by_name(r, "Outer");
     ASSERT_NOT_NULL(outer);
-    ASSERT_STR_EQ(outer->qualified_name, "t.Outer");
+    ASSERT_STR_EQ(outer->qualified_name, "Outer");
 
     const CBMDefinition *run = find_def_by_name(r, "run");
     ASSERT_NOT_NULL(run);
-    ASSERT_STR_EQ(run->qualified_name, "t.Outer.Inner.run");
+    ASSERT_STR_EQ(run->qualified_name, "Outer.Inner.run");
 
-    /* The in-body call to helper() must be attributed to the SAME QN as the
-     * method def — this is the equality the LSP cross-resolution join relies on
-     * for nested classes (the lsp_outer_dispatch repro). */
+    /* Вызов helper() внутри тела должен ссылаться на тот же QN, что и
+     * определение метода: на это равенство опирается LSP-разрешение вызовов во
+     * вложенных классах. */
     const CBMCall *call = find_call_by_callee(r, "helper");
     ASSERT_NOT_NULL(call);
     ASSERT_NOT_NULL(call->enclosing_func_qn);
@@ -3112,10 +3111,9 @@ TEST(extract_java_no_double_class_qn) {
     PASS();
 }
 
-/* Reproduce-first: Go module QN must derive from the CONTAINING DIRECTORY
- * (package), not the filename stem, so a type/method in `myapp/db/conn.go`
- * belongs to module `proj.myapp.db` and is NOT polluted with the `.conn.`
- * filename segment. */
+/* QN модуля Go строится по каталогу пакета, а не по основе имени файла. Поэтому
+ * тип и метод из myapp/db/conn.go принадлежат модулю myapp.db без сегмента
+ * имени файла .conn. */
 TEST(extract_go_no_filename_in_module_qn) {
     CBMFileResult *r = extract("package db\n\n"
                                "type Conn struct{}\n\n"
@@ -3124,25 +3122,24 @@ TEST(extract_go_no_filename_in_module_qn) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
 
-    /* Module is the directory `myapp/db`, NOT `myapp/db/conn`. */
+    /* Модуль соответствует каталогу myapp/db, а не файлу myapp/db/conn. */
     ASSERT_NOT_NULL(r->module_qn);
-    ASSERT_STR_EQ(r->module_qn, "proj.myapp.db");
+    ASSERT_STR_EQ(r->module_qn, "myapp.db");
 
-    /* The type and method QNs must not contain the filename segment `.conn.`. */
+    /* QN типа и метода не должны содержать сегмент имени файла .conn. */
     const CBMDefinition *conn = find_def_by_name(r, "Conn");
     ASSERT_NOT_NULL(conn);
-    ASSERT_STR_EQ(conn->qualified_name, "proj.myapp.db.Conn");
+    ASSERT_STR_EQ(conn->qualified_name, "myapp.db.Conn");
 
-    /* Go method nodes keep a FLAT QN (module + name) with a separate
-     * parent_class link to the receiver type — the QN must carry the
-     * directory-based module and NOT the `.conn.` filename segment. */
+    /* Узел метода Go сохраняет плоский QN (модуль и имя), а тип получателя
+     * хранится отдельно в parent_class. */
     const CBMDefinition *query = find_def_by_name(r, "Query");
     ASSERT_NOT_NULL(query);
-    ASSERT_STR_EQ(query->qualified_name, "proj.myapp.db.Query");
+    ASSERT_STR_EQ(query->qualified_name, "myapp.db.Query");
     ASSERT_EQ(strstr(query->qualified_name, ".conn."), NULL);
-    /* The method's parent_class must match the type node QN (for DEFINES_METHOD). */
+    /* parent_class метода должен совпадать с QN узла типа для DEFINES_METHOD. */
     ASSERT_NOT_NULL(query->parent_class);
-    ASSERT_STR_EQ(query->parent_class, "proj.myapp.db.Conn");
+    ASSERT_STR_EQ(query->parent_class, "myapp.db.Conn");
 
     cbm_free_result(r);
     PASS();
@@ -5180,7 +5177,7 @@ SUITE(extraction) {
     RUN_TEST(python_init_module_qn_not_collide_with_folder);
     RUN_TEST(python_init_nested_module_qn);
     RUN_TEST(js_index_module_qn_not_collide_with_folder);
-    RUN_TEST(python_regular_module_qn_unchanged);
+    RUN_TEST(python_regular_module_qn_keeps_local_structure);
     RUN_TEST(extract_java_method_annotations_issue382);
     RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
     RUN_TEST(extract_java_no_double_class_qn);

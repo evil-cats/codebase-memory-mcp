@@ -1237,7 +1237,7 @@ static const char skill_content[] =
     "1. `list_projects` — check if project is indexed\n"
     "2. `get_graph_schema` — understand node/edge types\n"
     "3. `search_graph(label=\"Function\", name_pattern=\".*Pattern.*\")` — find code\n"
-    "4. `get_code_snippet(qualified_name=\"project.path.FuncName\")` — read source\n"
+    "4. `get_code_snippet(project=\"project\", qualified_name=\"path.FuncName\")` — read source\n"
     "\n"
     "## Tracing Workflow\n"
     "1. `search_graph(name_pattern=\".*FuncName.*\")` — discover exact name\n"

@@ -94,9 +94,9 @@ static char *perl_node_text(PerlLSPContext *ctx, TSNode node) {
     return cbm_node_text(ctx->arena, node, ctx->source);
 }
 
-/* Perl qualified names use "." in the graph (project.path.module.pkg[.sub]).
- * Convert "Foo::Bar::Baz" to "Foo.Bar.Baz" so we can compose with module_qn
- * (which already uses ".") and look up registry entries. */
+/* В графе QN Perl используют точку: path.module.pkg[.sub]. Преобразуем
+ * Foo::Bar::Baz в Foo.Bar.Baz, чтобы соединять имя с module_qn и искать его в
+ * реестре. */
 static char *perl_pkg_to_dot(CBMArena *a, const char *pkg) {
     if (!pkg)
         return NULL;

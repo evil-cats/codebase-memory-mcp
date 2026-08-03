@@ -2052,26 +2052,19 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
                 py_emit_resolved_call(ctx, f->qualified_name, "lsp_module_attr", 0.92f);
                 return;
             }
-            // An `import sibling` of an IN-PROJECT module records the module's QN
-            // in its short, source-written form ("helpers"), but the sibling's
-            // defs are registered project-qualified ("<root>.helpers.do_work").
-            // So the lookup above misses for in-project modules even though the
-            // target IS resolvable, and the call used to drop to
-            // lsp_module_attr_unresolved @0.55 (below the join's 0.6 floor) — no
-            // edge. Retry against the project-qualified module: derive the
-            // project root from the current file's module_qn (strip its last
-            // segment) and look up "<root>.<mod>". A genuinely-external module
-            // (requests, os) has no such project def, so it correctly stays
-            // lsp_module_attr_unresolved.
+            // `import sibling` может хранить короткий QN "helpers", тогда как
+            // определение соседнего файла имеет локальный QN
+            // "<current-dir>.helpers.do_work". При прямом промахе добавляем
+            // каталог текущего модуля. Внешний модуль такого определения в
+            // реестре не имеет и остаётся unresolved.
             if (mod && ctx->module_qn) {
                 const char *last_dot = strrchr(ctx->module_qn, '.');
                 if (last_dot && last_dot > ctx->module_qn) {
                     size_t root_len = (size_t)(last_dot - ctx->module_qn);
-                    // Skip if mod is already rooted under the project to avoid
-                    // "<root>.<root>.mod".
+                    // Не дублируем каталог, если mod уже квалифицирован им.
                     if (!(strncmp(mod, ctx->module_qn, root_len) == 0 && mod[root_len] == '.')) {
-                        char *qual_mod = (char *)cbm_arena_alloc(ctx->arena, root_len + 1 +
-                                                                                strlen(mod) + 1);
+                        char *qual_mod =
+                            (char *)cbm_arena_alloc(ctx->arena, root_len + 1 + strlen(mod) + 1);
                         if (qual_mod) {
                             memcpy(qual_mod, ctx->module_qn, root_len);
                             qual_mod[root_len] = '.';
@@ -3316,10 +3309,8 @@ static void py_process_function(PyLSPContext *ctx, TSNode func_node, const char 
     // For methods, bind `self`/`cls` AFTER param walk so the receiver type
     // wins over the unannotated `self` / `cls` parameter declaration.
     if (ctx->enclosing_class_qn) {
-        py_scope_bind(ctx, "self",
-                       cbm_type_named(ctx->arena, ctx->enclosing_class_qn));
-        py_scope_bind(ctx, "cls",
-                       cbm_type_named(ctx->arena, ctx->enclosing_class_qn));
+        py_scope_bind(ctx, "self", cbm_type_named(ctx->arena, ctx->enclosing_class_qn));
+        py_scope_bind(ctx, "cls", cbm_type_named(ctx->arena, ctx->enclosing_class_qn));
     }
 
     TSNode body = ts_node_child_by_field_name(func_node, "body", 4);

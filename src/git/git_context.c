@@ -314,8 +314,7 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
     return 0;
 }
 
-char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx) {
-    const char *project = project_name && project_name[0] ? project_name : "project";
+char *cbm_git_context_branch_qn(const cbm_git_context_t *ctx) {
     const char *slug = "working-tree";
     if (ctx) {
         if (ctx->is_detached) {
@@ -325,7 +324,7 @@ char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_
         }
     }
 
-    int n = snprintf(NULL, 0, "%s.__branch__.%s", project, slug);
+    int n = snprintf(NULL, 0, "%s%s", CBM_BRANCH_NODE_QN_PREFIX, slug);
     if (n < 0) {
         return NULL;
     }
@@ -333,7 +332,7 @@ char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_
     if (!out) {
         return NULL;
     }
-    snprintf(out, (size_t)n + 1, "%s.__branch__.%s", project, slug);
+    snprintf(out, (size_t)n + 1, "%s%s", CBM_BRANCH_NODE_QN_PREFIX, slug);
     return out;
 }
 

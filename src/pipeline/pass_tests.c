@@ -269,7 +269,7 @@ static int create_tests_file_edges(cbm_pipeline_ctx_t *ctx) {
             continue;
         }
 
-        char *prod_qn = cbm_pipeline_fqn_compute(ctx->project_name, prod_path, "__file__");
+        char *prod_qn = cbm_pipeline_fqn_compute(prod_path, "__file__");
         const cbm_gbuf_node_t *prod_node = cbm_gbuf_find_by_qn(ctx->gbuf, prod_qn);
         free(prod_qn);
         free(prod_path);

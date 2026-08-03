@@ -37,9 +37,9 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang);
 // Returns a null node if none found.
 TSNode cbm_find_enclosing_func(TSNode node, CBMLanguage lang);
 
-// Get the QN of an enclosing function, or module_qn if none.
+// Возвращает локальный QN внешней функции либо module_qn, если функции нет.
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
-                                  const char *project, const char *rel_path, const char *module_qn);
+                                  const char *rel_path, const char *module_qn);
 
 // Cached version: uses ctx->ef_cache to avoid repeated parent-chain walks.
 const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
@@ -142,28 +142,25 @@ bool cbm_is_module_level_p(TSNode parent, CBMLanguage lang);
 
 // --- FQN computation ---
 
-// Compute qualified name: project.rel_path_parts.name
-char *cbm_fqn_compute(CBMArena *a, const char *project, const char *rel_path, const char *name);
+// Локальный QN символа: rel_path_parts.name; проект хранится отдельно.
+char *cbm_fqn_compute(CBMArena *a, const char *rel_path, const char *name);
 
-// Module QN (file without name): project.rel_path_parts
-char *cbm_fqn_module(CBMArena *a, const char *project, const char *rel_path);
+// Локальный QN модуля: путь к файлу без имени символа.
+char *cbm_fqn_module(CBMArena *a, const char *rel_path);
 
-// Language-aware module QN. For directory-module languages (Java package, Go
-// package) the module is derived from the CONTAINING DIRECTORY (the filename
-// stem is NOT baked in): `Outer.java` at root -> "proj", `myapp/db/conn.go` ->
-// "proj.myapp.db". For every OTHER language this returns exactly what
-// cbm_fqn_module returns (no behavior change).
-char *cbm_fqn_module_source_lang(CBMArena *a, const char *project, const char *rel_path,
-                                 CBMLanguage lang);
+// Для языков с каталогом-модулем (Java package, Go package) QN строится по
+// содержащему каталогу без основы имени файла: `Outer.java` в корне -> "",
+// `myapp/db/conn.go` -> "myapp.db". Для остальных языков результат совпадает с
+// Локальный QN модуля.
+char *cbm_fqn_module_source_lang(CBMArena *a, const char *rel_path, CBMLanguage lang);
 
-// Language-aware symbol QN. For directory-module languages this is the
-// directory-based module + "." + name (so a top-level class `Outer` in
-// `Outer.java` is "proj.Outer", not "proj.Outer.Outer"). For every other
-// language this is exactly cbm_fqn_compute (no behavior change).
-char *cbm_fqn_compute_source_lang(CBMArena *a, const char *project, const char *rel_path,
-                                  const char *name, CBMLanguage lang);
+// Для языков с каталогом-модулем QN символа равен QN каталога + "." + name:
+// класс `Outer` из корневого `Outer.java` получает "Outer", а не "Outer.Outer".
+// Для остальных языков результат совпадает с cbm_fqn_compute.
+char *cbm_fqn_compute_source_lang(CBMArena *a, const char *rel_path, const char *name,
+                                  CBMLanguage lang);
 
-// Folder QN: project.dir_parts
-char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir);
+// Локальный QN каталога: dir_parts.
+char *cbm_fqn_folder(CBMArena *a, const char *rel_dir);
 
 #endif // CBM_HELPERS_H

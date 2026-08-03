@@ -1355,14 +1355,14 @@ TEST(store_qn_to_package_single_segment) {
 }
 
 TEST(store_qn_to_package_two_segments) {
-    /* project.name — returns segment[1] */
-    ASSERT_STR_EQ(cbm_qn_to_package("proj.name"), "name");
+    /* package.name — возвращается первый локальный сегмент. */
+    ASSERT_STR_EQ(cbm_qn_to_package("pkg.name"), "pkg");
     PASS();
 }
 
 TEST(store_qn_to_package_many_segments) {
-    /* project.dir.pkg.Func — 4+ segments returns segment[2] */
-    ASSERT_STR_EQ(cbm_qn_to_package("myproj.dir.pkg.Func"), "pkg");
+    /* dir.pkg.Func — для вложенного QN возвращается второй сегмент. */
+    ASSERT_STR_EQ(cbm_qn_to_package("dir.pkg.Func"), "pkg");
     PASS();
 }
 
@@ -1382,14 +1382,13 @@ TEST(store_qn_to_top_package_single_segment) {
 }
 
 TEST(store_qn_to_top_package_two_segments) {
-    /* project.dir — returns "dir" */
-    ASSERT_STR_EQ(cbm_qn_to_top_package("proj.dir"), "dir");
+    ASSERT_STR_EQ(cbm_qn_to_top_package("dir.Func"), "dir");
     PASS();
 }
 
 TEST(store_qn_to_top_package_many_segments) {
-    /* Always returns segment[1] regardless of depth */
-    ASSERT_STR_EQ(cbm_qn_to_top_package("proj.dir.sub.Func"), "dir");
+    /* Глубина QN не меняет первый локальный пакет. */
+    ASSERT_STR_EQ(cbm_qn_to_top_package("dir.sub.Func"), "dir");
     PASS();
 }
 

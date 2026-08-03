@@ -3226,8 +3226,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     /* Java/Go derive the module from the containing directory (package), so the
      * filename stem is NOT baked into the QN (Go func in myapp/db/conn.go ->
      * proj.myapp.db.Func, not proj.myapp.db.conn.Func). Other langs unchanged. */
-    def.qualified_name =
-        cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
+    def.qualified_name = cbm_fqn_compute_source_lang(a, ctx->rel_path, name, ctx->language);
     /* A free function declared inside a namespace (C++/C#/PHP) is qualified by
      * the namespace scope the def walk carries (enclosing_class_qn was extended
      * by is_namespace_scope_kind), so `ns::serialize` is `proj.file.ns.serialize`
@@ -3290,8 +3289,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         if (recv_type && recv_type[0]) {
             /* Must match the Go type node QN (directory-based module) so the
              * DEFINES_METHOD edge links the method to its owning type. */
-            def.parent_class = cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path,
-                                                           recv_type, ctx->language);
+            def.parent_class =
+                cbm_fqn_compute_source_lang(a, ctx->rel_path, recv_type, ctx->language);
         }
     }
 
@@ -3304,7 +3303,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         strcmp(ts_node_type(node), "function_definition") == 0) {
         char *scope_name = cbm_cpp_out_of_line_parent_class(a, node, ctx->source);
         if (scope_name && scope_name[0]) {
-            const char *class_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, scope_name);
+            const char *class_qn = cbm_fqn_compute(a, ctx->rel_path, scope_name);
             def.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
             def.label = "Method";
             def.parent_class = class_qn;
@@ -3330,7 +3329,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
                 if (!ts_node_is_null(cn)) {
                     char *cname = cbm_node_text(a, cn, ctx->source);
                     if (cname && cname[0]) {
-                        def.parent_class = cbm_fqn_compute(a, ctx->project, ctx->rel_path, cname);
+                        def.parent_class = cbm_fqn_compute(a, ctx->rel_path, cname);
                     }
                 }
                 break;
@@ -3424,7 +3423,7 @@ static void push_simple_class_def(CBMExtractCtx *ctx, TSNode node, char *name, c
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, qn_safe_segment(a, name));
+    def.qualified_name = cbm_fqn_compute(a, ctx->rel_path, qn_safe_segment(a, name));
     def.label = label;
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
@@ -3888,7 +3887,7 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     if (ctx->enclosing_class_qn) {
         class_qn = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, name);
     } else {
-        class_qn = cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
+        class_qn = cbm_fqn_compute_source_lang(a, ctx->rel_path, name, ctx->language);
     }
     const char *label = class_label_for_kind(kind);
 
@@ -4478,7 +4477,7 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         }
     }
 
-    const char *type_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, type_name);
+    const char *type_qn = cbm_fqn_compute(a, ctx->rel_path, type_name);
 
     // Extract methods inside impl body
     TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
@@ -4574,7 +4573,7 @@ static void extract_elixir_func_def(CBMExtractCtx *ctx, TSNode node, const char 
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    def.qualified_name = cbm_fqn_compute(a, ctx->rel_path, name);
     def.label = "Function";
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
@@ -4602,7 +4601,7 @@ static TSNode emit_elixir_module_class(CBMExtractCtx *ctx, TSNode cur) {
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    def.qualified_name = cbm_fqn_compute(a, ctx->rel_path, name);
     def.label = "Class";
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(cur).row + TS_LINE_OFFSET;
@@ -4667,8 +4666,7 @@ static void push_var_def(CBMExtractCtx *ctx, const char *name, TSNode node) {
     def.name = name;
     /* Java/Go: directory-based module (package), so a Go package-level var in
      * myapp/db/conn.go is proj.myapp.db.Var, matching its siblings. */
-    def.qualified_name =
-        cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
+    def.qualified_name = cbm_fqn_compute_source_lang(a, ctx->rel_path, name, ctx->language);
     def.label = "Variable";
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
@@ -6270,8 +6268,7 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const char 
             }
             /* Top-level: language-aware module so Java/Go don't double the
              * filename stem (matches extract_class_def above). */
-            return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, cname,
-                                               ctx->language);
+            return cbm_fqn_compute_source_lang(ctx->arena, ctx->rel_path, cname, ctx->language);
         }
     }
     return saved_enclosing;
@@ -6353,7 +6350,7 @@ static void extract_cfml_function_tag(CBMExtractCtx *ctx, TSNode node) {
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    def.qualified_name = cbm_fqn_compute(a, ctx->rel_path, name);
     def.label = "Function";
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
@@ -6387,7 +6384,7 @@ static void extract_gotemplate_define(CBMExtractCtx *ctx, TSNode node) {
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = raw;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, raw);
+    def.qualified_name = cbm_fqn_compute(a, ctx->rel_path, raw);
     def.label = "Function";
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
@@ -6442,7 +6439,7 @@ static void extract_janet_def(CBMExtractCtx *ctx, TSNode node) {
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    def.qualified_name = cbm_fqn_compute(a, ctx->rel_path, name);
     def.label = is_class ? "Class" : "Function";
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
@@ -6477,7 +6474,7 @@ static void extract_c_macro_def(CBMExtractCtx *ctx, TSNode node) {
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    def.qualified_name = cbm_fqn_compute(a, ctx->rel_path, name);
     def.label = "Macro";
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
@@ -6566,7 +6563,7 @@ static void extract_lisp_def(CBMExtractCtx *ctx, TSNode node) {
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    def.qualified_name = cbm_fqn_compute(a, ctx->rel_path, name);
     def.label = lisp_label;
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
@@ -6626,7 +6623,7 @@ static void recover_kotlin_error_classes(CBMExtractCtx *ctx, TSNode err_node) {
         if (ctx->enclosing_class_qn) {
             class_qn = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, name);
         } else {
-            class_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+            class_qn = cbm_fqn_compute(a, ctx->rel_path, name);
         }
 
         /* Collect bases from any `delegation_specifier` siblings that follow the

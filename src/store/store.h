@@ -235,6 +235,8 @@ bool cbm_store_check_integrity(cbm_store_t *s);
 /* Shallow check + PRAGMA quick_check — catches page-level corruption.
  * O(db size); use on rare paths (artifact import), not hot opens. */
 bool cbm_store_check_integrity_deep(cbm_store_t *s);
+/* Проверяет маркер формата локальных QN в заголовке SQLite. */
+bool cbm_store_qn_format_is_current(cbm_store_t *s);
 
 /* Open database for a named project in the default cache dir. */
 cbm_store_t *cbm_store_open(const char *project);
@@ -323,9 +325,6 @@ int cbm_store_find_node_by_id(cbm_store_t *s, int64_t id, cbm_node_t *out);
 
 /* Find node by project + qualified_name. */
 int cbm_store_find_node_by_qn(cbm_store_t *s, const char *project, const char *qn, cbm_node_t *out);
-
-/* Find node by qualified_name only (no project filter — QNs are globally unique). */
-int cbm_store_find_node_by_qn_any(cbm_store_t *s, const char *qn, cbm_node_t *out);
 
 /* Find nodes by name (exact match). Returns allocated array, caller frees. */
 int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char *name,

@@ -147,24 +147,23 @@ void cbm_pipeline_lock(void);
 /* Release the global index lock. */
 void cbm_pipeline_unlock(void);
 
-/* ── FQN helpers (used by passes and external callers) ──────────── */
+/* ── Построение локальных QN для проходов и внешних вызовов ─────── */
 
-/* Compute a qualified name: project.dir.parts.name
- * Strips extension, converts / to ., drops __init__ and index.
- * Caller must free() the returned string. */
-char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const char *name);
+/* Строит QN вида dir.parts.name без имени проекта. Удаляет расширение,
+ * преобразует / в . и при необходимости опускает __init__ или index.
+ * Вызывающая сторона освобождает результат через free(). */
+char *cbm_pipeline_fqn_compute(const char *rel_path, const char *name);
 
-/* Module QN: project.dir.parts (no name). Caller must free(). */
-char *cbm_pipeline_fqn_module(const char *project, const char *rel_path);
+/* QN модуля: dir.parts без имени символа. Результат освобождается через free(). */
+char *cbm_pipeline_fqn_module(const char *rel_path);
 
-/* Language-aware module QN. When `module_is_dir` is true (Java/Go package
- * semantics) the module is derived from the CONTAINING DIRECTORY (the filename
- * stem is dropped), so it agrees with the extraction-side def QNs; when false
- * it is exactly cbm_pipeline_fqn_module(). Caller must free(). */
-char *cbm_pipeline_fqn_module_dir(const char *project, const char *rel_path, bool module_is_dir);
+/* Для Java/Go при module_is_dir QN модуля строится по содержащему каталогу без
+ * основы имени файла; иначе совпадает с cbm_pipeline_fqn_module(). Результат
+ * освобождается через free(). */
+char *cbm_pipeline_fqn_module_dir(const char *rel_path, bool module_is_dir);
 
-/* Folder QN: project.dir.parts. Caller must free(). */
-char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir);
+/* QN каталога: dir.parts. Результат освобождается через free(). */
+char *cbm_pipeline_fqn_folder(const char *rel_dir);
 
 /* Resolve an import specifier that uses a relative path (./foo, ../bar, .foo,
  * or an unqualified local name like "foo.h") against the importing file's

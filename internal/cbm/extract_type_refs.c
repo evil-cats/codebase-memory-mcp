@@ -268,7 +268,7 @@ static void process_func_type_refs(CBMExtractCtx *ctx, TSNode node) {
     if (!func_name || !func_name[0]) {
         return;
     }
-    const char *func_qn = cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, func_name);
+    const char *func_qn = cbm_fqn_compute(ctx->arena, ctx->rel_path, func_name);
     TSNode params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));
     if (!ts_node_is_null(params)) {
         extract_param_type_refs(ctx, params, func_qn);
@@ -336,7 +336,7 @@ static void extract_signature_type_refs(CBMExtractCtx *ctx, TSNode node, WalkSta
     if (state->enclosing_class_qn) {
         func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, func_name);
     } else {
-        func_qn = cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, func_name);
+        func_qn = cbm_fqn_compute(ctx->arena, ctx->rel_path, func_name);
     }
 
     TSNode params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));

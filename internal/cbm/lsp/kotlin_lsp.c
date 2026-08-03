@@ -448,7 +448,7 @@ static const CBMType *kt_build_func_sig_with_return(KotlinLSPContext *ctx,
 
 void kotlin_lsp_init(KotlinLSPContext *ctx, CBMArena *arena, const char *source, int source_len,
                      const CBMTypeRegistry *registry, const char *package_qn, const char *module_qn,
-                     const char *project_name, const char *rel_path, CBMResolvedCallArray *out) {
+                     const char *rel_path, CBMResolvedCallArray *out) {
     memset(ctx, 0, sizeof(KotlinLSPContext));
     ctx->arena = arena;
     ctx->source = source;
@@ -456,7 +456,6 @@ void kotlin_lsp_init(KotlinLSPContext *ctx, CBMArena *arena, const char *source,
     ctx->registry = registry;
     ctx->package_qn = package_qn ? cbm_arena_strdup(arena, package_qn) : "";
     ctx->module_qn = module_qn ? cbm_arena_strdup(arena, module_qn) : "";
-    ctx->project_name = project_name ? cbm_arena_strdup(arena, project_name) : "";
     ctx->rel_path = rel_path ? cbm_arena_strdup(arena, rel_path) : "";
     ctx->resolved_calls = out;
     ctx->import_cap = KT_IMPORT_INITIAL_CAP;
@@ -539,8 +538,7 @@ const char *kotlin_resolve_class_name(KotlinLSPContext *ctx, const char *name) {
     }
     /* Already qualified? */
     if (strchr(name, '.')) {
-        /* Prefix with project? Best-effort heuristic: leave as-is, the
-         * pipeline will retry with project prefix on miss. */
+        /* Уже квалифицированное имя остаётся локальным QN без преобразований. */
         return cbm_arena_strdup(ctx->arena, name);
     }
 
@@ -550,7 +548,6 @@ const char *kotlin_resolve_class_name(KotlinLSPContext *ctx, const char *name) {
         if (ctx->registry && cbm_registry_lookup_type(ctx->registry, cand)) {
             return cand;
         }
-        /* Project-qualified candidate — keep alongside as fallback */
     }
 
     /* Bare-name lookup: when the file has no `package` declaration, all
@@ -591,8 +588,8 @@ const char *kotlin_resolve_class_name(KotlinLSPContext *ctx, const char *name) {
         }
     }
 
-    /* Same-package fallback — even if not in registry, useful for cross-file
-     * lookups via the pipeline's <project>.<qn> retry. */
+    /* Возвращаем локальный QN того же пакета даже при промахе реестра: его
+     * сможет сопоставить межфайловый проход. */
     if (ctx->package_qn && *ctx->package_qn) {
         return kt_join_dot(ctx->arena, ctx->package_qn, name);
     }
@@ -647,17 +644,14 @@ const char *kotlin_resolve_function_name(KotlinLSPContext *ctx, const char *name
         return via_default;
     }
 
-    /* Cross-file sole-definer fallback. In the default package (no `package`
-     * declaration) a top-level `double()` in Util.kt is callable bare from
-     * Main.kt, but its registered QN embeds the defining file's path
-     * ("<project>.Util.double") which the caller can't reconstruct.  When the
-     * project-wide registry holds EXACTLY ONE top-level function (receiver_type
-     * == NULL) whose short name matches, resolve to it.  Bounded to a single
-     * candidate so an ambiguous name (>1 definer) is left unresolved — sound,
-     * mirroring the registry's "unique_name" strategy.  Runs only after the
-     * package/import/bare/default-import lookups miss, so it never overrides a
-     * more specific match; in the per-file pass the registry holds just this
-     * file's defs, so the candidate is the file's own sole top-level fun. */
+    /* Межфайловая резервная попытка для единственного определения. В пакете по
+     * умолчанию функцию double() верхнего уровня из Util.kt можно вызвать без
+     * квалификации из Main.kt, но её QN "Util.double" содержит путь файла,
+     * который вызывающая сторона восстановить не может. Если во всём реестре
+     * существует ровно одна функция верхнего уровня с таким коротким именем,
+     * используем её. При нескольких кандидатах имя остаётся неразрешённым.
+     * Эта ветка выполняется только после промаха поисков по пакету, импортам и
+     * короткому имени, поэтому не переопределяет более специфичное совпадение. */
     if (ctx->registry && ctx->registry->funcs) {
         const char *only_qn = NULL;
         int matches = 0;
@@ -2459,8 +2453,7 @@ static const CBMType *kt_eval_navigation_expression_type(KotlinLSPContext *ctx, 
             if (is_member) {
                 /* A member call on an `object`/`companion object` singleton is a
                  * static dispatch; on a regular class instance it is a method. */
-                const CBMRegisteredType *recv_rt =
-                    cbm_registry_lookup_type(ctx->registry, recv_qn);
+                const CBMRegisteredType *recv_rt = cbm_registry_lookup_type(ctx->registry, recv_qn);
                 strat = (recv_rt && recv_rt->is_object) ? "lsp_kt_static" : "lsp_kt_method";
             }
             /* A call through the lambda implicit parameter `it` (e.g. inside
@@ -4101,38 +4094,18 @@ void cbm_run_kotlin_lsp(CBMArena *arena, CBMFileResult *result, const char *sour
     /* Curated stdlib */
     cbm_kotlin_stdlib_register(&registry, arena);
 
-    /* Compute project name + package_qn from result->module_qn (which is
-     * "<project>.<rel.path.parts>"). The Kotlin convention places the
-     * file class as "<project>.<package>" — or "<project>.<rel-path>" for
-     * the module_qn. We honour module_qn as-is and strip the trailing
-     * filename to derive the package_qn at the FS-path level — but for
-     * cross-file resolution we additionally need the dotted package
-     * declared in the source. The kotlin_lsp_process_file pass updates
-     * package_qn from the actual `package_header` node when present.
-     */
-    const char *project_name = "";
+    /* module_qn уже локален. Исходный package_header при наличии заменит
+     * файловый путь пакета в kotlin_lsp_process_file. */
     const char *module_qn = result->module_qn ? result->module_qn : "";
-    const char *first_dot = strchr(module_qn, '.');
-    if (first_dot) {
-        size_t pl = (size_t)(first_dot - module_qn);
-        char *pn = (char *)cbm_arena_alloc(arena, pl + 1);
-        if (pn) {
-            memcpy(pn, module_qn, pl);
-            pn[pl] = '\0';
-            project_name = pn;
-        }
-    } else {
-        project_name = module_qn;
-    }
 
-    /* Initial package_qn is the FS-path module_qn ("<project>.<rel.path>"),
-     * matching the textual extractor's QN prefix so the LSP's caller_qn equals
-     * the call site's enclosing_func_qn (the join keys on an exact caller_qn
-     * match). A source `package_header`, when present, overrides this in
-     * kotlin_lsp_process_file for cross-file import resolution. */
+    /* Начальный package_qn совпадает с локальным module_qn пути файла. Так
+     * caller_qn из LSP равен enclosing_func_qn текстового экстрактора, по
+     * точному совпадению которых соединяются результаты. Если в исходнике есть
+     * package_header, kotlin_lsp_process_file заменит значение для
+     * межфайлового разрешения импортов. */
     KotlinLSPContext ctx;
     kotlin_lsp_init(&ctx, arena, use_source, use_source_len, &registry, module_qn, module_qn,
-                    project_name, /*rel_path=*/NULL, &result->resolved_calls);
+                    /*rel_path=*/NULL, &result->resolved_calls);
 
     kotlin_lsp_process_file(&ctx, use_root);
 
@@ -4147,10 +4120,8 @@ void cbm_run_kotlin_lsp(CBMArena *arena, CBMFileResult *result, const char *sour
 
 /* ── Cross-file LSP ───────────────────────────────────────────────── */
 
-/* Register one cross-file definition into the registry under its graph QN so
- * a call site in another file resolves to the right node. Types and functions
- * keep their full project-qualified QN; functions carry receiver_type so the
- * sole-definer fallback can tell a top-level fun from a method. */
+/* Регистрирует межфайловое определение по его локальному графовому QN.
+ * receiver_type позволяет отличить функцию верхнего уровня от метода. */
 static const char *kt_cross_builtin_return_qn(const char *name) {
     if (!name) {
         return NULL;
@@ -4329,24 +4300,9 @@ void cbm_run_kotlin_lsp_cross(CBMArena *arena, const char *source, int source_le
     }
     TSNode root = ts_tree_root_node(tree);
 
-    /* project_name prefix (everything before the first dot of module_qn). */
-    const char *project_name = "";
-    const char *first_dot = module_qn ? strchr(module_qn, '.') : NULL;
-    if (first_dot) {
-        size_t pl = (size_t)(first_dot - module_qn);
-        char *pn = (char *)cbm_arena_alloc(arena, pl + 1);
-        if (pn) {
-            memcpy(pn, module_qn, pl);
-            pn[pl] = '\0';
-            project_name = pn;
-        }
-    } else if (module_qn) {
-        project_name = module_qn;
-    }
-
     KotlinLSPContext ctx;
     kotlin_lsp_init(&ctx, arena, source, source_len, &reg, "", module_qn ? module_qn : "",
-                    project_name, /*rel_path=*/NULL, out);
+                    /*rel_path=*/NULL, out);
 
     /* Apply caller-supplied imports (resolved IMPORTS edges). */
     for (int i = 0; i < import_count; i++) {

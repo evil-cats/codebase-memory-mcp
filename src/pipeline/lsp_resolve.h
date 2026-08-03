@@ -245,22 +245,12 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
     return best_tail;
 }
 
-/* Resolve an LSP-emitted callee_qn to a graph-buffer node.
- *
- * Per-file LSPs sometimes emit `callee_qn` as the raw package-shaped
- * import path the source code uses rather than the project-qualified QN
- * the gbuf actually stores. The fallback rule is:
- *   1. try the LSP-emitted QN as-is;
- *   2. retry with `<project>.<callee_qn>` when needed;
- *   3. if both fail AND allow_tail_match is set (JVM callers only, see
- *      cbm_pipeline_lsp_allow_tail_match), use the exact node-name index
- *      to narrow candidates by short method name and accept exactly one
- *      Function/Method whose qualified_name has the same Class.method
- *      tail.
- *
- * Returns the matching node, or NULL if neither lookup hits. */
+/* Сопоставляет локальный callee_qn от LSP с узлом графового буфера.
+ * Сначала выполняется точный поиск. Если он не дал результата и разрешён
+ * JVM-tail-match, индекс коротких имён сужает кандидатов до единственного
+ * Function/Method с тем же хвостом Class.method. Проектный префикс здесь не
+ * восстанавливается: конвейер и LSP обязаны использовать один локальный QN. */
 static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node(const cbm_gbuf_t *gbuf,
-                                                                  const char *project_name,
                                                                   const char *callee_qn,
                                                                   bool allow_tail_match) {
     if (!gbuf || !callee_qn) {
@@ -269,19 +259,6 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node(const cbm_gbuf
     const cbm_gbuf_node_t *direct = cbm_gbuf_find_by_qn(gbuf, callee_qn);
     if (direct) {
         return direct;
-    }
-    if (project_name && project_name[0]) {
-        size_t proj_len = strlen(project_name);
-        if (!(strncmp(callee_qn, project_name, proj_len) == 0 && callee_qn[proj_len] == '.')) {
-            char buf[CBM_SZ_1K];
-            int written = snprintf(buf, sizeof(buf), "%s.%s", project_name, callee_qn);
-            if (written > 0 && (size_t)written < sizeof(buf)) {
-                const cbm_gbuf_node_t *prefixed = cbm_gbuf_find_by_qn(gbuf, buf);
-                if (prefixed) {
-                    return prefixed;
-                }
-            }
-        }
     }
     if (!allow_tail_match) {
         return NULL;

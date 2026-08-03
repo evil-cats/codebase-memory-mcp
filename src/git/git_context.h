@@ -19,9 +19,14 @@ typedef struct {
     char *base_sha;
 } cbm_git_context_t;
 
+/* Служебные QN содержат '/', который конструкторы исходных QN превращают в
+ * границу сегмента. Поэтому они не могут столкнуться с QN исходного узла. */
+#define CBM_PROJECT_NODE_QN "@cbm/project"
+#define CBM_BRANCH_NODE_QN_PREFIX "@cbm/branch/"
+
 int cbm_git_context_resolve(const char *path, cbm_git_context_t *out);
 void cbm_git_context_free(cbm_git_context_t *ctx);
-char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx);
+char *cbm_git_context_branch_qn(const cbm_git_context_t *ctx);
 int cbm_git_context_props_json(const cbm_git_context_t *ctx, char *buf, int buf_size);
 
 #endif

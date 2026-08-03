@@ -27,6 +27,12 @@ static const CBMType* go_lookup_field(GoLSPContext* ctx, const char* type_qn, co
 static void extract_type_params_from_ast(CBMArena* arena, CBMTypeRegistry* reg,
     TSNode root, const char* source, const char* module_qn);
 
+static const char* go_qn_join(CBMArena* arena, const char* prefix, const char* name) {
+    if (!prefix || !prefix[0]) return cbm_arena_strdup(arena, name ? name : "");
+    if (!name || !name[0]) return cbm_arena_strdup(arena, prefix);
+    return cbm_arena_sprintf(arena, "%s.%s", prefix, name);
+}
+
 // --- Initialization ---
 
 void go_lsp_init(GoLSPContext* ctx, CBMArena* arena, const char* source, int source_len,
@@ -130,8 +136,7 @@ const CBMType* go_parse_type_node(GoLSPContext* ctx, TSNode node) {
         const CBMType* builtin = resolve_builtin_type(ctx, name);
         if (builtin) return builtin;
         // Resolve as local type: package_qn.TypeName
-        return cbm_type_named(ctx->arena,
-            cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->package_qn, name));
+        return cbm_type_named(ctx->arena, go_qn_join(ctx->arena, ctx->package_qn, name));
     }
 
     // qualified_type: pkg.Type
@@ -143,8 +148,7 @@ const CBMType* go_parse_type_node(GoLSPContext* ctx, TSNode node) {
             char* name = lsp_node_text(ctx, name_node);
             const char* pkg_qn = resolve_import(ctx, pkg);
             if (pkg_qn) {
-                return cbm_type_named(ctx->arena,
-                    cbm_arena_sprintf(ctx->arena, "%s.%s", pkg_qn, name));
+                return cbm_type_named(ctx->arena, go_qn_join(ctx->arena, pkg_qn, name));
             }
         }
         return cbm_type_unknown();
@@ -347,7 +351,7 @@ const CBMType* go_eval_expr_type(GoLSPContext* ctx, TSNode node) {
         if (bt) return cbm_type_named(ctx->arena, name);
 
         // Check if it's a registered type (for type conversions like MyType(x))
-        const char* type_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->package_qn, name);
+        const char* type_qn = go_qn_join(ctx->arena, ctx->package_qn, name);
         const CBMRegisteredType* rt = cbm_registry_lookup_type(ctx->registry, type_qn);
         if (rt) return cbm_type_named(ctx->arena, type_qn);
 
@@ -373,7 +377,7 @@ const CBMType* go_eval_expr_type(GoLSPContext* ctx, TSNode node) {
                     const CBMRegisteredFunc* f = cbm_registry_lookup_symbol(ctx->registry, pkg_qn, field_name);
                     if (f && f->signature) return f->signature;
                     // Check if it's a type
-                    char* type_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", pkg_qn, field_name);
+                    const char* type_qn = go_qn_join(ctx->arena, pkg_qn, field_name);
                     const CBMRegisteredType* rt = cbm_registry_lookup_type(ctx->registry, type_qn);
                     if (rt) return cbm_type_named(ctx->arena, type_qn);
                     return cbm_type_unknown();
@@ -435,8 +439,7 @@ const CBMType* go_eval_expr_type(GoLSPContext* ctx, TSNode node) {
                 const CBMRegisteredFunc* rfunc = NULL;
                 char* func_name = lsp_node_text(ctx, func_node);
                 if (func_name) {
-                    const char* func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s",
-                        ctx->package_qn, func_name);
+                    const char* func_qn = go_qn_join(ctx->arena, ctx->package_qn, func_name);
                     rfunc = cbm_registry_lookup_func(ctx->registry, func_qn);
                     // If not found as local, try via import (selector_expression: pkg.Func)
                     if (!rfunc && strcmp(ts_node_type(func_node), "selector_expression") == 0) {
@@ -505,8 +508,7 @@ const CBMType* go_eval_expr_type(GoLSPContext* ctx, TSNode node) {
                 const CBMRegisteredFunc* rfunc = NULL;
                 char* func_name = lsp_node_text(ctx, func_node);
                 if (func_name) {
-                    const char* func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s",
-                        ctx->package_qn, func_name);
+                    const char* func_qn = go_qn_join(ctx->arena, ctx->package_qn, func_name);
                     rfunc = cbm_registry_lookup_func(ctx->registry, func_qn);
                     if (!rfunc && strcmp(ts_node_type(func_node), "selector_expression") == 0) {
                         TSNode operand = ts_node_child_by_field_name(func_node, "operand", 7);
@@ -1156,7 +1158,7 @@ static void resolve_calls_in_node_inner(GoLSPContext* ctx, TSNode node) {
                                 }
                                 // Package found but symbol not in registry
                                 emit_unresolved_call(ctx,
-                                    cbm_arena_sprintf(ctx->arena, "%s.%s", pkg_name, field_name),
+                                    go_qn_join(ctx->arena, pkg_name, field_name),
                                     "symbol_not_in_registry");
                                 goto recurse;
                             }
@@ -1251,7 +1253,7 @@ static void resolve_calls_in_node_inner(GoLSPContext* ctx, TSNode node) {
 
                                 // Fallback: generic interface dispatch
                                 emit_resolved_call(ctx,
-                                    cbm_arena_sprintf(ctx->arena, "%s.%s",
+                                    go_qn_join(ctx->arena,
                                         iface_qn ? iface_qn : "interface", field_name),
                                     "lsp_interface_dispatch", 0.85f);
                                 goto recurse;
@@ -1261,13 +1263,13 @@ static void resolve_calls_in_node_inner(GoLSPContext* ctx, TSNode node) {
                         // Type resolved to NAMED but neither method nor interface matched
                         if (base && base->kind == CBM_TYPE_NAMED) {
                             emit_unresolved_call(ctx,
-                                cbm_arena_sprintf(ctx->arena, "%s.%s",
+                                go_qn_join(ctx->arena,
                                     base->data.named.qualified_name, field_name),
                                 "method_not_found");
                         } else if (cbm_type_is_unknown(recv_type)) {
                             char* operand_text = lsp_node_text(ctx, operand);
                             emit_unresolved_call(ctx,
-                                cbm_arena_sprintf(ctx->arena, "%s.%s",
+                                go_qn_join(ctx->arena,
                                     operand_text ? operand_text : "?", field_name),
                                 "unknown_receiver_type");
                         }
@@ -1532,10 +1534,10 @@ static void process_function(GoLSPContext* ctx, TSNode func_node) {
     }
 
     if (recv_type_name) {
-        ctx->enclosing_func_qn =
-            cbm_arena_sprintf(ctx->arena, "%s.%s.%s", ctx->package_qn, recv_type_name, func_name);
+        const char* receiver_qn = go_qn_join(ctx->arena, ctx->package_qn, recv_type_name);
+        ctx->enclosing_func_qn = go_qn_join(ctx->arena, receiver_qn, func_name);
     } else {
-        ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->package_qn, func_name);
+        ctx->enclosing_func_qn = go_qn_join(ctx->arena, ctx->package_qn, func_name);
     }
 
     // Push function scope
@@ -1712,7 +1714,7 @@ const CBMType* cbm_parse_return_type_text(CBMArena* a, const char* text, const c
     }
 
     // Named type: assume local to module
-    return cbm_type_named(a, cbm_arena_sprintf(a, "%s.%s", module_qn, text));
+    return cbm_type_named(a, go_qn_join(a, module_qn, text));
 }
 
 // --- Entry point: build registry from file defs + run LSP ---
@@ -1754,7 +1756,7 @@ void cbm_run_go_lsp(CBMArena* arena, CBMFileResult* result,
                         // Strip pointer prefix for embedded *Type
                         while (bc[0] == '*') bc++;
                         // Qualify the embedded type name
-                        embedded[j] = cbm_arena_sprintf(arena, "%s.%s", module_qn, bc);
+                        embedded[j] = go_qn_join(arena, module_qn, bc);
                     }
                     embedded[bc_count] = NULL;
                     rt.embedded_types = embedded;
@@ -1820,7 +1822,7 @@ void cbm_run_go_lsp(CBMArena* arena, CBMFileResult* result,
                 while (*end && *end != ')' && *end != ' ') end++;
                 if (end > r) {
                     char* type_name = cbm_arena_strndup(arena, r, end - r);
-                    rf.receiver_type = cbm_arena_sprintf(arena, "%s.%s", module_qn, type_name);
+                    rf.receiver_type = go_qn_join(arena, module_qn, type_name);
 
                     // Also register this method under the type
                     const CBMRegisteredType* existing = cbm_registry_lookup_type(&reg, rf.receiver_type);
@@ -1863,8 +1865,8 @@ void cbm_run_go_lsp(CBMArena* arena, CBMFileResult* result,
                         char* aname = cbm_node_text(arena, alias_name, source);
                         char* atarget = cbm_node_text(arena, alias_type, source);
                         if (aname && aname[0] && atarget && atarget[0]) {
-                            const char* alias_type_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, aname);
-                            const char* alias_target_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, atarget);
+                            const char* alias_type_qn = go_qn_join(arena, module_qn, aname);
+                            const char* alias_target_qn = go_qn_join(arena, module_qn, atarget);
                             bool found_a = false;
                             for (int ti = 0; ti < reg.type_count; ti++) {
                                 if (reg.types[ti].qualified_name &&
@@ -1895,7 +1897,7 @@ void cbm_run_go_lsp(CBMArena* arena, CBMFileResult* result,
 
                 char* type_name = cbm_node_text(arena,name_node, source);
                 if (!type_name || !type_name[0]) continue;
-                const char* type_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, type_name);
+                const char* type_qn = go_qn_join(arena, module_qn, type_name);
 
                 // Interface type: extract method names for satisfaction checking
                 if (strcmp(ts_node_type(type_node), "interface_type") == 0) {
@@ -1977,7 +1979,7 @@ void cbm_run_go_lsp(CBMArena* arena, CBMFileResult* result,
                             if (embed_text && embed_text[0]) {
                                 const char* et = embed_text;
                                 while (*et == '*') et++;
-                                embeds[embed_count++] = cbm_arena_sprintf(arena, "%s.%s", module_qn, et);
+                                embeds[embed_count++] = go_qn_join(arena, module_qn, et);
                             }
                         }
                     } else if (!ts_node_is_null(fname) && !ts_node_is_null(ftype) && fld_count < 63) {
@@ -2198,7 +2200,7 @@ static const CBMType* parse_type_node_with_params(CBMArena* arena, TSNode node,
             strcmp(name, "uintptr") == 0) {
             return cbm_type_builtin(arena, name);
         }
-        return cbm_type_named(arena, cbm_arena_sprintf(arena, "%s.%s", module_qn, name));
+        return cbm_type_named(arena, go_qn_join(arena, module_qn, name));
     }
 
     // type_elem: wrapper in type_arguments
@@ -2215,7 +2217,7 @@ static const CBMType* parse_type_node_with_params(CBMArena* arena, TSNode node,
             char* pkg = cbm_node_text(arena, pkg_node, source);
             char* name = cbm_node_text(arena, name_node, source);
             if (pkg && name) {
-                return cbm_type_named(arena, cbm_arena_sprintf(arena, "%s.%s", pkg, name));
+                return cbm_type_named(arena, go_qn_join(arena, pkg, name));
             }
         }
         return cbm_type_unknown();
@@ -2401,7 +2403,7 @@ static void extract_type_params_from_ast(CBMArena* arena, CBMTypeRegistry* reg,
         for (int j = 0; j <= param_count; j++) tp_names[j] = params[j];
 
         // Find the matching registered function and set type_param_names
-        const char* func_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, func_name);
+        const char* func_qn = go_qn_join(arena, module_qn, func_name);
         for (int fi = 0; fi < reg->func_count; fi++) {
             if (reg->funcs[fi].qualified_name &&
                 strcmp(reg->funcs[fi].qualified_name, func_qn) == 0) {
@@ -2629,8 +2631,8 @@ void cbm_run_go_lsp_cross(
                         char* aname = cbm_node_text(arena, alias_name, source);
                         char* atarget = cbm_node_text(arena, alias_type, source);
                         if (aname && aname[0] && atarget && atarget[0]) {
-                            const char* alias_type_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, aname);
-                            const char* alias_target_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, atarget);
+                            const char* alias_type_qn = go_qn_join(arena, module_qn, aname);
+                            const char* alias_target_qn = go_qn_join(arena, module_qn, atarget);
                             bool found_a = false;
                             for (int ti = 0; ti < reg.type_count; ti++) {
                                 if (reg.types[ti].qualified_name &&
@@ -2662,7 +2664,7 @@ void cbm_run_go_lsp_cross(
 
                 char* type_name = cbm_node_text(arena, name_node, source);
                 if (!type_name || !type_name[0]) continue;
-                const char* type_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, type_name);
+                const char* type_qn = go_qn_join(arena, module_qn, type_name);
 
                 TSNode field_list = ts_node_child_by_field_name(type_node, "body", 4);
                 if (ts_node_is_null(field_list)) {
@@ -2701,7 +2703,7 @@ void cbm_run_go_lsp_cross(
                             if (embed_text && embed_text[0]) {
                                 const char* et = embed_text;
                                 while (*et == '*') et++;
-                                embeds[embed_count++] = cbm_arena_sprintf(arena, "%s.%s", module_qn, et);
+                                embeds[embed_count++] = go_qn_join(arena, module_qn, et);
                             }
                         }
                     } else if (!ts_node_is_null(fname) && !ts_node_is_null(ftype) && fld_count < 63) {

@@ -440,24 +440,13 @@ static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path)
         return ctx->self_type_qn;
     }
 
-    /* crate:: → <root>. We approximate the crate root as the first dotted
-     * segment of `module_qn` after the project prefix. The pipeline
-     * forms `module_qn` as `<project>.<crate>.<rel-path-segments>`, so
-     * the first two segments are project + crate root. */
+    /* crate:: → <root>. В локальном module_qn корень crate является первым
+     * сегментом относительного пути. */
     if (strncmp(path, "crate::", 7) == 0 && ctx->module_qn) {
         const char *p = ctx->module_qn;
-        int dots = 0;
-        const char *second_dot = NULL;
-        for (; *p; p++) {
-            if (*p == '.') {
-                if (++dots == 2) {
-                    second_dot = p;
-                    break;
-                }
-            }
-        }
+        const char *first_dot = strchr(p, '.');
         size_t crate_len =
-            second_dot ? (size_t)(second_dot - ctx->module_qn) : strlen(ctx->module_qn);
+            first_dot ? (size_t)(first_dot - ctx->module_qn) : strlen(ctx->module_qn);
         char *crate_buf = cbm_arena_strndup(ctx->arena, ctx->module_qn, crate_len);
         return cbm_arena_sprintf(ctx->arena, "%s.%s", crate_buf,
                                  convert_path_to_qn(ctx->arena, path + 7));
@@ -2383,8 +2372,7 @@ static const CBMRegisteredFunc *rust_resolve_trait_method(RustLSPContext *ctx,
         *out_impl_count = impls;
     if (impls == 1)
         return unique;
-    const CBMRegisteredFunc *tm =
-        rust_lookup_method_in_trait(ctx, receiver_type_qn, method_name);
+    const CBMRegisteredFunc *tm = rust_lookup_method_in_trait(ctx, receiver_type_qn, method_name);
     if (nm_active && !tm && impls == 0) {
         cbm_negmemo_insert(&ctx->neg_memo, ctx->arena, nm_key);
     }
@@ -5365,9 +5353,8 @@ extern const TSLanguage *tree_sitter_rust(void);
  * `module_qn` is ONLY the fallback used to qualify a def's return type when that def
  * carries no def_module_qn; pass NULL for the shared build (all_defs always carry
  * def_module_qn — verified: 0 NULL across the C + Rust kernel corpora). */
-static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
-                                         CBMRustLSPDef *defs, int def_count,
-                                         const char *module_qn) {
+static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena, CBMRustLSPDef *defs,
+                                         int def_count, const char *module_qn) {
     cbm_registry_init(reg, arena);
     cbm_rust_stdlib_register(reg, arena);
 

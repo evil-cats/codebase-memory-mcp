@@ -807,19 +807,18 @@ TEST(parallel_lsp_tail_match_fallbacks_gated_to_jvm) {
     ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&arr, &call, false) == NULL);
     ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&arr, &call, true) == &rc_item);
 
-    /* Target-node fallback: callee_qn misses both as-is and
-     * project-prefixed; exactly one node coincidentally shares the
-     * "Helper.run" tail in an unrelated module. */
+    /* При точном промахе JVM-tail-match находит единственный Method с тем же
+     * хвостом Helper.run в другом модуле. */
     cbm_gbuf_t *tgbuf = cbm_gbuf_new("proj", "/tmp");
     ASSERT_NOT_NULL(tgbuf);
-    int64_t nid = cbm_gbuf_upsert_node(tgbuf, "Method", "run", "proj.zeta.Helper.run",
-                                       "zeta/helper.py", 1, 3, NULL);
+    int64_t nid = cbm_gbuf_upsert_node(tgbuf, "Method", "run", "zeta.Helper.run", "zeta/helper.py",
+                                       1, 3, NULL);
     ASSERT_TRUE(nid != 0);
-    ASSERT_TRUE(cbm_pipeline_lsp_target_node(tgbuf, "proj", "com.other.Helper.run", false) == NULL);
+    ASSERT_TRUE(cbm_pipeline_lsp_target_node(tgbuf, "com.other.Helper.run", false) == NULL);
     const cbm_gbuf_node_t *jvm_hit =
-        cbm_pipeline_lsp_target_node(tgbuf, "proj", "com.other.Helper.run", true);
+        cbm_pipeline_lsp_target_node(tgbuf, "com.other.Helper.run", true);
     ASSERT_NOT_NULL(jvm_hit);
-    ASSERT_TRUE(strcmp(jvm_hit->qualified_name, "proj.zeta.Helper.run") == 0);
+    ASSERT_TRUE(strcmp(jvm_hit->qualified_name, "zeta.Helper.run") == 0);
     cbm_gbuf_free(tgbuf);
     PASS();
 }
@@ -882,15 +881,10 @@ TEST(parallel_python_lsp_override_emits_lsp_strategy_edges) {
     PASS();
 }
 
-/* Cross-file regression for the QN-mismatch bug: py_lsp's per-file mode
- * emits resolved_calls.callee_qn as the raw import-module path (e.g.
- * `greeter.Greeter` from `from greeter import Greeter`) rather than the
- * project-qualified QN the gbuf stores (`<project>.greeter.Greeter`).
- * Before cbm_pipeline_lsp_target_node added the project-prefix fallback,
- * the LSP match succeeded (lsp_overrides counter incremented) but the
- * downstream cbm_gbuf_find_by_qn lookup missed silently, dropping the
- * edge. With the fallback in place, the cross-file `g.hello()` call is
- * attributed to <project>.greeter.Greeter.hello with an lsp_* strategy.
+/* Межфайловая регрессия единого локального QN: py_lsp возвращает путь импорта
+ * `greeter.Greeter`, и граф хранит тот же QN без проектного префикса. Вызов
+ * `g.hello()` должен получить ребро со стратегией lsp_* без резервной подстановки
+ * имени проекта.
  *
  * Two-file scenario: greeter.py defines Greeter; app.py imports it and
  * calls hello() — same shape as the original failing reproduction. */
@@ -942,11 +936,7 @@ TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges) {
     cbm_gbuf_foreach_edge(gbuf, count_lsp_call_edges, &c);
 
     ASSERT_GT(c.total_calls, 0);
-    /* The cross-file LSP override must produce at least one lsp_*
-     * CALLS edge. Without the project-prefix fallback in
-     * cbm_pipeline_lsp_target_node this assertion would fail because the
-     * raw module-path callee_qn doesn't match the project-qualified
-     * gbuf node QN. */
+    /* Локальный callee_qn обязан напрямую совпасть с QN узла графа. */
     ASSERT_GT(c.lsp_strategy_count, 0);
 
     cbm_gbuf_free(gbuf);

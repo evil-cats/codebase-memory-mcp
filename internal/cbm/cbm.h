@@ -181,7 +181,7 @@ typedef enum {
 
 typedef struct {
     const char *name;           // short name
-    const char *qualified_name; // project.path.name
+    const char *qualified_name; // локальный QN вида path.name
     const char *label;          // "Function", "Method", "Class", "Variable", "Module"
     const char *file_path;      // relative path
     uint32_t start_line;

@@ -1646,7 +1646,7 @@ TEST(tool_trace_totals_respect_test_filter) {
     cbm_node_t tgt = {.project = proj,
                       .label = "Function",
                       .name = "tgt",
-                      .qualified_name = "totproj.a.tgt",
+                      .qualified_name = "a.tgt",
                       .file_path = "a.c",
                       .start_line = 1,
                       .end_line = 5};
@@ -1655,7 +1655,7 @@ TEST(tool_trace_totals_respect_test_filter) {
     cbm_node_t prod = {.project = proj,
                        .label = "Function",
                        .name = "prod_caller",
-                       .qualified_name = "totproj.a.prod_caller",
+                       .qualified_name = "a.prod_caller",
                        .file_path = "a.c",
                        .start_line = 10,
                        .end_line = 15};
@@ -1664,7 +1664,7 @@ TEST(tool_trace_totals_respect_test_filter) {
     cbm_node_t tst = {.project = proj,
                       .label = "Function",
                       .name = "test_caller",
-                      .qualified_name = "totproj.t.test_caller",
+                      .qualified_name = "t.test_caller",
                       .file_path = "tests/test_x.c",
                       .start_line = 1,
                       .end_line = 5};
@@ -1801,7 +1801,7 @@ TEST(tool_get_code_snippet_clips_whole_file_node) {
     mod.project = proj;
     mod.label = "Module";
     mod.name = "big";
-    mod.qualified_name = "test-project.big";
+    mod.qualified_name = "big";
     mod.file_path = "big.py";
     mod.start_line = 1;
     mod.end_line = BIG_LINES;
@@ -1810,7 +1810,7 @@ TEST(tool_get_code_snippet_clips_whole_file_node) {
     char *resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"tools/call\",\"params\":{"
              "\"name\":\"get_code_snippet\",\"arguments\":{\"project\":\"test-project\","
-             "\"qualified_name\":\"test-project.big\"}}}");
+             "\"qualified_name\":\"big\"}}}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -1850,6 +1850,7 @@ TEST(tool_search_graph_includes_node_properties) {
     ASSERT_NOT_NULL(strstr(inner, "results:")); /* TOON table header */
     ASSERT_NOT_NULL(strstr(inner, "(rows: qn_suffix name label lines in out;"));
     ASSERT_NOT_NULL(strstr(inner, "HandleRequest"));
+    ASSERT_NULL(strstr(inner, "test-project."));
     ASSERT_NULL(strstr(inner, "func HandleRequest")); /* signature not spilled */
     ASSERT_NULL(strstr(inner, "is_exported"));
     free(inner);
@@ -1888,7 +1889,8 @@ TEST(tool_search_graph_includes_node_properties) {
     ASSERT_NOT_NULL(strstr(inner, "\"rows\""));
     ASSERT_NOT_NULL(strstr(inner, "\"signature\""));      /* requested column */
     ASSERT_NOT_NULL(strstr(inner, "func HandleRequest")); /* its value */
-    ASSERT_NULL(strstr(inner, "is_exported"));            /* blob never spills */
+    ASSERT_NULL(strstr(inner, "test-project."));
+    ASSERT_NULL(strstr(inner, "is_exported")); /* blob never spills */
     free(inner);
     free(resp);
 
@@ -1957,7 +1959,7 @@ TEST(tool_search_graph_toon_never_leaks_internal_fields) {
     n.project = "test-project";
     n.label = "Function";
     n.name = "fpCarrier";
-    n.qualified_name = "test-project.src.fpCarrier";
+    n.qualified_name = "src.fpCarrier";
     n.file_path = "src/fp.go";
     n.start_line = 1;
     n.end_line = 2;
@@ -2005,7 +2007,7 @@ TEST(tool_lean_defaults_schema_and_status) {
     n.project = "test-project";
     n.label = "Function";
     n.name = "schemaCarrier";
-    n.qualified_name = "test-project.src.schemaCarrier";
+    n.qualified_name = "src.schemaCarrier";
     n.file_path = "src/sc.go";
     n.start_line = 1;
     n.end_line = 2;
@@ -2182,7 +2184,7 @@ TEST(tool_search_graph_query_honors_file_pattern_issue552) {
     lib_status.project = proj;
     lib_status.label = "Function";
     lib_status.name = "status";
-    lib_status.qualified_name = "issue-552.src.lib.status";
+    lib_status.qualified_name = "src.lib.status";
     lib_status.file_path = "src/lib/status.c";
     lib_status.start_line = 1;
     lib_status.end_line = 3;
@@ -2192,7 +2194,7 @@ TEST(tool_search_graph_query_honors_file_pattern_issue552) {
     component_status.project = proj;
     component_status.label = "Function";
     component_status.name = "status";
-    component_status.qualified_name = "issue-552.src.components.status";
+    component_status.qualified_name = "src.components.status";
     component_status.file_path = "src/components/status.c";
     component_status.start_line = 1;
     component_status.end_line = 3;
@@ -2557,14 +2559,14 @@ TEST(tool_trace_call_path_ambiguous) {
     cbm_node_t a = {.project = proj,
                     .label = "Function",
                     .name = "amb",
-                    .qualified_name = "amb-proj.a.amb",
+                    .qualified_name = "a.amb",
                     .file_path = "a.c",
                     .start_line = 10,
                     .end_line = 20};
     cbm_node_t b = {.project = proj,
                     .label = "Function",
                     .name = "amb",
-                    .qualified_name = "amb-proj.b.amb",
+                    .qualified_name = "b.amb",
                     .file_path = "b.c",
                     .start_line = 10,
                     .end_line = 20}; /* equal span -> genuine tie */
@@ -2580,6 +2582,9 @@ TEST(tool_trace_call_path_ambiguous) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "ambiguous"));
     ASSERT_NOT_NULL(strstr(inner, "suggestions"));
+    ASSERT_NOT_NULL(strstr(inner, "a.amb"));
+    ASSERT_NOT_NULL(strstr(inner, "b.amb"));
+    ASSERT_NULL(strstr(inner, "amb-proj."));
     ASSERT_NULL(strstr(inner, "\"callees\""));
     free(inner);
     free(resp);
@@ -2611,8 +2616,8 @@ TEST(tool_cpp_overloads_are_separate_and_exactly_addressable) {
     ASSERT_NOT_NULL(srv);
     cbm_store_t *st = cbm_mcp_server_store(srv);
     const char *proj = "overload-proj";
-    const char *qn_int = "overload-proj.ns.f(int)";
-    const char *qn_string = "overload-proj.ns.f(std::string_view)";
+    const char *qn_int = "ns.f(int)";
+    const char *qn_string = "ns.f(std::string_view)";
     cbm_mcp_server_set_project(srv, proj);
     ASSERT_EQ(cbm_store_upsert_project(st, proj, tmp_dir), CBM_STORE_OK);
 
@@ -2635,14 +2640,14 @@ TEST(tool_cpp_overloads_are_separate_and_exactly_addressable) {
     cbm_node_t int_target = {.project = proj,
                              .label = "Function",
                              .name = "int_target",
-                             .qualified_name = "overload-proj.targets.int_target",
+                             .qualified_name = "targets.int_target",
                              .file_path = "overloads.cpp",
                              .start_line = 1,
                              .end_line = 1};
     cbm_node_t string_target = {.project = proj,
                                 .label = "Function",
                                 .name = "string_target",
-                                .qualified_name = "overload-proj.targets.string_target",
+                                .qualified_name = "targets.string_target",
                                 .file_path = "overloads.cpp",
                                 .start_line = 4,
                                 .end_line = 4};
@@ -2674,6 +2679,7 @@ TEST(tool_cpp_overloads_are_separate_and_exactly_addressable) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, qn_int));
     ASSERT_NOT_NULL(strstr(inner, qn_string));
+    ASSERT_NULL(strstr(inner, "overload-proj."));
     free(inner);
 
     raw = cbm_mcp_handle_tool(srv, "search_graph",
@@ -2698,7 +2704,7 @@ TEST(tool_cpp_overloads_are_separate_and_exactly_addressable) {
 
     raw = cbm_mcp_handle_tool(srv, "get_code_snippet",
                               "{\"project\":\"overload-proj\","
-                              "\"qualified_name\":\"overload-proj.ns.f(int)\"}");
+                              "\"qualified_name\":\"ns.f(int)\"}");
     inner = extract_text_content(raw);
     free(raw);
     ASSERT_NOT_NULL(inner);
@@ -2716,10 +2722,9 @@ TEST(tool_cpp_overloads_are_separate_and_exactly_addressable) {
     ASSERT_NOT_NULL(strstr(inner, "ambiguous"));
     free(inner);
 
-    raw = cbm_mcp_handle_tool(
-        srv, "trace_path",
-        "{\"project\":\"overload-proj\","
-        "\"qualified_name\":\"overload-proj.ns.f(int)\",\"direction\":\"outbound\"}");
+    raw = cbm_mcp_handle_tool(srv, "trace_path",
+                              "{\"project\":\"overload-proj\","
+                              "\"qualified_name\":\"ns.f(int)\",\"direction\":\"outbound\"}");
     inner = extract_text_content(raw);
     free(raw);
     ASSERT_NOT_NULL(inner);
@@ -2753,28 +2758,28 @@ TEST(tool_trace_union_records_min_hop_across_seeds) {
     cbm_node_t sa = {.project = proj,
                      .label = "Function",
                      .name = "dual",
-                     .qualified_name = "dualproj.a.dual",
+                     .qualified_name = "a.dual",
                      .file_path = "a.c",
                      .start_line = 1,
                      .end_line = 50};
     cbm_node_t sb = {.project = proj,
                      .label = "Function",
                      .name = "dual",
-                     .qualified_name = "dualproj.b.dual",
+                     .qualified_name = "b.dual",
                      .file_path = "b.d.ts",
                      .start_line = 1,
                      .end_line = 1};
     cbm_node_t mid = {.project = proj,
                       .label = "Function",
                       .name = "mid",
-                      .qualified_name = "dualproj.c.mid",
+                      .qualified_name = "c.mid",
                       .file_path = "c.c",
                       .start_line = 1,
                       .end_line = 5};
     cbm_node_t tgt = {.project = proj,
                       .label = "Function",
                       .name = "tgt",
-                      .qualified_name = "dualproj.c.tgt",
+                      .qualified_name = "c.tgt",
                       .file_path = "c.c",
                       .start_line = 10,
                       .end_line = 15};
@@ -2824,7 +2829,7 @@ TEST(tool_trace_pagination_exactly_once) {
     cbm_node_t hub = {.project = proj,
                       .label = "Function",
                       .name = "hub",
-                      .qualified_name = "pageproj.h.hub",
+                      .qualified_name = "h.hub",
                       .file_path = "h.c",
                       .start_line = 1,
                       .end_line = 9};
@@ -2835,7 +2840,7 @@ TEST(tool_trace_pagination_exactly_once) {
         char nm[16];
         char qn[48];
         snprintf(nm, sizeof(nm), "c%02d", i);
-        snprintf(qn, sizeof(qn), "pageproj.m.c%02d", i);
+        snprintf(qn, sizeof(qn), "m.c%02d", i);
         cbm_node_t n = {.project = proj,
                         .label = "Function",
                         .name = nm,
@@ -2963,7 +2968,7 @@ TEST(tool_trace_call_path_prefers_definition) {
     cbm_node_t wrong = {.project = proj,
                         .label = "Module",
                         .name = "dup",
-                        .qualified_name = "pref-proj.dup",
+                        .qualified_name = "dup",
                         .file_path = "dup.x",
                         .start_line = 1,
                         .end_line = 1};
@@ -2971,14 +2976,14 @@ TEST(tool_trace_call_path_prefers_definition) {
     cbm_node_t def = {.project = proj,
                       .label = "Function",
                       .name = "dup",
-                      .qualified_name = "pref-proj.src.dup",
+                      .qualified_name = "src.dup",
                       .file_path = "src/dup.c",
                       .start_line = 10,
                       .end_line = 50};
     cbm_node_t callee = {.project = proj,
                          .label = "Function",
                          .name = "callee",
-                         .qualified_name = "pref-proj.src.callee",
+                         .qualified_name = "src.callee",
                          .file_path = "src/dup.c",
                          .start_line = 60,
                          .end_line = 70};
@@ -3080,28 +3085,28 @@ TEST(tool_trace_call_path_distinct_defs_not_over_unioned) {
     cbm_node_t da = {.project = proj,
                      .label = "Function",
                      .name = "dupreal",
-                     .qualified_name = "ou-proj.a.dupreal",
+                     .qualified_name = "a.dupreal",
                      .file_path = "a.c",
                      .start_line = 10,
                      .end_line = 20}; /* span 10 */
     cbm_node_t db = {.project = proj,
                      .label = "Function",
                      .name = "dupreal",
-                     .qualified_name = "ou-proj.b.dupreal",
+                     .qualified_name = "b.dupreal",
                      .file_path = "b.c",
                      .start_line = 10,
                      .end_line = 40}; /* span 30 (no tie) */
     cbm_node_t ca = {.project = proj,
                      .label = "Function",
                      .name = "callerA",
-                     .qualified_name = "ou-proj.a.callerA",
+                     .qualified_name = "a.callerA",
                      .file_path = "a.c",
                      .start_line = 30,
                      .end_line = 40};
     cbm_node_t cb = {.project = proj,
                      .label = "Function",
                      .name = "callerB",
-                     .qualified_name = "ou-proj.b.callerB",
+                     .qualified_name = "b.callerB",
                      .file_path = "b.c",
                      .start_line = 50,
                      .end_line = 60};
@@ -3149,28 +3154,28 @@ TEST(tool_trace_call_path_dts_stub_unions_with_impl) {
     cbm_node_t impl = {.project = proj,
                        .label = "Function",
                        .name = "sym546",
-                       .qualified_name = "dts-proj.impl.sym546",
+                       .qualified_name = "impl.sym546",
                        .file_path = "src/sym.ts",
                        .start_line = 10,
                        .end_line = 30}; /* real body */
     cbm_node_t stub = {.project = proj,
                        .label = "Function",
                        .name = "sym546",
-                       .qualified_name = "dts-proj.stub.sym546",
+                       .qualified_name = "stub.sym546",
                        .file_path = "types/sym.d.ts",
                        .start_line = 5,
                        .end_line = 5}; /* body-less ambient decl */
     cbm_node_t crel = {.project = proj,
                        .label = "Function",
                        .name = "callerRel",
-                       .qualified_name = "dts-proj.callerRel",
+                       .qualified_name = "callerRel",
                        .file_path = "src/rel.ts",
                        .start_line = 1,
                        .end_line = 8};
     cbm_node_t cali = {.project = proj,
                        .label = "Function",
                        .name = "callerAlias",
-                       .qualified_name = "dts-proj.callerAlias",
+                       .qualified_name = "callerAlias",
                        .file_path = "src/ali.ts",
                        .start_line = 1,
                        .end_line = 8};
@@ -3346,7 +3351,7 @@ TEST(tool_get_architecture_emits_populated_sections) {
     main_fn.project = proj;
     main_fn.label = "Function";
     main_fn.name = "main";
-    main_fn.qualified_name = "arch-test.cmd.main";
+    main_fn.qualified_name = "cmd.main";
     main_fn.file_path = "cmd/main.go";
     main_fn.start_line = 1;
     main_fn.end_line = 3;
@@ -3394,7 +3399,7 @@ TEST(tool_get_architecture_overview_compact_subset_pr560) {
     main_fn.project = proj;
     main_fn.label = "Function";
     main_fn.name = "main";
-    main_fn.qualified_name = "arch560.cmd.main";
+    main_fn.qualified_name = "cmd.main";
     main_fn.file_path = "cmd/main.go";
     main_fn.start_line = 1;
     main_fn.end_line = 3;
@@ -3406,7 +3411,7 @@ TEST(tool_get_architecture_overview_compact_subset_pr560) {
     cbm_node_t file_node = {.project = proj,
                             .label = "File",
                             .name = "main.go",
-                            .qualified_name = "arch560.cmd.main.go",
+                            .qualified_name = "cmd.main.go",
                             .file_path = "cmd/main.go"};
     ASSERT_GT(cbm_store_upsert_node(st, &file_node), 0);
 
@@ -3496,7 +3501,7 @@ TEST(tool_get_architecture_accepts_project_name_alias_issue640) {
     main_fn.project = proj;
     main_fn.label = "Function";
     main_fn.name = "main";
-    main_fn.qualified_name = "alias640.cmd.main";
+    main_fn.qualified_name = "cmd.main";
     main_fn.file_path = "cmd/main.go";
     main_fn.start_line = 1;
     main_fn.end_line = 3;
@@ -3540,7 +3545,7 @@ TEST(tool_search_graph_accepts_project_name_alias_issue640) {
     fn.project = proj;
     fn.label = "Function";
     fn.name = "WidgetHandler";
-    fn.qualified_name = "alias640b.svc.WidgetHandler";
+    fn.qualified_name = "svc.WidgetHandler";
     fn.file_path = "svc/widget.go";
     fn.start_line = 1;
     fn.end_line = 2;
@@ -3677,28 +3682,28 @@ TEST(tool_get_architecture_path_scoping) {
     cbm_node_t pkg_global = {.project = proj,
                              .label = "Package",
                              .name = "Django",
-                             .qualified_name = "arch-path.Django",
+                             .qualified_name = "Django",
                              .file_path = "vendor/django/__init__.py"};
     cbm_store_upsert_node(st, &pkg_global);
 
     cbm_node_t pkg_local = {.project = proj,
                             .label = "Package",
                             .name = "hoa",
-                            .qualified_name = "arch-path.hoa",
+                            .qualified_name = "hoa",
                             .file_path = "apps/hoa/main.go"};
     cbm_store_upsert_node(st, &pkg_local);
 
     cbm_node_t f_hoa = {.project = proj,
                         .label = "File",
                         .name = "main.go",
-                        .qualified_name = "arch-path.apps.hoa.main.go",
+                        .qualified_name = "apps.hoa.main.go",
                         .file_path = "apps/hoa/main.go"};
     cbm_store_upsert_node(st, &f_hoa);
 
     cbm_node_t f_other = {.project = proj,
                           .label = "File",
                           .name = "other.go",
-                          .qualified_name = "arch-path.other.go",
+                          .qualified_name = "other.go",
                           .file_path = "lib/other.go"};
     cbm_store_upsert_node(st, &f_other);
 
@@ -3922,7 +3927,7 @@ TEST(search_code_scoped_path_with_spaces_issue687) {
     cbm_node_t n = {.project = proj,
                     .label = "Function",
                     .name = "HandleRequest",
-                    .qualified_name = "space-search.main.HandleRequest",
+                    .qualified_name = "main.HandleRequest",
                     .file_path = "main.go",
                     .start_line = 3,
                     .end_line = 5};
@@ -3999,7 +4004,7 @@ TEST(search_code_scoped_path_with_cjk_root_issue903) {
     cbm_node_t n = {.project = proj,
                     .label = "Function",
                     .name = "HandleRequest",
-                    .qualified_name = "cjk-search.main.HandleRequest",
+                    .qualified_name = "main.HandleRequest",
                     .file_path = "main.go",
                     .start_line = 3,
                     .end_line = 5};
@@ -4076,14 +4081,14 @@ static cbm_mcp_server_t *setup_prefilter_server(char *tmp, size_t tmp_sz, char *
     cbm_node_t n1 = {.project = proj,
                      .label = "Function",
                      .name = "HandleRequest",
-                     .qualified_name = "prefilter-search.main.HandleRequest",
+                     .qualified_name = "main.HandleRequest",
                      .file_path = "src/handler.go",
                      .start_line = 3,
                      .end_line = 5};
     cbm_node_t n2 = {.project = proj,
                      .label = "Function",
                      .name = "HandleRequest",
-                     .qualified_name = "prefilter-search.vendored.HandleRequest",
+                     .qualified_name = "vendored.HandleRequest",
                      .file_path = "vendor/other.go",
                      .start_line = 3,
                      .end_line = 5};
@@ -6380,7 +6385,7 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     n_hr.project = proj_name;
     n_hr.label = "Function";
     n_hr.name = "HandleRequest";
-    n_hr.qualified_name = "test-project.cmd.server.main.HandleRequest";
+    n_hr.qualified_name = "cmd.server.main.HandleRequest";
     n_hr.file_path = "main.go";
     n_hr.start_line = 3;
     n_hr.end_line = 5;
@@ -6393,7 +6398,7 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     n_po.project = proj_name;
     n_po.label = "Function";
     n_po.name = "ProcessOrder";
-    n_po.qualified_name = "test-project.cmd.server.main.ProcessOrder";
+    n_po.qualified_name = "cmd.server.main.ProcessOrder";
     n_po.file_path = "main.go";
     n_po.start_line = 7;
     n_po.end_line = 9;
@@ -6404,7 +6409,7 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     n_run1.project = proj_name;
     n_run1.label = "Function";
     n_run1.name = "Run";
-    n_run1.qualified_name = "test-project.cmd.server.Run";
+    n_run1.qualified_name = "cmd.server.Run";
     n_run1.file_path = "main.go";
     n_run1.start_line = 11;
     n_run1.end_line = 13;
@@ -6414,7 +6419,7 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     n_run2.project = proj_name;
     n_run2.label = "Function";
     n_run2.name = "Run";
-    n_run2.qualified_name = "test-project.cmd.worker.Run";
+    n_run2.qualified_name = "cmd.worker.Run";
     n_run2.file_path = "main.go";
     n_run2.start_line = 11;
     n_run2.end_line = 13;
@@ -6517,9 +6522,8 @@ TEST(snippet_exact_qn) {
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    char *resp =
-        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
-                          "\"project\":\"test-project\"}");
+    char *resp = call_snippet(srv, "{\"qualified_name\":\"cmd.server.main.HandleRequest\","
+                                   "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"name\":\"HandleRequest\""));
     ASSERT_NOT_NULL(strstr(resp, "\"source\""));
@@ -6620,8 +6624,9 @@ TEST(snippet_ambiguous_short_name) {
     /* Must NOT have "source" */
     ASSERT_NULL(strstr(resp, "\"source\""));
     /* Should have at least 2 suggestions with qualified_name */
-    ASSERT_NOT_NULL(strstr(resp, "test-project.cmd.server.Run"));
-    ASSERT_NOT_NULL(strstr(resp, "test-project.cmd.worker.Run"));
+    ASSERT_NOT_NULL(strstr(resp, "cmd.server.Run"));
+    ASSERT_NOT_NULL(strstr(resp, "cmd.worker.Run"));
+    ASSERT_NULL(strstr(resp, "test-project.cmd"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -6680,9 +6685,8 @@ TEST(snippet_enriched_properties) {
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    char *resp =
-        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
-                          "\"project\":\"test-project\"}");
+    char *resp = call_snippet(srv, "{\"qualified_name\":\"cmd.server.main.HandleRequest\","
+                                   "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"source\""));
     ASSERT_NULL(strstr(resp, "\"signature\""));
@@ -6764,9 +6768,8 @@ TEST(snippet_include_neighbors_default) {
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    char *resp =
-        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
-                          "\"project\":\"test-project\"}");
+    char *resp = call_snippet(srv, "{\"qualified_name\":\"cmd.server.main.HandleRequest\","
+                                   "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
     /* Without include_neighbors → NO caller_names/callee_names */
     ASSERT_NULL(strstr(resp, "\"caller_names\""));
@@ -6788,9 +6791,8 @@ TEST(snippet_include_neighbors_enabled) {
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    char *resp =
-        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
-                          "\"include_neighbors\":true,\"project\":\"test-project\"}");
+    char *resp = call_snippet(srv, "{\"qualified_name\":\"cmd.server.main.HandleRequest\","
+                                   "\"include_neighbors\":true,\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"source\""));
     /* HandleRequest has 0 callers → no caller_names array */
@@ -6826,10 +6828,9 @@ TEST(snippet_source_invalid_utf8) {
     ASSERT_EQ(fwrite(source, 1, sizeof(source), fp), sizeof(source));
     ASSERT_EQ(fclose(fp), 0);
 
-    char *raw =
-        cbm_mcp_handle_tool(srv, "get_code_snippet",
-                            "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
-                            "\"project\":\"test-project\"}");
+    char *raw = cbm_mcp_handle_tool(srv, "get_code_snippet",
+                                    "{\"qualified_name\":\"cmd.server.main.HandleRequest\","
+                                    "\"project\":\"test-project\"}");
     ASSERT_TRUE(is_valid_json_response(raw));
     char *resp = extract_text_content(raw);
     ASSERT_NOT_NULL(resp);
@@ -7787,7 +7788,7 @@ TEST(readonly_query_does_not_mutate_db) {
     cbm_node_t node = {.project = ROQ_PROJECT,
                        .label = "Function",
                        .name = "ReadOnlyProbe",
-                       .qualified_name = "roq.mod.ReadOnlyProbe",
+                       .qualified_name = "mod.ReadOnlyProbe",
                        .file_path = "mod.c"};
     ASSERT_TRUE(cbm_store_upsert_node(setup, &node) > 0);
     ASSERT_EQ(cbm_store_exec(setup, "PRAGMA journal_mode=DELETE;"), 0);
@@ -7899,7 +7900,7 @@ TEST(readonly_query_succeeds_on_readonly_fs) {
     cbm_node_t node = {.project = ROQ_PROJECT,
                        .label = "Function",
                        .name = "ReadOnlyProbe",
-                       .qualified_name = "roq.mod.ReadOnlyProbe",
+                       .qualified_name = "mod.ReadOnlyProbe",
                        .file_path = "mod.c"};
     ASSERT_TRUE(cbm_store_upsert_node(setup, &node) > 0);
     (void)cbm_store_checkpoint(setup); /* fold WAL frames into the main file */

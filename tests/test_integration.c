@@ -473,17 +473,17 @@ TEST(integ_mcp_delete_project) {
  * ══════════════════════════════════════════════════════════════════ */
 
 TEST(integ_pipeline_fqn_compute) {
-    char *fqn = cbm_pipeline_fqn_compute("myproject", "src/utils.go", "Add");
+    char *fqn = cbm_pipeline_fqn_compute("src/utils.go", "Add");
     ASSERT_NOT_NULL(fqn);
-    ASSERT_STR_EQ(fqn, "myproject.src.utils.Add");
+    ASSERT_STR_EQ(fqn, "src.utils.Add");
     free(fqn);
     PASS();
 }
 
 TEST(integ_pipeline_fqn_module) {
-    char *fqn = cbm_pipeline_fqn_module("myproject", "src/utils.go");
+    char *fqn = cbm_pipeline_fqn_module("src/utils.go");
     ASSERT_NOT_NULL(fqn);
-    ASSERT_STR_EQ(fqn, "myproject.src.utils");
+    ASSERT_STR_EQ(fqn, "src.utils");
     free(fqn);
     PASS();
 }

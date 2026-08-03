@@ -80,7 +80,7 @@ static const char *compute_wolfram_func_qn(CBMExtractCtx *ctx, TSNode node) {
             if (strcmp(ts_node_type(head), "user_symbol") == 0) {
                 char *name = cbm_node_text(ctx->arena, head, ctx->source);
                 if (name && name[0]) {
-                    return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+                    return cbm_fqn_compute(ctx->arena, ctx->rel_path, name);
                 }
             }
         }
@@ -154,7 +154,7 @@ static const char *compute_lisp_func_qn(CBMExtractCtx *ctx, TSNode node) {
     if (!name || !name[0]) {
         return NULL;
     }
-    return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+    return cbm_fqn_compute(ctx->arena, ctx->rel_path, name);
 }
 
 /* Resolve an Elixir def/defp/defmacro's QN for scope tracking. The def is a
@@ -193,7 +193,7 @@ static const char *compute_elixir_func_qn(CBMExtractCtx *ctx, TSNode node) {
     if (!name || !name[0]) {
         return NULL;
     }
-    return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+    return cbm_fqn_compute(ctx->arena, ctx->rel_path, name);
 }
 
 /* Resolve a CFML tag-function's QN for scope tracking. A <cffunction name="foo">
@@ -234,7 +234,7 @@ static const char *compute_cfml_func_qn(CBMExtractCtx *ctx, TSNode node) {
     if (!name || !name[0]) {
         return NULL;
     }
-    return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+    return cbm_fqn_compute(ctx->arena, ctx->rel_path, name);
 }
 
 /* Resolve a Go-template named-template's QN for scope tracking. A
@@ -262,7 +262,7 @@ static const char *compute_gotemplate_func_qn(CBMExtractCtx *ctx, TSNode node) {
     if (!raw || !raw[0]) {
         return NULL;
     }
-    return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, raw);
+    return cbm_fqn_compute(ctx->arena, ctx->rel_path, raw);
 }
 
 // --- ObjectScript variable type inference (instance_method_call resolution) ---
@@ -446,7 +446,7 @@ static const char *objectscript_get_class_name(CBMExtractCtx *ctx, TSNode node) 
         if (strcmp(ts_node_type(child), "class_name") == 0) {
             char *name = cbm_node_text(ctx->arena, child, ctx->source);
             if (name && name[0]) {
-                return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+                return cbm_fqn_compute(ctx->arena, ctx->rel_path, name);
             }
         }
     }
@@ -474,7 +474,7 @@ static const char *objectscript_get_method_qn(CBMExtractCtx *ctx, TSNode node,
                                 return cbm_arena_sprintf(ctx->arena, "%s.%s", enclosing_class_qn,
                                                          name);
                             }
-                            return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+                            return cbm_fqn_compute(ctx->arena, ctx->rel_path, name);
                         }
                     }
                 }
@@ -498,7 +498,7 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         if (strcmp(ts_node_type(node), "tag") == 0) {
             char *name = cbm_node_text(ctx->arena, node, ctx->source);
             if (name && name[0]) {
-                return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+                return cbm_fqn_compute(ctx->arena, ctx->rel_path, name);
             }
         }
         return NULL;
@@ -548,8 +548,7 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
                 if (state->enclosing_class_qn) {
                     return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, mname);
                 }
-                return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, mname,
-                                                   ctx->language);
+                return cbm_fqn_compute_source_lang(ctx->arena, ctx->rel_path, mname, ctx->language);
             }
         }
     }
@@ -574,8 +573,7 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
                 if (state->enclosing_class_qn) {
                     return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, nm);
                 }
-                return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, nm,
-                                                   ctx->language);
+                return cbm_fqn_compute_source_lang(ctx->arena, ctx->rel_path, nm, ctx->language);
             }
         }
     }
@@ -605,8 +603,8 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
             if (!ts_node_is_null(nm)) {
                 char *name = cbm_node_text(ctx->arena, nm, ctx->source);
                 if (name && name[0]) {
-                    return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path,
-                                                       name, ctx->language);
+                    return cbm_fqn_compute_source_lang(ctx->arena, ctx->rel_path, name,
+                                                       ctx->language);
                 }
             }
         }
@@ -639,8 +637,7 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
     if (is_cpp && strcmp(ts_node_type(node), "function_definition") == 0) {
         char *scope_name = cbm_cpp_out_of_line_parent_class(ctx->arena, node, ctx->source);
         if (scope_name && scope_name[0]) {
-            const char *class_qn =
-                cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, scope_name);
+            const char *class_qn = cbm_fqn_compute(ctx->arena, ctx->rel_path, scope_name);
             base_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, name);
         }
     }
@@ -652,8 +649,7 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         /* Для Java/Go модуль определяется каталогом: так QN вызывающей функции
          * совпадает с QN определения и caller_qn из LSP (ключи соединяются по
          * точному равенству). */
-        base_qn = cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name,
-                                              ctx->language);
+        base_qn = cbm_fqn_compute_source_lang(ctx->arena, ctx->rel_path, name, ctx->language);
     }
     if (!is_cpp) {
         return base_qn;
@@ -712,8 +708,7 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
     }
 
     /* Java/Go: directory-based module (see compute_func_qn). */
-    return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name,
-                                       ctx->language);
+    return cbm_fqn_compute_source_lang(ctx->arena, ctx->rel_path, name, ctx->language);
 }
 
 /* Forward declaration */
@@ -1449,8 +1444,7 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
         if (!ts_node_is_null(type_node)) {
             char *type_name = cbm_node_text(ctx->arena, type_node, ctx->source);
             if (type_name && type_name[0]) {
-                const char *tqn =
-                    cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, type_name);
+                const char *tqn = cbm_fqn_compute(ctx->arena, ctx->rel_path, type_name);
                 push_scope(state, SCOPE_CLASS, depth, tqn);
             }
         }

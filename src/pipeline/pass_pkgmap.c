@@ -718,8 +718,7 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
 
 /* ── Merge: per-worker entries → hash table ────────────────────── */
 
-CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count,
-                               const char *project_name) {
+CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count) {
     /* Count total entries */
     int total = 0;
     for (int w = 0; w < worker_count; w++) {
@@ -735,8 +734,8 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
     for (int w = 0; w < worker_count; w++) {
         cbm_pkg_entries_t *we = &worker_entries[w];
         for (int i = 0; i < we->count; i++) {
-            /* Convert entry_rel to QN: project.dir.parts */
-            char *qn = cbm_pipeline_fqn_module(project_name, we->items[i].entry_rel);
+            /* Преобразуем entry_rel в локальный QN вида dir.parts. */
+            char *qn = cbm_pipeline_fqn_module(we->items[i].entry_rel);
             if (!qn) {
                 continue;
             }
@@ -937,8 +936,7 @@ int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char
 }
 
 /* Build pkgmap for sequential path (reads manifest files directly) */
-CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file_count,
-                                          const char *project_name) {
+CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file_count) {
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
 
@@ -958,7 +956,7 @@ CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file
         free(source);
     }
 
-    CBMHashTable *map = cbm_pkgmap_build(&entries, SKIP_ONE, project_name);
+    CBMHashTable *map = cbm_pkgmap_build(&entries, SKIP_ONE);
     cbm_pkg_entries_free(&entries);
     return map;
 }
@@ -968,8 +966,7 @@ CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file
  * (the canonical case: package.json, which is in IGNORED_JSON_FILES).
  * Falls back to the files[]-only behaviour if repo_path is NULL. */
 CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
-                                         int file_count, const char *project_name,
-                                         char **excluded_dirs, int excluded_count) {
+                                         int file_count, char **excluded_dirs, int excluded_count) {
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
 
@@ -997,7 +994,7 @@ CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_i
     cbm_log_info("pkgmap.scan", "manifests_from_files", pkgmap_itoa(from_files),
                  "manifests_from_walk", pkgmap_itoa(from_walk), "entries",
                  pkgmap_itoa(entries.count));
-    CBMHashTable *map = cbm_pkgmap_build(&entries, SKIP_ONE, project_name);
+    CBMHashTable *map = cbm_pkgmap_build(&entries, SKIP_ONE);
     cbm_pkg_entries_free(&entries);
     return map;
 }
@@ -1052,8 +1049,7 @@ static char *resolve_slash_prefix(CBMHashTable *map, const char *module_path) {
 
 /* Try dot-based prefix matching (Java: com.myorg.pkg.Foo).
  * Returns heap QN or NULL. */
-static char *resolve_dot_prefix(CBMHashTable *map, const char *module_path,
-                                const char *project_name) {
+static char *resolve_dot_prefix(CBMHashTable *map, const char *module_path) {
     char *buf = strdup(module_path);
     if (!buf) {
         return NULL;
@@ -1078,7 +1074,7 @@ static char *resolve_dot_prefix(CBMHashTable *map, const char *module_path,
         char result[PKGMAP_PATH_BUF];
         snprintf(result, sizeof(result), "%s/%s", base_qn, subpath_slashed);
         free(buf);
-        return cbm_pipeline_fqn_module(project_name, result);
+        return cbm_pipeline_fqn_module(result);
     }
     free(buf);
     return NULL;
@@ -1086,8 +1082,7 @@ static char *resolve_dot_prefix(CBMHashTable *map, const char *module_path,
 
 /* Try backslash-based prefix matching (PHP PSR-4: App\\Controllers\\Foo).
  * Returns heap QN or NULL. */
-static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path,
-                                      const char *project_name) {
+static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path) {
     char *buf = strdup(module_path);
     if (!buf) {
         return NULL;
@@ -1112,7 +1107,7 @@ static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path
             }
         }
         free(buf);
-        return cbm_pipeline_fqn_module(project_name, path_result);
+        return cbm_pipeline_fqn_module(path_result);
     }
     free(buf);
     return NULL;
@@ -1121,13 +1116,13 @@ static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path
 char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
                                   const char *module_path) {
     if (!ctx || !module_path) {
-        return cbm_pipeline_fqn_module(ctx ? ctx->project_name : NULL, module_path);
+        return cbm_pipeline_fqn_module(module_path);
     }
 
     /* 1. Try relative import resolution (existing logic) */
     char *resolved = cbm_pipeline_resolve_relative_import(source_rel, module_path);
     if (resolved) {
-        char *qn = cbm_pipeline_fqn_module(ctx->project_name, resolved);
+        char *qn = cbm_pipeline_fqn_module(resolved);
         free(resolved);
         return qn;
     }
@@ -1140,7 +1135,7 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
         if (amap) {
             char *aliased = cbm_path_alias_resolve(amap, module_path);
             if (aliased) {
-                char *qn = cbm_pipeline_fqn_module(ctx->project_name, aliased);
+                char *qn = cbm_pipeline_fqn_module(aliased);
                 free(aliased);
                 return qn;
             }
@@ -1150,7 +1145,7 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
     /* 2. No pkgmap → fall through immediately */
     CBMHashTable *pkgmap = cbm_pipeline_get_pkgmap();
     if (!pkgmap) {
-        return cbm_pipeline_fqn_module(ctx->project_name, module_path);
+        return cbm_pipeline_fqn_module(module_path);
     }
 
     /* 3. Exact lookup */
@@ -1162,17 +1157,17 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
     /* 4. Prefix matching by separator type */
     char *result = resolve_slash_prefix(pkgmap, module_path);
     if (!result) {
-        result = resolve_dot_prefix(pkgmap, module_path, ctx->project_name);
+        result = resolve_dot_prefix(pkgmap, module_path);
     }
     if (!result) {
-        result = resolve_backslash_prefix(pkgmap, module_path, ctx->project_name);
+        result = resolve_backslash_prefix(pkgmap, module_path);
     }
     if (result) {
         return result;
     }
 
     /* 5. Fallthrough to default resolution */
-    return cbm_pipeline_fqn_module(ctx->project_name, module_path);
+    return cbm_pipeline_fqn_module(module_path);
 }
 
 /* ── Import-target node resolver ─────────────────────────────────── */
@@ -1475,7 +1470,7 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
 
     const cbm_gbuf_node_t *found = NULL;
     for (int i = 0; i < ncand; i++) {
-        char *qn = cbm_pipeline_fqn_module(ctx->project_name, cands[i]);
+        char *qn = cbm_pipeline_fqn_module(cands[i]);
         if (!qn) {
             continue;
         }
@@ -1772,8 +1767,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 
 /* ── Namespace map ───────────────────────────────────────────────── */
 
-CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
-                                               CBMFileResult *const *results,
+CBMHashTable *cbm_pipeline_namespace_map_build(CBMFileResult *const *results,
                                                const char *const *rels, int count) {
     CBMHashTable *map = NULL;
     for (int i = 0; i < count; i++) {
@@ -1787,7 +1781,7 @@ CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
                 return NULL;
             }
         }
-        char *file_qn = cbm_pipeline_fqn_compute(project_name, rels[i], "__file__");
+        char *file_qn = cbm_pipeline_fqn_compute(rels[i], "__file__");
         if (!file_qn) {
             continue;
         }

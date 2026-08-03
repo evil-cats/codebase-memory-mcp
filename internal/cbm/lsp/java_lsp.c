@@ -550,15 +550,14 @@ const char *java_resolve_type_name(JavaLSPContext *ctx, const char *name) {
         return cbm_arena_strdup(ctx->arena, name);
     }
 
-    /* Cross-file sole-definer fallback. A same-package static call
-     * `Util.square()` references class `Util` whose graph QN embeds the
-     * defining file's path ("<project>.Util.Util"), which the caller's
-     * module_qn ("<project>.Main") can't reconstruct — and the fixture has no
-     * import to pin it.  When the project-wide registry holds EXACTLY ONE type
-     * with this short name, resolve to it.  Bounded to a single candidate so an
-     * ambiguous name (>1 type) stays unresolved — sound, mirroring the
-     * registry's "unique_name" strategy.  Only fires after all qualified
-     * lookups miss, so it never overrides a more specific match. */
+    /* Межфайловая резервная попытка для единственного определения. Статический
+     * вызов Util.square() в том же пакете ссылается на класс Util, чей QN
+     * содержит путь определяющего файла ("Util.Util"). module_qn вызывающего
+     * файла ("Main") восстановить этот путь не может, а явного импорта нет.
+     * Если во всём реестре существует ровно один тип с таким коротким именем,
+     * используем его. При нескольких кандидатах имя остаётся неразрешённым.
+     * Эта ветка выполняется только после промаха всех точных поисков и не
+     * переопределяет более специфичное совпадение. */
     if (ctx->registry && ctx->registry->types) {
         const char *only_qn = NULL;
         int matches = 0;

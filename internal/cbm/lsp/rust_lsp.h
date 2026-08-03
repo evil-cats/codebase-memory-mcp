@@ -75,7 +75,7 @@ typedef struct {
     const char **glob_module_qns;
     int glob_count;
 
-    /* Module-qualified name for this file (e.g. "<project>.<crate>.foo"). */
+    /* Локальный QN модуля этого файла, например "src.foo". */
     const char *module_qn;
 
     /* Enclosing function context. `enclosing_func_qn` is the QN we attach

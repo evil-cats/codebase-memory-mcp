@@ -43,7 +43,7 @@ enum {
     ST_SQL_BUF = 8192,
     ST_MAX_ROW_CHECK = 5,
     ST_QN_MAX_DOTS = 5,
-    ST_QN_MIN_DOTS = 3,
+    ST_QN_SUBPACKAGE_MIN_DOTS = 2,
     ST_IN_CLAUSE_MARGIN = 4,
     ST_GLOB_MIN_LEN = 3,
     ST_GLOB_SKIP = 2,
@@ -114,7 +114,6 @@ struct cbm_store {
     sqlite3_stmt *stmt_upsert_node;
     sqlite3_stmt *stmt_find_node_by_id;
     sqlite3_stmt *stmt_find_node_by_qn;
-    sqlite3_stmt *stmt_find_node_by_qn_any; /* QN lookup without project filter */
     sqlite3_stmt *stmt_find_nodes_by_name;
     sqlite3_stmt *stmt_find_nodes_by_name_any; /* name lookup without project filter */
     sqlite3_stmt *stmt_find_nodes_by_label;
@@ -980,6 +979,22 @@ bool cbm_store_check_integrity(cbm_store_t *s) {
     return ok;
 }
 
+bool cbm_store_qn_format_is_current(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return false;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, "PRAGMA user_version;", CBM_NOT_FOUND, &stmt, NULL) !=
+        SQLITE_OK) {
+        return false;
+    }
+    bool current =
+        sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == CBM_QN_FORMAT_VERSION;
+    sqlite3_finalize(stmt);
+    return current;
+}
+
 cbm_store_t *cbm_store_open(const char *project) {
     if (!project) {
         return NULL;
@@ -1018,7 +1033,6 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_upsert_node);
     finalize_stmt(&s->stmt_find_node_by_id);
     finalize_stmt(&s->stmt_find_node_by_qn);
-    finalize_stmt(&s->stmt_find_node_by_qn_any);
     finalize_stmt(&s->stmt_find_nodes_by_name);
     finalize_stmt(&s->stmt_find_nodes_by_name_any);
     finalize_stmt(&s->stmt_find_nodes_by_label);
@@ -1594,28 +1608,6 @@ int cbm_store_find_node_by_qn(cbm_store_t *s, const char *project, const char *q
 
     bind_text(stmt, SKIP_ONE, project);
     bind_text(stmt, ST_COL_2, qn);
-    int rc = sqlite3_step(stmt);
-    if (rc == SQLITE_ROW) {
-        scan_node(stmt, out);
-        return CBM_STORE_OK;
-    }
-    return CBM_STORE_NOT_FOUND;
-}
-
-int cbm_store_find_node_by_qn_any(cbm_store_t *s, const char *qn, cbm_node_t *out) {
-    if (!s || !s->db) {
-        return CBM_STORE_ERR;
-    }
-    sqlite3_stmt *stmt =
-        prepare_cached(s, &s->stmt_find_node_by_qn_any,
-                       "SELECT id, project, label, name, qualified_name, file_path, "
-                       "start_line, end_line, properties FROM nodes "
-                       "WHERE qualified_name = ?1 LIMIT 1;");
-    if (!stmt) {
-        return CBM_STORE_ERR;
-    }
-
-    bind_text(stmt, SKIP_ONE, qn);
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
         scan_node(stmt, out);
@@ -4811,7 +4803,7 @@ void cbm_store_schema_free(cbm_schema_info_t *out) {
 
 /* ── Architecture helpers ───────────────────────────────────────── */
 
-/* Extract sub-package from QN: project.dir1.dir2.sym → dir1 (4+ parts → [2], else [1]) */
+/* Извлекает пакет из локального QN: dir1.dir2.sym → dir2, dir1.sym → dir1. */
 const char *cbm_qn_to_package(const char *qn) {
     if (!qn || !qn[0]) {
         return "";
@@ -4825,23 +4817,21 @@ const char *cbm_qn_to_package(const char *qn) {
             dots[ndots++] = p;
         }
     }
-    /* 4+ segments: return segment[2] */
-    if (ndots >= ST_QN_MIN_DOTS) {
-        const char *start = dots[SKIP_ONE] + SKIP_ONE;
-        int len = (int)(dots[ST_COL_2] - start);
+    /* Три и более сегмента: возвращаем segment[1]. */
+    if (ndots >= ST_QN_SUBPACKAGE_MIN_DOTS) {
+        const char *start = dots[0] + SKIP_ONE;
+        int len = (int)(dots[SKIP_ONE] - start);
         if (len > 0 && len < (int)sizeof(buf)) {
             memcpy(buf, start, len);
             buf[len] = '\0';
             return buf;
         }
     }
-    /* 2+ segments: return segment[1] */
+    /* Два сегмента: возвращаем segment[0]. */
     if (ndots >= SKIP_ONE) {
-        const char *start = dots[0] + SKIP_ONE;
-        const char *end = (ndots >= ST_COL_2) ? dots[SKIP_ONE] : qn + strlen(qn);
-        int len = (int)(end - start);
+        int len = (int)(dots[0] - qn);
         if (len > 0 && len < (int)sizeof(buf)) {
-            memcpy(buf, start, len);
+            memcpy(buf, qn, len);
             buf[len] = '\0';
             return buf;
         }
@@ -4849,7 +4839,7 @@ const char *cbm_qn_to_package(const char *qn) {
     return "";
 }
 
-/* Extract top-level package from QN: project.dir1.rest → dir1 (segment[1]) */
+/* Извлекает верхний пакет из локального QN: dir1.rest → dir1. */
 const char *cbm_qn_to_top_package(const char *qn) {
     if (!qn || !qn[0]) {
         return "";
@@ -4859,12 +4849,9 @@ const char *cbm_qn_to_top_package(const char *qn) {
     if (!first_dot) {
         return "";
     }
-    const char *start = first_dot + SKIP_ONE;
-    const char *second_dot = strchr(start, '.');
-    const char *end = second_dot ? second_dot : qn + strlen(qn);
-    int len = (int)(end - start);
+    int len = (int)(first_dot - qn);
     if (len > 0 && len < (int)sizeof(buf)) {
-        memcpy(buf, start, len);
+        memcpy(buf, qn, len);
         buf[len] = '\0';
         return buf;
     }

@@ -97,10 +97,10 @@ static bool cross_repo_seed_http_pair(const cross_repo_fixture_t *fixture,
     char handler_qn[256];
     char route_name[128];
     char edge_props[256];
-    snprintf(caller_qn, sizeof(caller_qn), "%s.call.%s", source_project, suffix);
-    snprintf(local_route_qn, sizeof(local_route_qn), "%s.local-route.%s", source_project, suffix);
+    snprintf(caller_qn, sizeof(caller_qn), "call.%s", suffix);
+    snprintf(local_route_qn, sizeof(local_route_qn), "local-route.%s", suffix);
     snprintf(target_route_qn, sizeof(target_route_qn), "__route__GET__%s", route_path);
-    snprintf(handler_qn, sizeof(handler_qn), "%s.handle.%s", target_project, suffix);
+    snprintf(handler_qn, sizeof(handler_qn), "handle.%s", suffix);
     snprintf(route_name, sizeof(route_name), "GET %s", route_path);
     snprintf(edge_props, sizeof(edge_props), "{\"url_path\":\"%s\",\"method\":\"GET\"}",
              route_path);
@@ -257,7 +257,7 @@ static bool cross_repo_seed_bounded_scan(const cross_repo_fixture_t *fixture,
     cbm_node_t caller = {.project = source_project,
                          .label = "Function",
                          .name = "bounded_caller",
-                         .qualified_name = "bounded.source.caller",
+                         .qualified_name = "source.caller",
                          .file_path = "client.c"};
     int64_t caller_id = ok ? cbm_store_upsert_node(source, &caller) : 0;
     ok = ok && caller_id > 0 &&
@@ -266,7 +266,7 @@ static bool cross_repo_seed_bounded_scan(const cross_repo_fixture_t *fixture,
         char name[64];
         char qn[96];
         snprintf(name, sizeof(name), "local_route_%d", i);
-        snprintf(qn, sizeof(qn), "bounded.source.route.%d", i);
+        snprintf(qn, sizeof(qn), "source.route.%d", i);
         cbm_node_t local_route = {.project = source_project,
                                   .label = "Route",
                                   .name = name,
@@ -298,7 +298,7 @@ static bool cross_repo_seed_bounded_scan(const cross_repo_fixture_t *fixture,
     cbm_node_t handler = {.project = target_project,
                           .label = "Function",
                           .name = "bounded_handler",
-                          .qualified_name = "bounded.target.handler",
+                          .qualified_name = "target.handler",
                           .file_path = "server.c"};
     int64_t target_route_id = ok ? cbm_store_upsert_node(target, &target_route) : 0;
     int64_t handler_id = ok ? cbm_store_upsert_node(target, &handler) : 0;

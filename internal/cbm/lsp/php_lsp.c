@@ -87,9 +87,9 @@ static TSNode child_named(TSNode parent, const char *kind) {
     return null_node;
 }
 
-/* PHP qualified names use "." in the graph (project.path.module.class[.method]).
- * Convert "App\\Models\\User" to "App.Models.User" so we can compose with
- * module_qn (which already uses ".") and look up registry entries. */
+/* В графе QN PHP используют точку: path.module.class[.method]. Преобразуем
+ * App\\Models\\User в App.Models.User, чтобы соединять имя с module_qn и
+ * искать его в реестре. */
 static char *php_ns_to_dot(CBMArena *a, const char *ns) {
     if (!ns)
         return NULL;
@@ -253,20 +253,20 @@ const char *php_resolve_class_name(PHPLSPContext *ctx, const char *name) {
     return php_ns_to_dot(ctx->arena, name);
 }
 
-/* Try to find a registered type for a "namespaced" QN.
+/* Ищет зарегистрированный тип по QN с пространством имён.
  *
- * Lookup order:
- *   1. exact QN match
- *   2. module_qn + "." + qn (same-file class)
- *   3. project_root + "." + qn (drop trailing module segments one at a time)
- *   4. fall back to a short-name scan of the registry, preferring the
- *      candidate whose QN shares the longest dot-prefix with module_qn
- *      (cross-file class in the same project tree).
+ * Порядок поиска:
+ *   1. точное совпадение QN;
+ *   2. module_qn + "." + qn для класса из того же файла;
+ *   3. local_path_prefix + "." + qn с последовательным удалением конечных
+ *      сегментов модуля;
+ *   4. поиск по короткому имени во всём реестре с предпочтением кандидата,
+ *      имеющего самый длинный общий префикс с module_qn.
  *
- * Step 4 is critical for PHP because the unified extractor builds QNs from
- * file paths but `use App\\Models\\User` produces an "App.Models.User" key.
- * Without short-name fallback, every cross-file class resolution would miss. */
-static const CBMRegisteredType *lookup_type_with_project(PHPLSPContext *ctx, const char *qn) {
+ * Последний шаг необходим, потому что единый экстрактор строит QN по пути
+ * файла, а use App\\Models\\User даёт ключ App.Models.User. Без поиска по
+ * короткому имени межфайловое разрешение классов завершалось бы промахом. */
+static const CBMRegisteredType *lookup_type_in_local_tree(PHPLSPContext *ctx, const char *qn) {
     if (!qn)
         return NULL;
     const CBMRegisteredType *t = cbm_registry_lookup_type(ctx->registry, qn);
@@ -346,7 +346,7 @@ const CBMRegisteredFunc *php_lookup_method(PHPLSPContext *ctx, const char *class
      * type to its registered identity and retry. */
     const CBMRegisteredType *t = cbm_registry_lookup_type(ctx->registry, class_qn);
     if (!t)
-        t = lookup_type_with_project(ctx, class_qn);
+        t = lookup_type_in_local_tree(ctx, class_qn);
     if (!t)
         return NULL;
     if (strcmp(t->qualified_name, class_qn) != 0) {
@@ -389,7 +389,7 @@ const CBMRegisteredFunc *php_lookup_method(PHPLSPContext *ctx, const char *class
 
         const CBMRegisteredType *next = cbm_registry_lookup_type(ctx->registry, parent);
         if (!next)
-            next = lookup_type_with_project(ctx, parent);
+            next = lookup_type_in_local_tree(ctx, parent);
         if (!next)
             continue;
 
@@ -935,7 +935,7 @@ const CBMType *php_eval_expr_type(PHPLSPContext *ctx, TSNode node) {
                 if (cls_qn) {
                     const CBMRegisteredType *t = cbm_registry_lookup_type(ctx->registry, cls_qn);
                     if (!t)
-                        t = lookup_type_with_project(ctx, cls_qn);
+                        t = lookup_type_in_local_tree(ctx, cls_qn);
                     if (t && t->field_names) {
                         for (int i = 0; t->field_names[i]; i++) {
                             if (strcmp(t->field_names[i], member) == 0) {
@@ -1078,7 +1078,7 @@ const CBMType *php_eval_expr_type(PHPLSPContext *ctx, TSNode node) {
                 const CBMRegisteredType *t =
                     cbm_registry_lookup_type(ctx->registry, recv->data.named.qualified_name);
                 if (!t)
-                    t = lookup_type_with_project(ctx, recv->data.named.qualified_name);
+                    t = lookup_type_in_local_tree(ctx, recv->data.named.qualified_name);
                 if (t && t->field_names && fname) {
                     for (int i = 0; t->field_names[i]; i++) {
                         if (strcmp(t->field_names[i], fname) == 0) {
@@ -1223,7 +1223,7 @@ static const CBMType *eval_member_call_type(PHPLSPContext *ctx, TSNode call_node
                 sig->data.func.return_types[0]) {
                 const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, class_qn);
                 if (!rt)
-                    rt = lookup_type_with_project(ctx, class_qn);
+                    rt = lookup_type_in_local_tree(ctx, class_qn);
                 if (rt && rt->type_param_names && recv_type->data.template_type.template_args) {
                     return php_substitute_template(ctx->arena, sig->data.func.return_types[0],
                                                    rt->type_param_names,
@@ -3456,7 +3456,7 @@ static void flatten_trait_into_class(PHPLSPContext *ctx, CBMTypeRegistry *reg, c
     /* Resolve trait through alias-style lookup if needed. */
     const CBMRegisteredType *t = cbm_registry_lookup_type(reg, trait_qn);
     if (!t)
-        t = lookup_type_with_project(ctx, trait_qn);
+        t = lookup_type_in_local_tree(ctx, trait_qn);
     const char *canonical_trait_qn = t ? t->qualified_name : trait_qn;
 
     /* A trait cannot meaningfully flatten into itself. PHP itself rejects

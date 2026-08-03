@@ -8,6 +8,7 @@
  * bypassing the SQL parser entirely. These tests verify integrity.
  */
 #include "../src/foundation/compat.h"
+#include "foundation/constants.h"
 #include "foundation/compat_fs.h"
 #include "test_framework.h"
 /* sqlite_writer.h is at internal/cbm/ — Makefile adds -Iinternal/cbm */
@@ -112,7 +113,7 @@ TEST(sw_minimal_data) {
          .project = "test",
          .label = "Module",
          .name = "main",
-         .qualified_name = "test.main",
+         .qualified_name = "main",
          .file_path = "main.go",
          .start_line = 1,
          .end_line = 10,
@@ -121,7 +122,7 @@ TEST(sw_minimal_data) {
          .project = "test",
          .label = "Function",
          .name = "hello",
-         .qualified_name = "test.main.hello",
+         .qualified_name = "main.hello",
          .file_path = "main.go",
          .start_line = 3,
          .end_line = 5,
@@ -155,6 +156,13 @@ TEST(sw_minimal_data) {
     ASSERT_STR_EQ(integrity, "ok");
     sqlite3_finalize(stmt);
 
+    /* Прямой writer обязан помечать базу текущим форматом локальных QN. */
+    sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &stmt, NULL);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), CBM_QN_FORMAT_VERSION);
+    sqlite3_finalize(stmt);
+
     /* Node count */
     sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM nodes", -1, &stmt, NULL);
     sqlite3_step(stmt);
@@ -178,7 +186,7 @@ TEST(sw_minimal_data) {
     sqlite3_prepare_v2(db, "SELECT qualified_name, label FROM nodes WHERE id=2", -1, &stmt, NULL);
     rc = sqlite3_step(stmt);
     ASSERT_EQ(rc, SQLITE_ROW);
-    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "test.main.hello");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "main.hello");
     ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "Function");
     sqlite3_finalize(stmt);
 

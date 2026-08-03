@@ -75,8 +75,7 @@ typedef struct KotlinLSPContext {
 
     /* Package context. Empty string for default package. */
     const char *package_qn;    /* dotted form, e.g. "com.example.foo" */
-    const char *module_qn;     /* file-level QN, e.g. "<project>.com.example.foo.<File>" */
-    const char *project_name;  /* project prefix (without trailing dot) */
+    const char *module_qn;     /* локальный QN файла, например "com.example.foo.File" */
     const char *file_class_qn; /* JVM file-class QN, "<package>.<File>Kt" */
     const char *rel_path;      /* for diagnostics */
 
@@ -122,7 +121,7 @@ typedef struct KotlinLSPContext {
 /* Initialize a KotlinLSPContext for processing one file. */
 void kotlin_lsp_init(KotlinLSPContext *ctx, CBMArena *arena, const char *source, int source_len,
                      const CBMTypeRegistry *registry, const char *package_qn, const char *module_qn,
-                     const char *project_name, const char *rel_path, CBMResolvedCallArray *out);
+                     const char *rel_path, CBMResolvedCallArray *out);
 
 /* Add an import mapping. local_name is the name used in code (alias or
  * short name); target_qn is the full dotted FQN. For wildcard imports,

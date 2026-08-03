@@ -1459,8 +1459,7 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
 }
 
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
-                                  const char *project, const char *rel_path,
-                                  const char *module_qn) {
+                                  const char *rel_path, const char *module_qn) {
     TSNode func_node = cbm_find_enclosing_func(node, lang);
     if (ts_node_is_null(func_node)) {
         return module_qn;
@@ -1501,7 +1500,7 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
             class_chain = class_chain ? cbm_arena_sprintf(a, "%s.%s", cname, class_chain) : cname;
         }
         if (class_chain) {
-            const char *class_qn = cbm_fqn_compute(a, project, rel_path, class_chain);
+            const char *class_qn = cbm_fqn_compute(a, rel_path, class_chain);
             base_qn = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
         }
     }
@@ -1509,12 +1508,12 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
     if (!base_qn && (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA)) {
         char *scope_name = cbm_cpp_out_of_line_parent_class(a, func_node, source);
         if (scope_name && scope_name[0]) {
-            const char *class_qn = cbm_fqn_compute(a, project, rel_path, scope_name);
+            const char *class_qn = cbm_fqn_compute(a, rel_path, scope_name);
             base_qn = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
         }
     }
     if (!base_qn) {
-        base_qn = cbm_fqn_compute(a, project, rel_path, name);
+        base_qn = cbm_fqn_compute(a, rel_path, name);
     }
     if (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) {
         TSNode wrapper = func_node;
@@ -1543,7 +1542,7 @@ const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node) {
 
     // Cache miss: compute via parent walk
     const char *qn = cbm_enclosing_func_qn(ctx->arena, node, ctx->language, ctx->source,
-                                           ctx->project, ctx->rel_path, ctx->module_qn);
+                                           ctx->rel_path, ctx->module_qn);
 
     // Cache the result: find the enclosing function's byte range
     TSNode func_node = cbm_find_enclosing_func(node, ctx->language);
@@ -1735,8 +1734,8 @@ bool cbm_is_module_level(TSNode node, CBMLanguage lang) {
     return cbm_is_module_level_p(ts_node_parent(node), lang);
 }
 
-// --- FQN computation ---
-// Mirrors Go's fqn.Compute(): project + path_parts_dotted + name
+// --- Построение локальных QN ---
+// Формат: части относительного пути через точку, затем имя символа.
 
 // Internal helper: find extension start in basename (returns length without ext)
 static size_t strip_ext_len(const char *s, size_t len) {
@@ -1774,8 +1773,9 @@ static bool should_skip_fqn_part(const char *part, size_t part_len, bool is_last
     return false;
 }
 
-// Append dotted path segments from rel_path (extension-stripped) to output buffer.
-static char *append_path_segments(char *out, const char *rel_path, size_t plen, bool has_name) {
+// Добавляет части пути через точку, не создавая служебную ведущую точку.
+static char *append_path_segments(char *out, char *buf, const char *rel_path, size_t plen,
+                                  bool has_name) {
     const char *start = rel_path;
     const char *end_ptr = rel_path + plen;
     while (start < end_ptr) {
@@ -1786,22 +1786,13 @@ static char *append_path_segments(char *out, const char *rel_path, size_t plen, 
         if (part_len > 0) {
             bool is_last = (part_end == end_ptr);
             if (!should_skip_fqn_part(start, part_len, is_last, has_name)) {
-                /* Drop a leading '.' from a dotfile / hidden-dir segment
-                 * (".env" -> "env", ".github" -> "github"). Otherwise the QN
-                 * separator '.' plus the segment's own leading '.' produce a
-                 * malformed "proj..env" double-dot, and a root dotfile's empty
-                 * stem collides with the project QN. */
-                const char *seg = start;
-                size_t seg_len = part_len;
-                if (seg[0] == '.') {
-                    seg++;
-                    seg_len--;
-                }
-                if (seg_len > 0) {
+                /* Начальная точка dotfile является частью имени. Разделитель
+                 * добавляется только между уже записанными сегментами. */
+                if (out != buf) {
                     *out++ = '.';
-                    memcpy(out, seg, seg_len);
-                    out += seg_len;
                 }
+                memcpy(out, start, part_len);
+                out += part_len;
             }
         }
         start = part_end + SKIP_ONE;
@@ -1809,30 +1800,27 @@ static char *append_path_segments(char *out, const char *rel_path, size_t plen, 
     return out;
 }
 
-char *cbm_fqn_compute(CBMArena *a, const char *project, const char *rel_path, const char *name) {
-    if (!project)
-        project = "";
+char *cbm_fqn_compute(CBMArena *a, const char *rel_path, const char *name) {
     if (!rel_path)
         rel_path = "";
-    size_t proj_len = strlen(project);
     size_t path_len = strlen(rel_path);
     size_t name_len = name ? strlen(name) : 0;
 
-    size_t max_len = proj_len + SKIP_ONE + path_len + SKIP_ONE + name_len + SKIP_ONE;
+    size_t max_len = path_len + SKIP_ONE + name_len + SKIP_ONE;
     char *buf = (char *)cbm_arena_alloc(a, max_len);
     if (!buf) {
         return NULL;
     }
 
     char *out = buf;
-    memcpy(out, project, proj_len);
-    out += proj_len;
-
-    size_t plen = strip_ext_len(rel_path, path_len);
-    out = append_path_segments(out, rel_path, plen, name && name_len > 0);
+    bool is_file_qn = name && strcmp(name, "__file__") == 0;
+    size_t plen = is_file_qn ? path_len : strip_ext_len(rel_path, path_len);
+    out = append_path_segments(out, buf, rel_path, plen, name && name_len > 0);
 
     if (name && name_len > 0) {
-        *out++ = '.';
+        if (out != buf) {
+            *out++ = '.';
+        }
         memcpy(out, name, name_len);
         out += name_len;
     }
@@ -1840,8 +1828,8 @@ char *cbm_fqn_compute(CBMArena *a, const char *project, const char *rel_path, co
     return buf;
 }
 
-char *cbm_fqn_module(CBMArena *a, const char *project, const char *rel_path) {
-    return cbm_fqn_compute(a, project, rel_path, NULL);
+char *cbm_fqn_module(CBMArena *a, const char *rel_path) {
+    return cbm_fqn_compute(a, rel_path, NULL);
 }
 
 // True when a language derives its module from the CONTAINING DIRECTORY (Java
@@ -1854,11 +1842,10 @@ static bool cbm_lang_module_is_dir(CBMLanguage lang) {
     return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
 }
 
-char *cbm_fqn_module_source_lang(CBMArena *a, const char *project, const char *rel_path,
-                                 CBMLanguage lang) {
+char *cbm_fqn_module_source_lang(CBMArena *a, const char *rel_path, CBMLanguage lang) {
     if (!cbm_lang_module_is_dir(lang)) {
         // All other languages keep the legacy filename-stem module QN.
-        return cbm_fqn_module(a, project, rel_path);
+        return cbm_fqn_module(a, rel_path);
     }
     if (!rel_path) {
         rel_path = "";
@@ -1866,8 +1853,8 @@ char *cbm_fqn_module_source_lang(CBMArena *a, const char *project, const char *r
     // Module is the CONTAINING DIRECTORY: strip the basename (last '/' segment).
     const char *last_slash = strrchr(rel_path, '/');
     if (!last_slash) {
-        // Root file: dir is empty → module is just the project.
-        return cbm_fqn_folder(a, project, "");
+        // У корневого файла каталог модуля пуст.
+        return cbm_fqn_folder(a, "");
     }
     size_t dir_len = (size_t)(last_slash - rel_path);
     char *dir = (char *)cbm_arena_alloc(a, dir_len + SKIP_ONE);
@@ -1876,39 +1863,38 @@ char *cbm_fqn_module_source_lang(CBMArena *a, const char *project, const char *r
     }
     memcpy(dir, rel_path, dir_len);
     dir[dir_len] = '\0';
-    return cbm_fqn_folder(a, project, dir);
+    return cbm_fqn_folder(a, dir);
 }
 
-char *cbm_fqn_compute_source_lang(CBMArena *a, const char *project, const char *rel_path,
-                                  const char *name, CBMLanguage lang) {
+char *cbm_fqn_compute_source_lang(CBMArena *a, const char *rel_path, const char *name,
+                                  CBMLanguage lang) {
     if (!cbm_lang_module_is_dir(lang)) {
         // All other languages keep the legacy filename-stem symbol QN.
-        return cbm_fqn_compute(a, project, rel_path, name);
+        return cbm_fqn_compute(a, rel_path, name);
     }
-    char *module = cbm_fqn_module_source_lang(a, project, rel_path, lang);
+    char *module = cbm_fqn_module_source_lang(a, rel_path, lang);
     if (!module) {
         return NULL;
     }
     if (!name || !name[0]) {
         return module;
     }
-    return cbm_arena_sprintf(a, "%s.%s", module, name);
+    return module[0] ? cbm_arena_sprintf(a, "%s.%s", module, name) : cbm_arena_strdup(a, name);
 }
 
-char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir) {
-    // project.dir1.dir2
-    size_t proj_len = strlen(project);
+char *cbm_fqn_folder(CBMArena *a, const char *rel_dir) {
+    // Результат вида dir1.dir2.
+    if (!rel_dir) {
+        rel_dir = "";
+    }
     size_t dir_len = strlen(rel_dir);
-    size_t max_len = proj_len + SKIP_ONE + dir_len + SKIP_ONE;
+    size_t max_len = dir_len + SKIP_ONE;
     char *buf = (char *)cbm_arena_alloc(a, max_len);
     if (!buf) {
         return NULL;
     }
 
     char *out = buf;
-    memcpy(out, project, proj_len);
-    out += proj_len;
-
     if (dir_len > 0 && !(dir_len == SKIP_ONE && rel_dir[0] == '.')) {
         const char *start = rel_dir;
         const char *end_ptr = rel_dir + dir_len;
@@ -1917,7 +1903,9 @@ char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir) {
             const char *part_end = slash ? slash : end_ptr;
             size_t part_len = (size_t)(part_end - start);
             if (part_len > 0) {
-                *out++ = '.';
+                if (out != buf) {
+                    *out++ = '.';
+                }
                 memcpy(out, start, part_len);
                 out += part_len;
             }

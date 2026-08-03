@@ -39,7 +39,7 @@ static cbm_store_t *setup_arch_test_store(void) {
     const char *files[] = {"main.go", "handler.go", "service.go", "model.py", "utils.js"};
     for (int i = 0; i < 5; i++) {
         char qn[64];
-        snprintf(qn, sizeof(qn), "test.%s", files[i]);
+        snprintf(qn, sizeof(qn), "%s", files[i]);
         cbm_node_t n = {.project = "test",
                         .label = "File",
                         .name = files[i],
@@ -50,11 +50,11 @@ static cbm_store_t *setup_arch_test_store(void) {
 
     /* Packages */
     cbm_node_t pkg1 = {
-        .project = "test", .label = "Package", .name = "cmd", .qualified_name = "test.cmd"};
+        .project = "test", .label = "Package", .name = "cmd", .qualified_name = "cmd"};
     cbm_node_t pkg2 = {
-        .project = "test", .label = "Package", .name = "handler", .qualified_name = "test.handler"};
+        .project = "test", .label = "Package", .name = "handler", .qualified_name = "handler"};
     cbm_node_t pkg3 = {
-        .project = "test", .label = "Package", .name = "service", .qualified_name = "test.service"};
+        .project = "test", .label = "Package", .name = "service", .qualified_name = "service"};
     cbm_store_upsert_node(s, &pkg1);
     cbm_store_upsert_node(s, &pkg2);
     cbm_store_upsert_node(s, &pkg3);
@@ -63,7 +63,7 @@ static cbm_store_t *setup_arch_test_store(void) {
     cbm_node_t fn_main = {.project = "test",
                           .label = "Function",
                           .name = "main",
-                          .qualified_name = "test.cmd.server.main",
+                          .qualified_name = "cmd.server.main",
                           .file_path = "cmd/server/main.go",
                           .properties_json = "{\"is_entry_point\":true}"};
     int64_t id_main = cbm_store_upsert_node(s, &fn_main);
@@ -71,7 +71,7 @@ static cbm_store_t *setup_arch_test_store(void) {
     cbm_node_t fn_handle = {.project = "test",
                             .label = "Function",
                             .name = "HandleRequest",
-                            .qualified_name = "test.internal.handler.HandleRequest",
+                            .qualified_name = "internal.handler.HandleRequest",
                             .file_path = "internal/handler/handler.go",
                             .properties_json = "{\"is_entry_point\":true}"};
     int64_t id_handle = cbm_store_upsert_node(s, &fn_handle);
@@ -79,21 +79,21 @@ static cbm_store_t *setup_arch_test_store(void) {
     cbm_node_t fn_process = {.project = "test",
                              .label = "Function",
                              .name = "ProcessOrder",
-                             .qualified_name = "test.internal.service.ProcessOrder",
+                             .qualified_name = "internal.service.ProcessOrder",
                              .file_path = "internal/service/service.go"};
     int64_t id_process = cbm_store_upsert_node(s, &fn_process);
 
     cbm_node_t fn_validate = {.project = "test",
                               .label = "Function",
                               .name = "ValidateOrder",
-                              .qualified_name = "test.internal.service.ValidateOrder",
+                              .qualified_name = "internal.service.ValidateOrder",
                               .file_path = "internal/service/service.go"};
     int64_t id_validate = cbm_store_upsert_node(s, &fn_validate);
 
     cbm_node_t fn_helper = {.project = "test",
                             .label = "Function",
                             .name = "formatDate",
-                            .qualified_name = "test.internal.service.formatDate",
+                            .qualified_name = "internal.service.formatDate",
                             .file_path = "internal/service/service.go"};
     int64_t id_helper = cbm_store_upsert_node(s, &fn_helper);
 
@@ -101,7 +101,7 @@ static cbm_store_t *setup_arch_test_store(void) {
     cbm_node_t fn_test = {.project = "test",
                           .label = "Function",
                           .name = "TestHandleRequest",
-                          .qualified_name = "test.internal.handler.handler_test.TestHandleRequest",
+                          .qualified_name = "internal.handler.handler_test.TestHandleRequest",
                           .file_path = "internal/handler/handler_test.go",
                           .properties_json = "{\"is_entry_point\":true}"};
     int64_t id_test = cbm_store_upsert_node(s, &fn_test);
@@ -111,7 +111,7 @@ static cbm_store_t *setup_arch_test_store(void) {
         .project = "test",
         .label = "Route",
         .name = "/api/orders",
-        .qualified_name = "test.internal.handler.route./api/orders",
+        .qualified_name = "internal.handler.route./api/orders",
         .properties_json =
             "{\"method\":\"POST\",\"path\":\"/api/orders\",\"handler\":\"HandleRequest\"}"};
     cbm_store_upsert_node(s, &route);
@@ -275,7 +275,8 @@ TEST(arch_path_scoping) {
     ASSERT_TRUE(whole_pkg_nodes > scoped_pkg_nodes);
     ASSERT_EQ(scoped_pkg_nodes, 1);
 
-    ASSERT_TRUE(cbm_store_count_nodes(s, "pscope") > cbm_store_count_nodes_scoped(s, "pscope", "apps/foo"));
+    ASSERT_TRUE(cbm_store_count_nodes(s, "pscope") >
+                cbm_store_count_nodes_scoped(s, "pscope", "apps/foo"));
 
     cbm_architecture_info_t scoped_slash;
     memset(&scoped_slash, 0, sizeof(scoped_slash));
@@ -1212,13 +1213,13 @@ TEST(arch_clusters_basic) {
 
 TEST(qn_to_package) {
     /* 4+ segments: returns segment[2] */
-    ASSERT_STR_EQ(cbm_qn_to_package("project.internal.store.search.Search"), "store");
-    ASSERT_STR_EQ(cbm_qn_to_package("project.src.utils.helper.foo"), "utils");
-    ASSERT_STR_EQ(cbm_qn_to_package("project.src.components.Button.render"), "components");
-    ASSERT_STR_EQ(cbm_qn_to_package("project.cmd.server.main"), "server");
+    ASSERT_STR_EQ(cbm_qn_to_package("internal.store.search.Search"), "store");
+    ASSERT_STR_EQ(cbm_qn_to_package("src.utils.helper.foo"), "utils");
+    ASSERT_STR_EQ(cbm_qn_to_package("src.components.Button.render"), "components");
+    ASSERT_STR_EQ(cbm_qn_to_package("cmd.server.main"), "server");
     /* 3 segments: falls back to segment[1] */
-    ASSERT_STR_EQ(cbm_qn_to_package("project.main.foo"), "main");
-    ASSERT_STR_EQ(cbm_qn_to_package("project.cmd"), "cmd");
+    ASSERT_STR_EQ(cbm_qn_to_package("main.foo"), "main");
+    ASSERT_STR_EQ(cbm_qn_to_package("cmd.entry"), "cmd");
     /* Edge cases */
     ASSERT_STR_EQ(cbm_qn_to_package("standalone"), "");
     ASSERT_STR_EQ(cbm_qn_to_package(""), "");
@@ -1226,9 +1227,9 @@ TEST(qn_to_package) {
 }
 
 TEST(qn_to_top_package) {
-    ASSERT_STR_EQ(cbm_qn_to_top_package("project.internal.store.search.Search"), "internal");
-    ASSERT_STR_EQ(cbm_qn_to_top_package("project.src.components.Button"), "src");
-    ASSERT_STR_EQ(cbm_qn_to_top_package("project.cmd"), "cmd");
+    ASSERT_STR_EQ(cbm_qn_to_top_package("internal.store.search.Search"), "internal");
+    ASSERT_STR_EQ(cbm_qn_to_top_package("src.components.Button"), "src");
+    ASSERT_STR_EQ(cbm_qn_to_top_package("cmd.entry"), "cmd");
     ASSERT_STR_EQ(cbm_qn_to_top_package("standalone"), "");
     PASS();
 }
@@ -1251,7 +1252,7 @@ TEST(find_architecture_docs) {
     const char *fps[] = {"main.go", "ARCHITECTURE.md", "docs/adr/001-use-sqlite.md", "README.md"};
     for (int i = 0; i < 4; i++) {
         char qn[64];
-        snprintf(qn, sizeof(qn), "test.%s", fps[i]);
+        snprintf(qn, sizeof(qn), "%s", fps[i]);
         cbm_node_t n = {.project = "test",
                         .label = "File",
                         .name = fps[i],
@@ -1303,11 +1304,11 @@ TEST(search_case_insensitive_default) {
     cbm_store_upsert_project(s, "test", "/tmp/test");
 
     cbm_node_t n1 = {
-        .project = "test", .label = "Function", .name = "FooBar", .qualified_name = "test.FooBar"};
+        .project = "test", .label = "Function", .name = "FooBar", .qualified_name = "FooBar"};
     cbm_node_t n2 = {
-        .project = "test", .label = "Function", .name = "foobar", .qualified_name = "test.foobar"};
+        .project = "test", .label = "Function", .name = "foobar", .qualified_name = "foobar"};
     cbm_node_t n3 = {
-        .project = "test", .label = "Function", .name = "FOOBAR", .qualified_name = "test.FOOBAR"};
+        .project = "test", .label = "Function", .name = "FOOBAR", .qualified_name = "FOOBAR"};
     cbm_store_upsert_node(s, &n1);
     cbm_store_upsert_node(s, &n2);
     cbm_store_upsert_node(s, &n3);
@@ -1332,11 +1333,11 @@ TEST(search_case_sensitive_explicit) {
     cbm_store_upsert_project(s, "test", "/tmp/test");
 
     cbm_node_t n1 = {
-        .project = "test", .label = "Function", .name = "FooBar", .qualified_name = "test.FooBar"};
+        .project = "test", .label = "Function", .name = "FooBar", .qualified_name = "FooBar"};
     cbm_node_t n2 = {
-        .project = "test", .label = "Function", .name = "foobar", .qualified_name = "test.foobar"};
+        .project = "test", .label = "Function", .name = "foobar", .qualified_name = "foobar"};
     cbm_node_t n3 = {
-        .project = "test", .label = "Function", .name = "FOOBAR", .qualified_name = "test.FOOBAR"};
+        .project = "test", .label = "Function", .name = "FOOBAR", .qualified_name = "FOOBAR"};
     cbm_store_upsert_node(s, &n1);
     cbm_store_upsert_node(s, &n2);
     cbm_store_upsert_node(s, &n3);

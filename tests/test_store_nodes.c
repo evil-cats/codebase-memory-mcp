@@ -1167,38 +1167,33 @@ TEST(store_find_by_qn_not_found) {
 
 /* ── Edge case: cross-project lookups ──────────────────────────── */
 
-TEST(store_find_by_qn_any_cross_project) {
+TEST(store_local_qn_identity_includes_project) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "proj-a", "/tmp/a");
     cbm_store_upsert_project(s, "proj-b", "/tmp/b");
 
-    cbm_node_t na = {.project = "proj-a",
-                     .label = "Function",
-                     .name = "SharedFunc",
-                     .qualified_name = "proj-a.main.SharedFunc"};
-    cbm_node_t nb = {.project = "proj-b",
-                     .label = "Class",
-                     .name = "Widget",
-                     .qualified_name = "proj-b.pkg.Widget"};
+    cbm_node_t na = {
+        .project = "proj-a", .label = "Function", .name = "RunA", .qualified_name = "src.main.run"};
+    cbm_node_t nb = {
+        .project = "proj-b", .label = "Function", .name = "RunB", .qualified_name = "src.main.run"};
     cbm_store_upsert_node(s, &na);
     cbm_store_upsert_node(s, &nb);
 
-    /* find_node_by_qn_any finds without project filter */
+    /* Одинаковый локальный QN выбирается только вместе с проектом. */
     cbm_node_t found = {0};
-    int rc = cbm_store_find_node_by_qn_any(s, "proj-a.main.SharedFunc", &found);
+    int rc = cbm_store_find_node_by_qn(s, "proj-a", "src.main.run", &found);
     ASSERT_EQ(rc, CBM_STORE_OK);
-    ASSERT_STR_EQ(found.name, "SharedFunc");
+    ASSERT_STR_EQ(found.name, "RunA");
     ASSERT_STR_EQ(found.project, "proj-a");
     cbm_node_free_fields(&found);
 
-    rc = cbm_store_find_node_by_qn_any(s, "proj-b.pkg.Widget", &found);
+    rc = cbm_store_find_node_by_qn(s, "proj-b", "src.main.run", &found);
     ASSERT_EQ(rc, CBM_STORE_OK);
-    ASSERT_STR_EQ(found.name, "Widget");
+    ASSERT_STR_EQ(found.name, "RunB");
     ASSERT_STR_EQ(found.project, "proj-b");
     cbm_node_free_fields(&found);
 
-    /* Non-existent QN */
-    rc = cbm_store_find_node_by_qn_any(s, "nonexistent.Nope", &found);
+    rc = cbm_store_find_node_by_qn(s, "proj-c", "src.main.run", &found);
     ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
 
     cbm_store_close(s);
@@ -1974,7 +1969,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_empty_strings);
     RUN_TEST(store_find_by_id_not_found);
     RUN_TEST(store_find_by_qn_not_found);
-    RUN_TEST(store_find_by_qn_any_cross_project);
+    RUN_TEST(store_local_qn_identity_includes_project);
     RUN_TEST(store_find_by_name_any_cross_project);
     RUN_TEST(store_find_by_file_no_match);
     RUN_TEST(store_node_batch_upsert_zero);

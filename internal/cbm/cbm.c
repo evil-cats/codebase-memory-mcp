@@ -1215,7 +1215,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
     // so def QNs, the LSP caller_qn, and the textual calls-enclosing QN all
     // agree (e.g. Outer.java -> module "proj", not "proj.Outer"). Other
     // languages are unchanged.
-    result->module_qn = cbm_fqn_module_source_lang(a, project, rel_path, language);
+    result->module_qn = cbm_fqn_module_source_lang(a, rel_path, language);
     result->is_test_file = cbm_is_test_file(rel_path, language);
 
     // Build extraction context

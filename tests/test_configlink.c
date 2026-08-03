@@ -267,11 +267,11 @@ TEST(configlink_file_ref_no_false_positive) {
     cbm_gbuf_t *gb = cbm_gbuf_new(project, tmpdir);
 
     /* data.csv Module (NOT a config extension) */
-    char *csv_qn = cbm_pipeline_fqn_module(project, "data.csv");
+    char *csv_qn = cbm_pipeline_fqn_module("data.csv");
     cbm_gbuf_upsert_node(gb, "Module", "data", csv_qn, "data.csv", 0, 0, NULL);
 
     /* Source Module */
-    char *main_qn = cbm_pipeline_fqn_module(project, "main.go");
+    char *main_qn = cbm_pipeline_fqn_module("main.go");
     cbm_gbuf_upsert_node(gb, "Module", "main", main_qn, "main.go", 0, 0, NULL);
 
     run_configlink(gb, project, tmpdir);

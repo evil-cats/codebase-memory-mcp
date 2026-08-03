@@ -880,7 +880,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     };
 
     for (int i = 0; i < ci; i++) {
-        char *file_qn = cbm_pipeline_fqn_compute(project, changed_files[i].rel_path, "__file__");
+        char *file_qn = cbm_pipeline_fqn_compute(changed_files[i].rel_path, "__file__");
         if (file_qn) {
             /* #994: the name must be the BASENAME with extension props,
              * mirroring the full build's File node (pipeline.c) — upserts

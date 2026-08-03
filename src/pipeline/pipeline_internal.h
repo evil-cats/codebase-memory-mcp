@@ -177,8 +177,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
  * Each result that declared a namespace/package contributes one entry keyed by
  * the namespace string (e.g. "App.Utils", "com.example").  Returns NULL when no
  * results declared a namespace.  Caller frees via cbm_pipeline_namespace_map_free. */
-CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
-                                               CBMFileResult *const *results,
+CBMHashTable *cbm_pipeline_namespace_map_build(CBMFileResult *const *results,
                                                const char *const *rels, int count);
 void cbm_pipeline_namespace_map_free(CBMHashTable *map);
 
@@ -187,17 +186,14 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
                           int source_len, cbm_pkg_entries_t *entries);
 
 /* Merge per-worker entries into a hash table. Returns NULL if no entries. */
-CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count,
-                               const char *project_name);
+CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count);
 
 /* Build pkgmap by reading manifest files from the files array (sequential path). */
 int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,
                          int excluded_count);
 CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
-                                         int file_count, const char *project_name,
-                                         char **excluded_dirs, int excluded_count);
-CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file_count,
-                                          const char *project_name);
+                                         int file_count, char **excluded_dirs, int excluded_count);
+CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file_count);
 
 /* Free pkgmap and all owned strings. */
 void cbm_pkgmap_free(CBMHashTable *pkgmap);
@@ -473,8 +469,7 @@ typedef struct {
 int cbm_parse_helm_chart(const char *source, cbm_helm_chart_t *out);
 
 /* Build an infrastructure QN. Caller must free the returned string. */
-char *cbm_infra_qn(const char *project_name, const char *rel_path, const char *infra_type,
-                   const char *service_name);
+char *cbm_infra_qn(const char *rel_path, const char *infra_type, const char *service_name);
 
 /* ── Parallel pipeline prototypes (pass_parallel.c) ─────────────── */
 

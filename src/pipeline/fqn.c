@@ -1,8 +1,8 @@
 /*
- * fqn.c — Fully Qualified Name computation for graph nodes.
+ * fqn.c — построение локальных qualified name для узлов графа.
  *
- * Implements the FQN scheme: project.dir.parts.name
- * Handles Python __init__.py, JS/TS index.{js,ts}, path separators.
+ * QN состоит из относительного пути и имени символа; проект хранится отдельно.
+ * Здесь также учитываются __init__.py, index.{js,ts} и разные разделители пути.
  */
 #include "pipeline/pipeline.h"
 #include "foundation/compat_fs.h"
@@ -20,9 +20,9 @@
 #include <io.h>
 #endif
 
-/* Maximum path segments in a FQN (CBM_SZ_256 slots total, -2 for project + name) */
-#define FQN_MAX_PATH_SEGS 254
-#define FQN_MAX_DIR_SEGS 255
+/* В массиве CBM_SZ_256 один элемент оставлен под имя символа. */
+#define FQN_MAX_PATH_SEGS 255
+#define FQN_MAX_DIR_SEGS 256
 
 /* Max bytes for a derived project name. The name becomes a filename component
  * ("<cache>/<name>.db" and sidecars ".db-wal"/".db.corrupt"), so it must stay
@@ -96,7 +96,7 @@ static int tokenize_path(char *path, const char **segments, int max_segs) {
  * symbol name is provided. Keeps it when no name is given to avoid QN
  * collision with Folder nodes for the same directory. */
 static void strip_init_or_index(const char **segments, int *seg_count, const char *name) {
-    if (*seg_count <= SKIP_ONE) {
+    if (*seg_count <= 0) {
         return;
     }
     const char *last = segments[*seg_count - SKIP_ONE];
@@ -110,11 +110,7 @@ static void strip_init_or_index(const char **segments, int *seg_count, const cha
 
 /* ── Public API ──────────────────────────────────────────────────── */
 
-char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const char *name) {
-    if (!project) {
-        return strdup("");
-    }
-
+char *cbm_pipeline_fqn_compute(const char *rel_path, const char *name) {
     char *path = strdup(rel_path ? rel_path : "");
     cbm_normalize_path_sep(path);
     /* #1077/#964: File-node QNs (name=="__file__") must preserve the full
@@ -133,8 +129,7 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
 
     const char *segments[CBM_SZ_256];
     int seg_count = 0;
-    segments[seg_count++] = project;
-    seg_count += tokenize_path(path, segments + seg_count, FQN_MAX_PATH_SEGS);
+    seg_count += tokenize_path(path, segments, FQN_MAX_PATH_SEGS);
 
     strip_init_or_index(segments, &seg_count, name);
 
@@ -147,14 +142,14 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
     return result;
 }
 
-char *cbm_pipeline_fqn_module(const char *project, const char *rel_path) {
-    return cbm_pipeline_fqn_compute(project, rel_path, NULL);
+char *cbm_pipeline_fqn_module(const char *rel_path) {
+    return cbm_pipeline_fqn_compute(rel_path, NULL);
 }
 
-char *cbm_pipeline_fqn_module_dir(const char *project, const char *rel_path, bool module_is_dir) {
+char *cbm_pipeline_fqn_module_dir(const char *rel_path, bool module_is_dir) {
     if (!module_is_dir) {
-        /* Filename-stem module (default for all but Java/Go). */
-        return cbm_pipeline_fqn_module(project, rel_path);
+        /* Для всех языков, кроме Java/Go, модуль задаётся основой имени файла. */
+        return cbm_pipeline_fqn_module(rel_path);
     }
     /* Directory-module languages (Java package, Go package): the module is the
      * CONTAINING DIRECTORY — strip the basename so a sibling file in the same
@@ -168,8 +163,8 @@ char *cbm_pipeline_fqn_module_dir(const char *project, const char *rel_path, boo
     const char *last_bwd = strrchr(src, '\\');
     const char *last_sep = last_fwd > last_bwd ? last_fwd : last_bwd;
     if (!last_sep) {
-        /* Root file: empty directory → module is just the project. */
-        return cbm_pipeline_fqn_folder(project, "");
+        /* У корневого файла каталог модуля пуст. */
+        return cbm_pipeline_fqn_folder("");
     }
     size_t dir_len = (size_t)(last_sep - src);
     char *dir = (char *)malloc(dir_len + 1); /* +1 for NUL */
@@ -178,7 +173,7 @@ char *cbm_pipeline_fqn_module_dir(const char *project, const char *rel_path, boo
     }
     memcpy(dir, src, dir_len);
     dir[dir_len] = '\0';
-    char *res = cbm_pipeline_fqn_folder(project, dir);
+    char *res = cbm_pipeline_fqn_folder(dir);
     free(dir);
     return res;
 }
@@ -344,19 +339,13 @@ char *cbm_pipeline_resolve_relative_import(const char *source_rel, const char *m
     return resolve_js_relative(buf, sizeof(buf), module_path);
 }
 
-char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir) {
-    if (!project) {
-        return strdup("");
-    }
-
-    /* Work on mutable copy */
+char *cbm_pipeline_fqn_folder(const char *rel_dir) {
+    /* Работаем с изменяемой копией пути. */
     char *dir = strdup(rel_dir ? rel_dir : "");
     cbm_normalize_path_sep(dir);
 
     const char *segments[CBM_SZ_256];
     int seg_count = 0;
-    segments[seg_count++] = project;
-
     if (dir[0] != '\0') {
         char *tok = dir;
         while (tok && *tok && seg_count < FQN_MAX_DIR_SEGS) {

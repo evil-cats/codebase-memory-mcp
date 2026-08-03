@@ -242,9 +242,27 @@ TEST(pipeline_structure_nodes) {
     int node_count = cbm_store_count_nodes(s, project);
     ASSERT_GTE(node_count, 9); /* 6 structure + at least 3 definitions */
 
+    /* Полное поколение не должно содержать QN со старым проектным префиксом. */
+    char legacy_prefix[512];
+    int legacy_prefix_len = snprintf(legacy_prefix, sizeof(legacy_prefix), "%s.", project);
+    ASSERT_GT(legacy_prefix_len, 1);
+    ASSERT_LT(legacy_prefix_len, (int)sizeof(legacy_prefix));
+    sqlite3_stmt *prefix_stmt = NULL;
+    rc = sqlite3_prepare_v2(cbm_store_get_db(s),
+                            "SELECT COUNT(*) FROM nodes WHERE project=?1 "
+                            "AND substr(qualified_name,1,length(?2))=?2",
+                            -1, &prefix_stmt, NULL);
+    ASSERT_EQ(rc, SQLITE_OK);
+    sqlite3_bind_text(prefix_stmt, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(prefix_stmt, 2, legacy_prefix, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(prefix_stmt), SQLITE_ROW);
+    int legacy_qn_count = sqlite3_column_int(prefix_stmt, 0);
+    sqlite3_finalize(prefix_stmt);
+    ASSERT_EQ(legacy_qn_count, 0);
+
     /* Verify project node exists */
     cbm_node_t proj_node = {0};
-    rc = cbm_store_find_node_by_qn(s, project, project, &proj_node);
+    rc = cbm_store_find_node_by_qn(s, project, CBM_PROJECT_NODE_QN, &proj_node);
     ASSERT_EQ(rc, CBM_STORE_OK);
     ASSERT_STR_EQ(proj_node.label, "Project");
     cbm_node_free_fields(&proj_node);
@@ -393,22 +411,21 @@ TEST(pipeline_branch_root_structure) {
     ASSERT_NOT_NULL(s);
     const char *project = cbm_pipeline_project_name(p);
 
-    char branch_qn[1024];
-    snprintf(branch_qn, sizeof(branch_qn), "%s.__branch__.working-tree", project);
+    const char *branch_qn = CBM_BRANCH_NODE_QN_PREFIX "working-tree";
 
     cbm_node_t project_node = {0};
     cbm_node_t branch_node = {0};
     cbm_node_t root_file_node = {0};
     cbm_node_t root_folder_node = {0};
-    rc = cbm_store_find_node_by_qn(s, project, project, &project_node);
+    rc = cbm_store_find_node_by_qn(s, project, CBM_PROJECT_NODE_QN, &project_node);
     ASSERT_EQ(rc, CBM_STORE_OK);
     rc = cbm_store_find_node_by_qn(s, project, branch_qn, &branch_node);
     ASSERT_EQ(rc, CBM_STORE_OK);
     ASSERT_STR_EQ(branch_node.label, "Branch");
     ASSERT_STR_EQ(branch_node.name, "working-tree");
     ASSERT_NOT_NULL(strstr(branch_node.properties_json, "\"is_git\":false"));
-    char *root_folder_qn = cbm_pipeline_fqn_folder(project, "pkg");
-    char *root_file_qn = cbm_pipeline_fqn_compute(project, "main.go", "__file__");
+    char *root_folder_qn = cbm_pipeline_fqn_folder("pkg");
+    char *root_file_qn = cbm_pipeline_fqn_compute("main.go", "__file__");
     ASSERT_NOT_NULL(root_folder_qn);
     ASSERT_NOT_NULL(root_file_qn);
     rc = cbm_store_find_node_by_qn(s, project, root_folder_qn, &root_folder_node);
@@ -904,6 +921,58 @@ TEST(pipeline_incremental_preserves_cross_file_calls) {
     ASSERT_TRUE(cross_file_call_exists(s2, project2, "Serve", "Help"));
     cbm_store_close(s2);
     cbm_pipeline_free(p2);
+
+    teardown_test_repo();
+    PASS();
+}
+
+TEST(pipeline_legacy_qn_format_forces_full_reindex) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_qn_migration.db", g_tmpdir);
+
+    cbm_pipeline_t *first = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(first);
+    ASSERT_EQ(cbm_pipeline_run(first), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(first));
+    cbm_pipeline_free(first);
+
+    /* Имитируем индекс прежнего формата и оставляем узел, который
+     * инкрементальный путь не удалил бы по файловым хешам. */
+    cbm_store_t *legacy = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(legacy);
+    cbm_node_t stale = {
+        .project = project,
+        .label = "Function",
+        .name = "ghost",
+        .qualified_name = "legacy-project.src.ghost",
+        .file_path = "legacy.c",
+        .start_line = 1,
+        .end_line = 1,
+        .properties_json = "{}",
+    };
+    ASSERT_GTE(cbm_store_upsert_node(legacy, &stale), 1);
+    ASSERT_EQ(sqlite3_exec(cbm_store_get_db(legacy), "PRAGMA user_version=0;", NULL, NULL, NULL),
+              SQLITE_OK);
+    ASSERT_FALSE(cbm_store_qn_format_is_current(legacy));
+    cbm_store_close(legacy);
+
+    cbm_pipeline_t *second = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(second);
+    ASSERT_EQ(cbm_pipeline_run(second), 0);
+    cbm_pipeline_free(second);
+
+    cbm_store_t *rebuilt = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(rebuilt);
+    ASSERT_TRUE(cbm_store_qn_format_is_current(rebuilt));
+    cbm_node_t found = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(rebuilt, project, stale.qualified_name, &found),
+              CBM_STORE_NOT_FOUND);
+    cbm_store_close(rebuilt);
 
     teardown_test_repo();
     PASS();
@@ -2898,9 +2967,9 @@ TEST(git_context_non_git_path) {
     ASSERT_FALSE(ctx.is_git);
     ASSERT_TRUE(ctx.root_exists);
 
-    char *qn = cbm_git_context_branch_qn("proj", &ctx);
+    char *qn = cbm_git_context_branch_qn(&ctx);
     ASSERT_NOT_NULL(qn);
-    ASSERT_STR_EQ(qn, "proj.__branch__.working-tree");
+    ASSERT_STR_EQ(qn, "@cbm/branch/working-tree");
     free(qn);
 
     char json[1024];
@@ -2970,9 +3039,9 @@ TEST(git_context_linked_worktree) {
     ASSERT_STR_EQ(wt_ctx.branch_slug, "feature-git-context");
     ASSERT_NOT_NULL(wt_ctx.head_sha);
 
-    char *qn = cbm_git_context_branch_qn("proj", &wt_ctx);
+    char *qn = cbm_git_context_branch_qn(&wt_ctx);
     ASSERT_NOT_NULL(qn);
-    ASSERT_STR_EQ(qn, "proj.__branch__.feature-git-context");
+    ASSERT_STR_EQ(qn, "@cbm/branch/feature-git-context");
     free(qn);
 
     char json[2048];
@@ -4674,13 +4743,13 @@ TEST(infra_qn_helper) {
     /* Port of TestInfraQN */
 
     /* Regular infra file → __infra__ suffix */
-    char *qn = cbm_infra_qn("myproject", "docker-images/service/Dockerfile", "dockerfile", NULL);
+    char *qn = cbm_infra_qn("docker-images/service/Dockerfile", "dockerfile", NULL);
     ASSERT_NOT_NULL(qn);
     ASSERT(strstr(qn, ".__infra__") != NULL);
     free(qn);
 
     /* Compose service → ::service_name suffix */
-    qn = cbm_infra_qn("myproject", "docker-compose.yml", "compose-service", "web");
+    qn = cbm_infra_qn("docker-compose.yml", "compose-service", "web");
     ASSERT_NOT_NULL(qn);
     ASSERT(strstr(qn, "::web") != NULL);
     free(qn);
@@ -7077,18 +7146,17 @@ TEST(clean_json_brackets_empty) {
 }
 
 TEST(fqn_compute_basic) {
-    /* Basic FQN: project.dir.name */
-    char *fqn = cbm_pipeline_fqn_compute("proj", "pkg/handler.go", "Serve");
+    /* Локальный QN: каталог, модуль и имя без префикса проекта. */
+    char *fqn = cbm_pipeline_fqn_compute("pkg/handler.go", "Serve");
     ASSERT_NOT_NULL(fqn);
-    ASSERT_TRUE(strstr(fqn, "proj") != NULL);
-    ASSERT_TRUE(strstr(fqn, "Serve") != NULL);
+    ASSERT_STR_EQ(fqn, "pkg.handler.Serve");
     free(fqn);
     PASS();
 }
 
 TEST(fqn_compute_strips_ext) {
     /* FQN should strip file extension */
-    char *fqn = cbm_pipeline_fqn_compute("proj", "main.go", "main");
+    char *fqn = cbm_pipeline_fqn_compute("main.go", "main");
     ASSERT_NOT_NULL(fqn);
     /* Should not contain ".go" */
     ASSERT_TRUE(strstr(fqn, ".go") == NULL);
@@ -7098,19 +7166,19 @@ TEST(fqn_compute_strips_ext) {
 }
 
 TEST(fqn_module_basic) {
-    /* Module QN: project.dir.parts */
-    char *mod = cbm_pipeline_fqn_module("proj", "pkg/util/helper.go");
+    /* QN модуля содержит только относительный путь. */
+    char *mod = cbm_pipeline_fqn_module("pkg/util/helper.go");
     ASSERT_NOT_NULL(mod);
-    ASSERT_TRUE(strstr(mod, "proj") != NULL);
+    ASSERT_STR_EQ(mod, "pkg.util.helper");
     free(mod);
     PASS();
 }
 
 TEST(fqn_folder_basic) {
     /* Folder QN from directory path */
-    char *folder = cbm_pipeline_fqn_folder("proj", "pkg/util");
+    char *folder = cbm_pipeline_fqn_folder("pkg/util");
     ASSERT_NOT_NULL(folder);
-    ASSERT_TRUE(strstr(folder, "proj") != NULL);
+    ASSERT_STR_EQ(folder, "pkg.util");
     free(folder);
     PASS();
 }
@@ -7481,6 +7549,7 @@ SUITE(pipeline) {
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
+    RUN_TEST(pipeline_legacy_qn_format_forces_full_reindex);
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);

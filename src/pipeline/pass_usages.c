@@ -100,7 +100,7 @@ static int build_import_map_from_cache(cbm_pipeline_ctx_t *ctx, const CBMFileRes
         if (!imp->local_name || !imp->local_name[0] || !imp->module_path) {
             continue;
         }
-        char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
+        char *target_qn = cbm_pipeline_fqn_module(imp->module_path);
         const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
         free(target_qn);
         if (!target) {
@@ -121,7 +121,7 @@ static int build_import_map_from_cache(cbm_pipeline_ctx_t *ctx, const CBMFileRes
 static int build_import_map_from_edges(cbm_pipeline_ctx_t *ctx, const char *rel_path,
                                        const char ***out_keys, const char ***out_vals,
                                        int *out_count) {
-    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
+    char *file_qn = cbm_pipeline_fqn_compute(rel_path, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
     free(file_qn);
     if (!file_node) {
@@ -205,7 +205,7 @@ static const cbm_gbuf_node_t *find_enclosing_node(cbm_pipeline_ctx_t *ctx, const
         }
     }
     if (!node) {
-        char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
+        char *file_qn = cbm_pipeline_fqn_compute(rel_path, "__file__");
         node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
         free(file_qn);
     }
@@ -370,8 +370,7 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
         int imp_count = 0;
         build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
 
-        char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
-                                                      pu_module_is_dir(files[i].language));
+        char *module_qn = cbm_pipeline_fqn_module_dir(rel, pu_module_is_dir(files[i].language));
 
         usage_resolved +=
             resolve_usage_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count);
