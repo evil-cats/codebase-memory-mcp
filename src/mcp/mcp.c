@@ -375,13 +375,7 @@ static const tool_def_t TOOLS[] = {
      "similarity/semantic. cross-repo-intelligence: match Routes/Channels across projects.\"},"
      "\"target_projects\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
      "\"description\":\"Projects to search for cross-repo links (cross-repo-intelligence mode). "
-     "Use [\\\"*\\\"] for all indexed projects. Run list_projects to see available projects.\"},"
-     "\"name\":{\"type\":\"string\",\"description\":"
-     "\"Override the derived project name. Non-ASCII bytes are encoded and unsafe path characters "
-     "are normalized.\"},"
-     "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
-     "\"Write compressed artifact to .codebase-memory/graph.db.zst for team sharing. "
-     "Teammates can bootstrap from the artifact instead of full re-indexing.\"}"
+     "Use [\\\"*\\\"] for all indexed projects. Run list_projects to see available projects.\"}"
      "},\"required\":[\"repo_path\"]}"},
 
     {"search_graph", "Search graph",

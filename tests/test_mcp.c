@@ -852,12 +852,90 @@ TEST(mcp_tools_have_behavior_annotations) {
     PASS();
 }
 
-TEST(mcp_index_repository_declares_name_override_issue571) {
+/* Публичный контракт индексации не рекламирует внутренние параметры имени и
+ * экспорта артефакта, но сохраняет остальные свойства без потерь. */
+TEST(mcp_index_repository_hides_internal_options) {
     char *json = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(json);
-    ASSERT_NOT_NULL(strstr(json, "\"index_repository\""));
-    ASSERT_NOT_NULL(strstr(json, "\"name\":{\"type\":\"string\""));
-    ASSERT_NOT_NULL(strstr(json, "Non-ASCII bytes are encoded"));
+
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_NOT_NULL(root);
+    yyjson_val *tools = yyjson_obj_get(root, "tools");
+    ASSERT_NOT_NULL(tools);
+    ASSERT_TRUE(yyjson_is_arr(tools));
+
+    yyjson_val *tool;
+    yyjson_arr_iter iter;
+    yyjson_arr_iter_init(tools, &iter);
+    yyjson_val *index_repository = NULL;
+    while ((tool = yyjson_arr_iter_next(&iter)) != NULL) {
+        yyjson_val *name = yyjson_obj_get(tool, "name");
+        if (name && yyjson_is_str(name) && strcmp(yyjson_get_str(name), "index_repository") == 0) {
+            index_repository = tool;
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(index_repository);
+
+    yyjson_val *description = yyjson_obj_get(index_repository, "description");
+    ASSERT_TRUE(yyjson_is_str(description));
+    const char *description_text = yyjson_get_str(description);
+    ASSERT_NULL(strstr(description_text, "Override the derived project name"));
+    ASSERT_NULL(strstr(description_text, "Write compressed artifact"));
+    ASSERT_NULL(strstr(description_text, ".codebase-memory/graph.db.zst"));
+
+    yyjson_val *input_schema = yyjson_obj_get(index_repository, "inputSchema");
+    ASSERT_NOT_NULL(input_schema);
+    yyjson_val *properties = yyjson_obj_get(input_schema, "properties");
+    ASSERT_NOT_NULL(properties);
+    ASSERT_EQ(yyjson_obj_size(properties), 3U);
+    ASSERT_NULL(yyjson_obj_get(properties, "name"));
+    ASSERT_NULL(yyjson_obj_get(properties, "persistence"));
+
+    yyjson_val *repo_path = yyjson_obj_get(properties, "repo_path");
+    ASSERT_NOT_NULL(repo_path);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(repo_path, "type")), "string");
+    ASSERT_TRUE(yyjson_is_str(yyjson_obj_get(repo_path, "description")));
+
+    yyjson_val *required = yyjson_obj_get(input_schema, "required");
+    ASSERT_TRUE(yyjson_is_arr(required));
+    ASSERT_EQ(yyjson_arr_size(required), 1U);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(required, 0)), "repo_path");
+
+    yyjson_val *mode = yyjson_obj_get(properties, "mode");
+    ASSERT_NOT_NULL(mode);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(mode, "type")), "string");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(mode, "default")), "full");
+    ASSERT_TRUE(yyjson_is_str(yyjson_obj_get(mode, "description")));
+    yyjson_val *mode_enum = yyjson_obj_get(mode, "enum");
+    ASSERT_TRUE(yyjson_is_arr(mode_enum));
+    static const char *expected_modes[] = {"full", "moderate", "fast", "cross-repo-intelligence"};
+    ASSERT_EQ(yyjson_arr_size(mode_enum), sizeof(expected_modes) / sizeof(expected_modes[0]));
+    for (size_t i = 0; i < sizeof(expected_modes) / sizeof(expected_modes[0]); i++) {
+        bool found = false;
+        yyjson_val *value;
+        yyjson_arr_iter mode_iter;
+        yyjson_arr_iter_init(mode_enum, &mode_iter);
+        while ((value = yyjson_arr_iter_next(&mode_iter)) != NULL) {
+            if (yyjson_is_str(value) && strcmp(yyjson_get_str(value), expected_modes[i]) == 0) {
+                found = true;
+                break;
+            }
+        }
+        ASSERT_TRUE(found);
+    }
+
+    yyjson_val *target_projects = yyjson_obj_get(properties, "target_projects");
+    ASSERT_NOT_NULL(target_projects);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(target_projects, "type")), "array");
+    ASSERT_TRUE(yyjson_is_str(yyjson_obj_get(target_projects, "description")));
+    yyjson_val *items = yyjson_obj_get(target_projects, "items");
+    ASSERT_NOT_NULL(items);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(items, "type")), "string");
+
+    yyjson_doc_free(doc);
     free(json);
     PASS();
 }
@@ -9676,7 +9754,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_tools_list);
     RUN_TEST(mcp_tools_list_latest_metadata);
     RUN_TEST(mcp_tools_have_behavior_annotations);
-    RUN_TEST(mcp_index_repository_declares_name_override_issue571);
+    RUN_TEST(mcp_index_repository_hides_internal_options);
     RUN_TEST(mcp_tools_array_schemas_have_items);
     RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);
     RUN_TEST(mcp_get_architecture_aspects_schema_enum_pr560);
