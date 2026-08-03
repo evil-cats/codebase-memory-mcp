@@ -387,9 +387,10 @@ static const tool_def_t TOOLS[] = {
      "vector cosine search that bridges vocabulary (finds 'publish' when you search 'send'). "
      "The three modes are independent and can be combined in a single call. "
      "RESPONSE: prefix-grouped tree rows by default — a shared (qn-prefix, file) group "
-     "header printed once, then `qn_suffix name base_name label lines in out` per row "
-     "(full qn = group prefix + dot + qn_suffix). C++ overloads are separate rows; "
-     "base_name groups one overload set. in/out = TOTAL degree across ALL edge types (DEFINES, "
+     "header printed once, then `qn_suffix name label lines in out` per row "
+     "(full qn = group prefix + dot + qn_suffix). C++ overloads are separate rows. "
+     "Use name_pattern to find all overloads by their existing short name. "
+     "in/out = TOTAL degree across ALL edge types (DEFINES, "
      "USAGE, CALLS, ...), NOT caller/callee counts — use trace_path for callers. Add per-node "
      "property columns via "
      "fields (e.g. [\"complexity\",\"signature\",\"docstring\"]); format=\"json\" returns "
@@ -407,8 +408,7 @@ static const tool_def_t TOOLS[] = {
      "Noise labels (File/Folder/Module/Variable) are filtered out. When provided, name_pattern "
      "is ignored.\"},"
      "\"label\":{\"type\":\"string\"},\"name_pattern\":{\"type\":\"string\"},\"qn_pattern\":{"
-     "\"type\":\"string\"},\"base_name\":{\"type\":\"string\",\"description\":"
-     "\"Exact overload-group qualified name. Returns every C++ overload in that set.\"},"
+     "\"type\":\"string\"},"
      "\"file_pattern\":{\"type\":\"string\"},"
      "\"relationship\":{\"type\":\"string\"},\"min_degree\":{\"type\":\"integer\"},"
      "\"max_degree\":{\"type\":\"integer\"},\"exclude_entry_points\":{\"type\":\"boolean\"},"
@@ -429,7 +429,7 @@ static const tool_def_t TOOLS[] = {
      "\"fields\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":"
      "\"Extra per-node property columns, e.g. complexity, cognitive, "
      "signature, docstring, return_type, is_test, lines(int). Core row columns "
-     "(qn/name/base_name/label/file/lines/in/out) are always present — do not request them here. "
+     "(qn/name/label/file/lines/in/out) are always present — do not request them here. "
      "Missing values emit as empty cells.\"},"
      "\"detail\":{\"type\":\"string\",\"enum\":[\"ids\",\"default\"],\"default\":\"default\","
      "\"description\":\"ids: bare qualified-name enumeration (one column) — cheapest form "
@@ -2637,8 +2637,7 @@ enum {
     BM25_COL_FILE = 4,
     BM25_COL_START = 5,
     BM25_COL_END = 6,
-    BM25_COL_BASE_NAME = 7,
-    BM25_COL_RANK = 8,
+    BM25_COL_RANK = 7,
     BM25_BIND_QUERY = 1,
     BM25_BIND_PROJECT = 2,
     BM25_BIND_LIMIT = 3,
@@ -2756,7 +2755,6 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
      * NEGATIVE score (lower = more relevant). */
     const char *sql =
         "SELECT n.id, n.label, n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, "
-        "       COALESCE(json_extract(n.properties, '$.base_name'), n.qualified_name), "
         "       (fts.base_rank "
         "        - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
         "               WHEN n.label = 'Route' THEN 8.0 "
@@ -2845,8 +2843,6 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
             cbm_tree_row_begin(&rows);
             cbm_tree_cell_str(&rows, (const char *)sqlite3_column_text(stmt, BM25_COL_QN), true);
             cbm_tree_cell_str(&rows, (const char *)sqlite3_column_text(stmt, BM25_COL_NAME), false);
-            cbm_tree_cell_str(&rows, (const char *)sqlite3_column_text(stmt, BM25_COL_BASE_NAME),
-                              false);
             cbm_tree_cell_str(&rows, (const char *)sqlite3_column_text(stmt, BM25_COL_LABEL),
                               false);
             cbm_tree_cell_str(&rows, (const char *)sqlite3_column_text(stmt, BM25_COL_FILE), false);
@@ -2862,9 +2858,8 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         cbm_sb_init(&sb);
         cbm_tree_scalar_int(&sb, "total", total);
         cbm_tree_scalar_str(&sb, "search_mode", "bm25");
-        static const char *const cols[] = {"qn",   "name",  "base_name", "label",
-                                           "file", "lines", "rank"};
-        cbm_tree_table_header(&sb, "results", emitted, cols, 7);
+        static const char *const cols[] = {"qn", "name", "label", "file", "lines", "rank"};
+        cbm_tree_table_header(&sb, "results", emitted, cols, 6);
         char *rows_text = cbm_sb_finish(&rows);
         cbm_sb_append(&sb, rows_text ? rows_text : "");
         free(rows_text);
@@ -2880,8 +2875,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     yyjson_mut_obj_add_int(doc, root, "total", total);
     yyjson_mut_obj_add_str(doc, root, "search_mode", "bm25");
     yyjson_mut_val *jcols = yyjson_mut_arr(doc);
-    static const char *const bm25_cols[] = {"qn",   "name",  "base_name", "label",
-                                            "file", "lines", "rank"};
+    static const char *const bm25_cols[] = {"qn", "name", "label", "file", "lines", "rank"};
     for (size_t ci = 0; ci < sizeof(bm25_cols) / sizeof(bm25_cols[0]); ci++) {
         yyjson_mut_arr_add_str(doc, jcols, bm25_cols[ci]);
     }
@@ -2901,8 +2895,6 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         yyjson_mut_val *row = yyjson_mut_arr(doc);
         yyjson_mut_arr_add_strcpy(doc, row, (const char *)sqlite3_column_text(stmt, BM25_COL_QN));
         yyjson_mut_arr_add_strcpy(doc, row, (const char *)sqlite3_column_text(stmt, BM25_COL_NAME));
-        yyjson_mut_arr_add_strcpy(doc, row,
-                                  (const char *)sqlite3_column_text(stmt, BM25_COL_BASE_NAME));
         yyjson_mut_arr_add_strcpy(doc, row,
                                   (const char *)sqlite3_column_text(stmt, BM25_COL_LABEL));
         yyjson_mut_arr_add_strcpy(doc, row, (const char *)sqlite3_column_text(stmt, BM25_COL_FILE));
@@ -3042,9 +3034,9 @@ static bool sg_field_blocked(const char *f) {
  * round-trip on exactly that. Drop them and teach instead. */
 static bool sg_field_is_core(const char *f) {
     return strcmp(f, "qn") == 0 || strcmp(f, "qualified_name") == 0 || strcmp(f, "name") == 0 ||
-           strcmp(f, "base_name") == 0 || strcmp(f, "label") == 0 || strcmp(f, "file") == 0 ||
-           strcmp(f, "file_path") == 0 || strcmp(f, "path") == 0 || strcmp(f, "lines") == 0 ||
-           strcmp(f, "in") == 0 || strcmp(f, "out") == 0;
+           strcmp(f, "label") == 0 || strcmp(f, "file") == 0 || strcmp(f, "file_path") == 0 ||
+           strcmp(f, "path") == 0 || strcmp(f, "lines") == 0 || strcmp(f, "in") == 0 ||
+           strcmp(f, "out") == 0;
 }
 
 /* Parse the `fields` argument (array of property names) into out[] as
@@ -3127,24 +3119,6 @@ static void sg_lines_str(char *out, size_t sz, int start, int end) {
     }
 }
 
-static void sg_node_base_name(const cbm_node_t *node, char *out, size_t out_size) {
-    const char *fallback = node->qualified_name ? node->qualified_name : "";
-    snprintf(out, out_size, "%s", fallback);
-    if (!node->properties_json || !node->properties_json[0]) {
-        return;
-    }
-    yyjson_doc *doc = yyjson_read(node->properties_json, strlen(node->properties_json), 0);
-    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
-    yyjson_val *value = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "base_name") : NULL;
-    const char *base = value && yyjson_is_str(value) ? yyjson_get_str(value) : NULL;
-    if (base && base[0]) {
-        snprintf(out, out_size, "%s", base);
-    }
-    if (doc) {
-        yyjson_doc_free(doc);
-    }
-}
-
 /* Emit the regex-path search results as a TOON table. */
 static void emit_search_results_toon(cbm_sb_t *sb, const cbm_search_output_t *out, int offset,
                                      const char *const *fields, int nfields, bool detail_ids) {
@@ -3162,9 +3136,9 @@ static void emit_search_results_toon(cbm_sb_t *sb, const cbm_search_output_t *ou
         cbm_tree_scalar_bool(sb, "has_more", out->total > offset + out->count);
         return;
     }
-    const char *cols[8 + SG_MAX_EXTRA_FIELDS] = {"qn",   "name",  "base_name", "label",
-                                                 "file", "lines", "in",        "out"};
-    int ncols = 8;
+    const char *cols[7 + SG_MAX_EXTRA_FIELDS] = {"qn",    "name", "label", "file",
+                                                 "lines", "in",   "out"};
+    int ncols = 7;
     for (int f = 0; f < nfields; f++) {
         cols[ncols++] = fields[f];
     }
@@ -3172,13 +3146,10 @@ static void emit_search_results_toon(cbm_sb_t *sb, const cbm_search_output_t *ou
     for (int i = 0; i < out->count; i++) {
         const cbm_search_result_t *sr = &out->results[i];
         char lines[CBM_SZ_32];
-        char base_name[CBM_SZ_2K];
         sg_lines_str(lines, sizeof(lines), sr->node.start_line, sr->node.end_line);
-        sg_node_base_name(&sr->node, base_name, sizeof(base_name));
         cbm_tree_row_begin(sb);
         cbm_tree_cell_str(sb, sr->node.qualified_name, true);
         cbm_tree_cell_str(sb, sr->node.name, false);
-        cbm_tree_cell_str(sb, base_name, false);
         cbm_tree_cell_str(sb, sr->node.label, false);
         cbm_tree_cell_str(sb, sr->node.file_path, false);
         cbm_tree_cell_str(sb, lines, false);
@@ -3226,7 +3197,7 @@ static void emit_search_results_tree(cbm_sb_t *sb, cbm_search_output_t *out, int
         strncat(extra_cols, " connected", sizeof(extra_cols) - strlen(extra_cols) - 1);
     }
     snprintf(buf, sizeof(buf),
-             "total: %d\nresults: %d  (rows: qn_suffix name base_name label lines in out%s; "
+             "total: %d\nresults: %d  (rows: qn_suffix name label lines in out%s; "
              "qn = group prefix + \".\" + qn_suffix)\n",
              out->total, out->count, extra_cols);
     cbm_sb_append(sb, buf);
@@ -3249,13 +3220,10 @@ static void emit_search_results_tree(cbm_sb_t *sb, cbm_search_output_t *out, int
         }
         const char *shortname = plen ? qn + plen + 1 : qn;
         char lines[CBM_SZ_32];
-        char base_name[CBM_SZ_2K];
         sg_lines_str(lines, sizeof(lines), sr->node.start_line, sr->node.end_line);
-        sg_node_base_name(&sr->node, base_name, sizeof(base_name));
         cbm_tree_row_begin(sb);
         cbm_tree_cell_str(sb, shortname, true);
         cbm_tree_cell_str(sb, sr->node.name, false);
-        cbm_tree_cell_str(sb, base_name, false);
         cbm_tree_cell_str(sb, sr->node.label, false);
         cbm_tree_cell_str(sb, lines, false);
         cbm_tree_cell_int(sb, sr->in_degree, false);
@@ -3312,8 +3280,7 @@ static void emit_search_results_tree_json(yyjson_mut_doc *doc, yyjson_mut_val *r
     yyjson_mut_obj_add_int(doc, root, "total", out->total);
     yyjson_mut_obj_add_int(doc, root, "count", out->count);
     yyjson_mut_val *cols = yyjson_mut_arr(doc);
-    static const char *const col_names[] = {"qn_suffix", "name", "base_name", "label",
-                                            "lines",     "in",   "out"};
+    static const char *const col_names[] = {"qn_suffix", "name", "label", "lines", "in", "out"};
     for (size_t i = 0; i < sizeof(col_names) / sizeof(col_names[0]); i++) {
         yyjson_mut_arr_add_str(doc, cols, col_names[i]);
     }
@@ -3350,13 +3317,10 @@ static void emit_search_results_tree_json(yyjson_mut_doc *doc, yyjson_mut_val *r
             yyjson_mut_arr_add_val(groups, cur);
         }
         char lines[CBM_SZ_32];
-        char base_name[CBM_SZ_2K];
         sg_lines_str(lines, sizeof(lines), sr->node.start_line, sr->node.end_line);
-        sg_node_base_name(&sr->node, base_name, sizeof(base_name));
         yyjson_mut_val *row = yyjson_mut_arr(doc);
         yyjson_mut_arr_add_strcpy(doc, row, plen ? qn + plen + 1 : qn);
         yyjson_mut_arr_add_strcpy(doc, row, sr->node.name ? sr->node.name : "");
-        yyjson_mut_arr_add_strcpy(doc, row, base_name);
         yyjson_mut_arr_add_strcpy(doc, row, sr->node.label ? sr->node.label : "");
         yyjson_mut_arr_add_strcpy(doc, row, lines);
         yyjson_mut_arr_add_int(doc, row, sr->in_degree);
@@ -3457,7 +3421,6 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     char *label = cbm_mcp_get_string_arg(args, "label");
     char *name_pattern = cbm_mcp_get_string_arg(args, "name_pattern");
     char *qn_pattern = cbm_mcp_get_string_arg(args, "qn_pattern");
-    char *base_name = cbm_mcp_get_string_arg(args, "base_name");
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
     char *relationship = cbm_mcp_get_string_arg(args, "relationship");
     bool exclude_entry_points = cbm_mcp_get_bool_arg(args, "exclude_entry_points");
@@ -3472,7 +3435,6 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         free(label);
         free(name_pattern);
         free(qn_pattern);
-        free(base_name);
         free(file_pattern);
         free(relationship);
         return cbm_mcp_text_result("relationship must be uppercase letters and underscores", true);
@@ -3483,7 +3445,6 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         .label = label,
         .name_pattern = name_pattern,
         .qn_pattern = qn_pattern,
-        .base_name = base_name,
         .file_pattern = file_pattern,
         .relationship = relationship,
         .exclude_entry_points = exclude_entry_points,
@@ -3513,7 +3474,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             /* Semantic-only calls get semantic results only: the legacy
              * behavior also ran the UNFILTERED regex search and prepended
              * up to `limit` unrelated enriched nodes to the response. */
-            bool has_filters = label || name_pattern || qn_pattern || base_name || file_pattern ||
+            bool has_filters = label || name_pattern || qn_pattern || file_pattern ||
                                relationship || exclude_entry_points ||
                                min_degree != CBM_NOT_FOUND || max_degree != CBM_NOT_FOUND;
             bool semantic_only = sq_present && !has_filters;
@@ -3575,7 +3536,6 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             free(label);
             free(name_pattern);
             free(qn_pattern);
-            free(base_name);
             free(file_pattern);
             free(relationship);
             char *text = cbm_sb_finish(&sb);
@@ -3591,7 +3551,6 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         free(label);
         free(name_pattern);
         free(qn_pattern);
-        free(base_name);
         free(file_pattern);
         free(relationship);
         return cbm_mcp_text_result(
@@ -3651,7 +3610,6 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         free(label);
         free(name_pattern);
         free(qn_pattern);
-        free(base_name);
         free(file_pattern);
         free(relationship);
         return cbm_mcp_text_result(
@@ -3670,7 +3628,6 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     free(label);
     free(name_pattern);
     free(qn_pattern);
-    free(base_name);
     free(file_pattern);
     free(relationship);
 
@@ -5775,30 +5732,47 @@ static int pick_resolved_node(const cbm_node_t *nodes, int count, bool *ambiguou
     return best;
 }
 
-/* Канонические перегрузки имеют общий base_name, но разные qualified_name.
- * Такой набор нельзя сводить к «лучшей» декларации или объединять при обходе:
- * вызывающий должен выбрать точную сигнатуру. */
+/* Найти конец короткого имени в каноническом QN. Сигнатура начинается сразу
+ * после него с `(` либо с шаблонной части `<...>`. */
+static size_t node_callable_name_end(const cbm_node_t *node) {
+    if (!node || !node->qualified_name || !node->name || !node->name[0]) {
+        return 0;
+    }
+    const char *qn = node->qualified_name;
+    const char *name = node->name;
+    const size_t name_len = strlen(name);
+    const char *name_segment = NULL;
+    for (const char *match = qn; (match = strstr(match, name)) != NULL; match += name_len) {
+        const char next = match[name_len];
+        if ((match == qn || match[-1] == '.' || match[-1] == ':') && (next == '(' || next == '<')) {
+            name_segment = match;
+        }
+    }
+    return name_segment ? (size_t)(name_segment - qn) + name_len : 0;
+}
+
+/* Канонические перегрузки имеют одинаковый квалифицированный префикс имени,
+ * но разные qualified_name. Такой набор нельзя сводить к «лучшей» декларации
+ * или объединять при обходе: вызывающий должен выбрать точную сигнатуру. */
 static bool nodes_form_overload_set(const cbm_node_t *nodes, int count) {
     if (!nodes || count < 2) {
         return false;
     }
 
-    char first_base[CBM_SZ_2K];
-    sg_node_base_name(&nodes[0], first_base, sizeof(first_base));
-    bool has_canonical_signature =
-        nodes[0].qualified_name && strcmp(first_base, nodes[0].qualified_name) != 0;
+    const char *first_qn = nodes[0].qualified_name;
+    const size_t first_name_end = node_callable_name_end(&nodes[0]);
+    if (!first_qn || first_name_end == 0) {
+        return false;
+    }
 
     for (int i = 1; i < count; i++) {
-        char base_name[CBM_SZ_2K];
-        sg_node_base_name(&nodes[i], base_name, sizeof(base_name));
-        if (strcmp(first_base, base_name) != 0) {
+        const size_t name_end = node_callable_name_end(&nodes[i]);
+        if (!nodes[i].qualified_name || name_end != first_name_end ||
+            strncmp(first_qn, nodes[i].qualified_name, first_name_end) != 0) {
             return false;
         }
-        if (nodes[i].qualified_name && strcmp(base_name, nodes[i].qualified_name) != 0) {
-            has_canonical_signature = true;
-        }
     }
-    return has_canonical_signature;
+    return true;
 }
 
 static int node_hop_cmp_hop_id(const void *pa, const void *pb) {
@@ -6247,8 +6221,8 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* Точный qualified_name никогда не расширяется до одноимённых узлов. Для
-     * обнаружения сначала ищем короткое имя, затем канонический QN и base_name.
-     * Набор перегрузок возвращается вызывающему без выбора и объединения. */
+     * обнаружения сначала ищем короткое имя, затем канонический QN. Набор
+     * перегрузок возвращается вызывающему без выбора и объединения. */
     /* Find the node by name. If the bare-name lookup misses, fall back to
      * qualified_name so callers passing a fully-qualified identifier (which
      * the not-found hint actually recommends) hit the same path. The QN
@@ -6285,12 +6259,6 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                 free_node_contents(&qn_node);
             }
         }
-    }
-
-    if (!exact_target && node_count == 0) {
-        cbm_store_free_nodes(nodes, node_count);
-        nodes = NULL;
-        cbm_store_find_nodes_by_base_name(store, project, func_name, &nodes, &node_count);
     }
 
     if (node_count == 0) {
@@ -7964,9 +7932,6 @@ static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count
         yyjson_mut_obj_add_str(doc, s, "qualified_name",
                                nodes[i].qualified_name ? nodes[i].qualified_name : "");
         yyjson_mut_obj_add_str(doc, s, "name", nodes[i].name ? nodes[i].name : "");
-        char base_name[CBM_SZ_2K];
-        sg_node_base_name(&nodes[i], base_name, sizeof(base_name));
-        yyjson_mut_obj_add_strcpy(doc, s, "base_name", base_name);
         yyjson_mut_obj_add_str(doc, s, "label", nodes[i].label ? nodes[i].label : "");
         yyjson_mut_obj_add_str(doc, s, "file_path", nodes[i].file_path ? nodes[i].file_path : "");
         yyjson_mut_arr_append(arr, s);
@@ -8220,9 +8185,6 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     yyjson_mut_obj_add_str(doc, root_obj, "name", node->name ? node->name : "");
     yyjson_mut_obj_add_str(doc, root_obj, "qualified_name",
                            node->qualified_name ? node->qualified_name : "");
-    char base_name[CBM_SZ_2K];
-    sg_node_base_name(node, base_name, sizeof(base_name));
-    yyjson_mut_obj_add_strcpy(doc, root_obj, "base_name", base_name);
     yyjson_mut_obj_add_str(doc, root_obj, "label", node->label ? node->label : "");
 
     const char *display_path = "";
@@ -8359,30 +8321,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         return result;
     }
 
-    /* Уровень 2: точный base_name группы. Несколько перегрузок требуют выбора
-     * вызывающего; молча выбирать одну из них нельзя. */
-    cbm_node_t *base_nodes = NULL;
-    int base_count = 0;
-    cbm_store_find_nodes_by_base_name(store, effective_project, qn, &base_nodes, &base_count);
-    if (base_count == SKIP_ONE) {
-        copy_node(&base_nodes[0], &node);
-        cbm_store_free_nodes(base_nodes, base_count);
-        char *result = build_snippet_response(srv, &node, "base_name", include_neighbors, NULL, 0);
-        free_node_contents(&node);
-        free(qn);
-        free(project);
-        return result;
-    }
-    if (base_count > SKIP_ONE) {
-        char *result = snippet_suggestions(qn, base_nodes, base_count);
-        cbm_store_free_nodes(base_nodes, base_count);
-        free(qn);
-        free(project);
-        return result;
-    }
-    cbm_store_free_nodes(base_nodes, base_count);
-
-    /* Уровень 3: точное короткое имя. Канонические QN перегрузок больше не
+    /* Уровень 2: точное короткое имя. Канонические QN перегрузок больше не
      * оканчиваются голым именем, поэтому suffix-поиск их не обнаружит. */
     cbm_node_t *name_nodes = NULL;
     int name_count = 0;
@@ -8390,7 +8329,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     if (name_count == SKIP_ONE) {
         copy_node(&name_nodes[0], &node);
         cbm_store_free_nodes(name_nodes, name_count);
-        char *result = build_snippet_response(srv, &node, "suffix", include_neighbors, NULL, 0);
+        char *result = build_snippet_response(srv, &node, "name", include_neighbors, NULL, 0);
         free_node_contents(&node);
         free(qn);
         free(project);
@@ -8405,7 +8344,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     }
     cbm_store_free_nodes(name_nodes, name_count);
 
-    /* Уровень 4: совпадение по суффиксу для неполных QN ("main.HandleRequest")
+    /* Уровень 3: совпадение по суффиксу для неполных QN ("main.HandleRequest")
      * and short names ("ProcessOrder") via LIKE '%.X'. */
     cbm_node_t *suffix_nodes = NULL;
     int suffix_count = 0;

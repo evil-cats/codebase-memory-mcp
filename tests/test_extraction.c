@@ -817,9 +817,7 @@ TEST(cpp_overload_qualified_names) {
     const CBMDefinition *f_view = cpp_def_n(r, "f", 1);
     ASSERT_NOT_NULL(f_int);
     ASSERT_NOT_NULL(f_view);
-    ASSERT_NOT_NULL(f_int->base_name);
-    ASSERT_STR_EQ(f_int->base_name, f_view->base_name);
-    ASSERT_NOT_NULL(strstr(f_int->base_name, ".ns.f"));
+    ASSERT_STR_EQ(f_int->name, f_view->name);
     ASSERT_STR_NEQ(f_int->qualified_name, f_view->qualified_name);
     ASSERT_NOT_NULL(strstr(f_int->qualified_name, "f(int)"));
     ASSERT_NOT_NULL(strstr(f_view->qualified_name, "f(std::string_view)"));
@@ -830,15 +828,14 @@ TEST(cpp_overload_qualified_names) {
     const CBMDefinition *data_const = cpp_def_n(r, "data", 1);
     ASSERT_NOT_NULL(data_mut);
     ASSERT_NOT_NULL(data_const);
-    ASSERT_STR_EQ(data_mut->base_name, data_const->base_name);
-    ASSERT_NOT_NULL(strstr(data_mut->base_name, ".ns.Buffer.data"));
+    ASSERT_STR_EQ(data_mut->name, data_const->name);
     ASSERT_NOT_NULL(strstr(data_mut->qualified_name, "data()"));
     ASSERT_NOT_NULL(strstr(data_const->qualified_name, "data() const"));
     ASSERT_STR_NEQ(data_mut->qualified_name, data_const->qualified_name);
 
     const CBMDefinition *data_volatile = cpp_def_n(r, "data", 2);
     ASSERT_NOT_NULL(data_volatile);
-    ASSERT_STR_EQ(data_mut->base_name, data_volatile->base_name);
+    ASSERT_STR_EQ(data_mut->name, data_volatile->name);
     ASSERT_NOT_NULL(strstr(data_volatile->qualified_name, "data() volatile"));
     ASSERT_STR_NEQ(data_mut->qualified_name, data_volatile->qualified_name);
     ASSERT_STR_NEQ(data_const->qualified_name, data_volatile->qualified_name);
@@ -939,7 +936,8 @@ TEST(cpp_overload_many_template_params_stay_stable) {
     PASS();
 }
 
-/* LSP должен связывать вызов с точной перегрузкой, а не с общим base QN. */
+/* LSP должен связывать вызов с точной перегрузкой, а не с произвольным
+ * одноимённым определением. */
 TEST(cpp_overload_lsp_resolves_exact_callee) {
     const char *src = "#include <string_view>\n"
                       "namespace ns {\n"
@@ -960,7 +958,7 @@ TEST(cpp_overload_lsp_resolves_exact_callee) {
     ASSERT_NOT_NULL(f_view);
     ASSERT_NOT_NULL(call_int);
     ASSERT_NOT_NULL(call_view);
-    ASSERT_NOT_NULL(strstr(f_int->base_name, ".ns.f"));
+    ASSERT_STR_EQ(f_int->name, f_view->name);
     ASSERT_NOT_NULL(strstr(call_int->qualified_name, ".ns.call_int()"));
 
     bool raw_int_has_canonical_caller = false;

@@ -248,7 +248,6 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         dst->receiver_type = pxc_jvm_type_qn(arena, namespace_name, src->parent_class);
     } else {
         dst->qualified_name = src->qualified_name;
-        dst->base_qualified_name = src->base_name;
         dst->receiver_type = src->parent_class;
     }
     dst->short_name = src->name;

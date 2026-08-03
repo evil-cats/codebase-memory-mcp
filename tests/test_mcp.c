@@ -1848,7 +1848,7 @@ TEST(tool_search_graph_includes_node_properties) {
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "results:")); /* TOON table header */
-    ASSERT_NOT_NULL(strstr(inner, "(rows: qn_suffix name base_name label lines in out;"));
+    ASSERT_NOT_NULL(strstr(inner, "(rows: qn_suffix name label lines in out;"));
     ASSERT_NOT_NULL(strstr(inner, "HandleRequest"));
     ASSERT_NULL(strstr(inner, "func HandleRequest")); /* signature not spilled */
     ASSERT_NULL(strstr(inner, "is_exported"));
@@ -1864,7 +1864,7 @@ TEST(tool_search_graph_includes_node_properties) {
     ASSERT_NOT_NULL(resp);
     inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "(rows: qn_suffix name base_name label lines in out signature;"));
+    ASSERT_NOT_NULL(strstr(inner, "(rows: qn_suffix name label lines in out signature;"));
     /* values with spaces are QUOTED so column positions survive */
     ASSERT_NOT_NULL(strstr(inner, "\"func HandleRequest() error\""));
     ASSERT_NOT_NULL(strstr(inner, "func HandleRequest"));
@@ -2611,7 +2611,6 @@ TEST(tool_cpp_overloads_are_separate_and_exactly_addressable) {
     ASSERT_NOT_NULL(srv);
     cbm_store_t *st = cbm_mcp_server_store(srv);
     const char *proj = "overload-proj";
-    const char *base = "overload-proj.ns.f";
     const char *qn_int = "overload-proj.ns.f(int)";
     const char *qn_string = "overload-proj.ns.f(std::string_view)";
     cbm_mcp_server_set_project(srv, proj);
@@ -2624,8 +2623,7 @@ TEST(tool_cpp_overloads_are_separate_and_exactly_addressable) {
                         .file_path = "overloads.cpp",
                         .start_line = 1,
                         .end_line = 3,
-                        .properties_json =
-                            "{\"base_name\":\"overload-proj.ns.f\",\"signature\":\"f(int)\"}"};
+                        .properties_json = "{\"signature\":\"f(int)\"}"};
     cbm_node_t f_string = {.project = proj,
                            .label = "Function",
                            .name = "f",
@@ -2633,8 +2631,7 @@ TEST(tool_cpp_overloads_are_separate_and_exactly_addressable) {
                            .file_path = "overloads.cpp",
                            .start_line = 4,
                            .end_line = 6,
-                           .properties_json = "{\"base_name\":\"overload-proj.ns.f\","
-                                              "\"signature\":\"f(std::string_view)\"}"};
+                           .properties_json = "{\"signature\":\"f(std::string_view)\"}"};
     cbm_node_t int_target = {.project = proj,
                              .label = "Function",
                              .name = "int_target",
@@ -2664,10 +2661,14 @@ TEST(tool_cpp_overloads_are_separate_and_exactly_addressable) {
     ASSERT_GT(cbm_store_insert_edge(st, &int_edge), 0);
     ASSERT_GT(cbm_store_insert_edge(st, &string_edge), 0);
 
-    char *raw =
-        cbm_mcp_handle_tool(srv, "search_graph",
-                            "{\"project\":\"overload-proj\",\"base_name\":\"overload-proj.ns.f\","
-                            "\"detail\":\"ids\"}");
+    char *tools = cbm_mcp_tools_list();
+    ASSERT_NOT_NULL(tools);
+    ASSERT_NULL(strstr(tools, "\"base_name\""));
+    free(tools);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"overload-proj\",\"name_pattern\":\"^f$\",\"detail\":\"ids\"}");
     char *inner = extract_text_content(raw);
     free(raw);
     ASSERT_NOT_NULL(inner);
@@ -2675,20 +2676,18 @@ TEST(tool_cpp_overloads_are_separate_and_exactly_addressable) {
     ASSERT_NOT_NULL(strstr(inner, qn_string));
     free(inner);
 
-    raw =
-        cbm_mcp_handle_tool(srv, "search_graph",
-                            "{\"project\":\"overload-proj\",\"base_name\":\"overload-proj.ns.f\"}");
+    raw = cbm_mcp_handle_tool(srv, "search_graph",
+                              "{\"project\":\"overload-proj\",\"name_pattern\":\"^f$\"}");
     inner = extract_text_content(raw);
     free(raw);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, base));
     ASSERT_NOT_NULL(strstr(inner, "f(int)"));
     ASSERT_NOT_NULL(strstr(inner, "f(std::string_view)"));
+    ASSERT_NULL(strstr(inner, "base_name"));
     free(inner);
 
-    raw = cbm_mcp_handle_tool(
-        srv, "get_code_snippet",
-        "{\"project\":\"overload-proj\",\"qualified_name\":\"overload-proj.ns.f\"}");
+    raw = cbm_mcp_handle_tool(srv, "get_code_snippet",
+                              "{\"project\":\"overload-proj\",\"qualified_name\":\"f\"}");
     inner = extract_text_content(raw);
     free(raw);
     ASSERT_NOT_NULL(inner);
@@ -2705,22 +2704,12 @@ TEST(tool_cpp_overloads_are_separate_and_exactly_addressable) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "int f(int value)"));
     ASSERT_NULL(strstr(inner, "std::string_view value"));
-    ASSERT_NOT_NULL(strstr(inner, "\"base_name\":\"overload-proj.ns.f\""));
+    ASSERT_NULL(strstr(inner, "base_name"));
     free(inner);
 
     raw = cbm_mcp_handle_tool(srv, "trace_path",
                               "{\"project\":\"overload-proj\",\"function_name\":\"f\","
                               "\"direction\":\"outbound\"}");
-    inner = extract_text_content(raw);
-    free(raw);
-    ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "ambiguous"));
-    free(inner);
-
-    raw = cbm_mcp_handle_tool(
-        srv, "trace_path",
-        "{\"project\":\"overload-proj\",\"function_name\":\"overload-proj.ns.f\","
-        "\"direction\":\"outbound\"}");
     inner = extract_text_content(raw);
     free(raw);
     ASSERT_NOT_NULL(inner);
@@ -6578,12 +6567,12 @@ TEST(snippet_unique_short_name) {
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* "ProcessOrder" is unique — suffix tier matches (QN ends with .ProcessOrder) */
+    /* Короткое имя "ProcessOrder" уникально и находится через индекс name. */
     char *resp = call_snippet(srv, "{\"qualified_name\":\"ProcessOrder\","
                                    "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"name\":\"ProcessOrder\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"suffix\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"name\""));
     ASSERT_NOT_NULL(strstr(resp, "\"source\""));
     free(resp);
 
@@ -6599,12 +6588,12 @@ TEST(snippet_name_tier) {
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* "HandleRequest" — suffix tier finds it (QN ends with .HandleRequest) */
+    /* Короткое имя "HandleRequest" уникально и находится через индекс name. */
     char *resp = call_snippet(srv, "{\"qualified_name\":\"HandleRequest\","
                                    "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"name\":\"HandleRequest\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"suffix\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"name\""));
     free(resp);
 
     cbm_mcp_server_free(srv);

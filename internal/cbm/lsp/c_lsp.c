@@ -430,29 +430,44 @@ static const CBMType **c_extract_call_arg_types(CLSPContext *ctx, TSNode call_no
     return types;
 }
 
-/* Уточнить уже найденную функцию по типам аргументов внутри того же базового QN.
- * Обычный поиск по имени выбирает область видимости, а этот шаг — перегрузку. */
+/* Уточнить уже найденную функцию по типам аргументов. Обычный поиск по имени
+ * выбирает область видимости, а этот шаг — конкретную перегрузку. */
 static const CBMRegisteredFunc *c_refine_overload_by_types(CLSPContext *ctx,
                                                            const CBMRegisteredFunc *func,
                                                            const CBMType **arg_types,
                                                            int arg_count) {
-    if (!func || !func->base_qualified_name) {
+    if (!func || !func->qualified_name || !func->short_name || !func->short_name[0]) {
         return func;
     }
-    const char *base_qn = func->base_qualified_name;
-    const char *dot = strrchr(base_qn, '.');
-    if (!dot || dot == base_qn || !dot[1]) {
+
+    if (func->receiver_type) {
+        const CBMRegisteredFunc *refined = cbm_registry_lookup_method_by_types(
+            ctx->registry, func->receiver_type, func->short_name, arg_types, arg_count);
+        return refined ? refined : func;
+    }
+
+    const char *qn = func->qualified_name;
+    const char *name = func->short_name;
+    const size_t name_len = strlen(name);
+    const char *name_segment = NULL;
+    for (const char *match = qn; (match = strstr(match, name)) != NULL; match += name_len) {
+        const char next = match[name_len];
+        if (match > qn && match[-1] == '.' && (next == '\0' || next == '(' || next == '<')) {
+            name_segment = match;
+        }
+    }
+    if (!name_segment || name_segment <= qn + 1) {
         return func;
     }
-    const size_t package_len = (size_t)(dot - base_qn);
+    const size_t package_len = (size_t)(name_segment - qn - 1);
     char *package_qn = (char *)cbm_arena_alloc(ctx->arena, package_len + 1);
     if (!package_qn) {
         return func;
     }
-    memcpy(package_qn, base_qn, package_len);
+    memcpy(package_qn, qn, package_len);
     package_qn[package_len] = '\0';
-    const CBMRegisteredFunc *refined = cbm_registry_lookup_symbol_by_types(
-        ctx->registry, package_qn, dot + 1, arg_types, arg_count);
+    const CBMRegisteredFunc *refined =
+        cbm_registry_lookup_symbol_by_types(ctx->registry, package_qn, name, arg_types, arg_count);
     return refined ? refined : func;
 }
 
@@ -5286,7 +5301,6 @@ void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, i
             memset(&rf, 0, sizeof(rf));
             rf.min_params = -1;
             rf.qualified_name = d->qualified_name;
-            rf.base_qualified_name = d->base_name;
             rf.short_name = d->name;
 
             // Build return type — prefer return_type (raw text) over return_types
@@ -5449,8 +5463,7 @@ static void c_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const cha
             CBMRegisteredFunc rf;
             memset(&rf, 0, sizeof(rf));
             rf.min_params = -1;
-            rf.qualified_name = d->qualified_name;           /* borrowed */
-            rf.base_qualified_name = d->base_qualified_name; /* borrowed */
+            rf.qualified_name = d->qualified_name; /* заимствованный указатель */
             rf.short_name = d->short_name;
 
             const char *def_module = d->def_module_qn ? d->def_module_qn : module_qn;

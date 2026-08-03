@@ -3312,8 +3312,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     }
 
     if (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) {
-        def.base_name = def.qualified_name;
-        def.qualified_name = cbm_cpp_callable_identity(a, def.base_name, node, func_node,
+        def.qualified_name = cbm_cpp_callable_identity(a, def.qualified_name, node, func_node,
                                                        ctx->source, &def.param_types);
     }
 
@@ -4249,7 +4248,6 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     def.name = name;
     def.qualified_name = method_qn;
     if (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) {
-        def.base_name = method_qn;
         def.qualified_name = cbm_cpp_callable_identity(a, method_qn, child, func_node, ctx->source,
                                                        &cpp_param_types);
     }

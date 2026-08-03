@@ -1344,14 +1344,14 @@ static bool cpp_append_constraint(cpp_canon_buf_t *buf, TSNode constraint, const
                                   ts_node_end_byte(constraint), NULL, 0, names, name_count);
 }
 
-const char *cbm_cpp_callable_identity(CBMArena *a, const char *base_name, TSNode wrapper_node,
+const char *cbm_cpp_callable_identity(CBMArena *a, const char *callable_name, TSNode wrapper_node,
                                       TSNode callable_node, const char *source,
                                       const char ***param_types_out) {
     if (param_types_out) {
         *param_types_out = NULL;
     }
-    if (!a || !base_name || !source) {
-        return base_name;
+    if (!a || !callable_name || !source) {
+        return callable_name;
     }
     TSNode identity_callable = callable_node;
     while (!ts_node_is_null(identity_callable) &&
@@ -1360,14 +1360,14 @@ const char *cbm_cpp_callable_identity(CBMArena *a, const char *base_name, TSNode
     }
     TSNode function_declarator = cpp_find_function_declarator(identity_callable);
     if (ts_node_is_null(function_declarator)) {
-        return base_name;
+        return callable_name;
     }
 
     size_t layer_count = cpp_count_template_layers(wrapper_node);
     cpp_template_layer_t *layers =
         layer_count ? (cpp_template_layer_t *)calloc(layer_count, sizeof(*layers)) : NULL;
     if (layer_count && !layers) {
-        return base_name;
+        return callable_name;
     }
     cpp_collect_template_layers(wrapper_node, layers, layer_count);
     size_t name_capacity = cpp_template_name_capacity(layers, layer_count);
@@ -1376,12 +1376,12 @@ const char *cbm_cpp_callable_identity(CBMArena *a, const char *base_name, TSNode
                                      : NULL;
     if (name_capacity == SIZE_MAX || (name_capacity && !names)) {
         free(layers);
-        return base_name;
+        return callable_name;
     }
     size_t name_count = cpp_collect_template_names(layers, layer_count, source, names);
 
     cpp_canon_buf_t buf = {0};
-    bool ok = cpp_canon_append_raw(&buf, base_name, strlen(base_name)) &&
+    bool ok = cpp_canon_append_raw(&buf, callable_name, strlen(callable_name)) &&
               cpp_append_template_layers(&buf, source, layers, layer_count, names, name_count) &&
               cpp_append_parameters(a, &buf, function_declarator, source, names, name_count,
                                     param_types_out) &&
@@ -1401,16 +1401,17 @@ const char *cbm_cpp_callable_identity(CBMArena *a, const char *base_name, TSNode
     if (!ok && param_types_out) {
         *param_types_out = NULL;
     }
-    const char *result = ok && buf.data ? cbm_arena_strdup(a, buf.data) : base_name;
+    const char *result = ok && buf.data ? cbm_arena_strdup(a, buf.data) : callable_name;
     free(buf.data);
     free(names);
     free(layers);
     return result;
 }
 
-const char *cbm_cpp_callable_qualified_name(CBMArena *a, const char *base_name, TSNode wrapper_node,
-                                            TSNode callable_node, const char *source) {
-    return cbm_cpp_callable_identity(a, base_name, wrapper_node, callable_node, source, NULL);
+const char *cbm_cpp_callable_qualified_name(CBMArena *a, const char *callable_name,
+                                            TSNode wrapper_node, TSNode callable_node,
+                                            const char *source) {
+    return cbm_cpp_callable_identity(a, callable_name, wrapper_node, callable_node, source, NULL);
 }
 
 static const char *func_node_name(CBMArena *a, TSNode func_node, const char *source,

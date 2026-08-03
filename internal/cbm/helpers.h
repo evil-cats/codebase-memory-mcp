@@ -64,19 +64,20 @@ TSNode cbm_resolve_c_declarator_name_node(TSNode func_node);
 // unified extractors so the def name and call-scope QN agree.
 char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source);
 
-// Сформировать стабильный qualified_name перегрузки C++/CUDA. base_name уже
+// Сформировать стабильный qualified_name перегрузки C++/CUDA. callable_name уже
 // содержит принятую в графе квалификацию проекта, файла, пространства имён и класса.
 // В каноническую часть входят типы параметров, cv/ref-квалификаторы, параметры
 // шаблона и ограничения; имена параметров, значения по умолчанию, возвращаемый
 // тип и noexcept намеренно исключаются. wrapper_node может быть
 // template_declaration, а callable_node — вложенным function_definition/declaration.
-const char *cbm_cpp_callable_qualified_name(CBMArena *a, const char *base_name, TSNode wrapper_node,
-                                            TSNode callable_node, const char *source);
+const char *cbm_cpp_callable_qualified_name(CBMArena *a, const char *callable_name,
+                                            TSNode wrapper_node, TSNode callable_node,
+                                            const char *source);
 
 // То же построение идентичности, но дополнительно возвращает позиционный
 // NULL-terminated массив канонических типов параметров. Он нужен LSP-реестру:
 // общий def.param_types исторически отбрасывал встроенные типы и повторы.
-const char *cbm_cpp_callable_identity(CBMArena *a, const char *base_name, TSNode wrapper_node,
+const char *cbm_cpp_callable_identity(CBMArena *a, const char *callable_name, TSNode wrapper_node,
                                       TSNode callable_node, const char *source,
                                       const char ***param_types_out);
 

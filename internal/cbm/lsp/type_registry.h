@@ -22,7 +22,6 @@ typedef enum {
 // Registered function/method with full type signature.
 typedef struct {
     const char *qualified_name;    // точный QN, включая сигнатуру перегрузки
-    const char *base_qualified_name; // QN без сигнатуры перегрузки; NULL = qualified_name
     const char *receiver_type;     // e.g., "proj.pkg.TypeName" (NULL for functions)
     const char *short_name;        // e.g., "MethodName"
     const CBMType *signature;      // FUNC type with param/return types
