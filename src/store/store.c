@@ -116,6 +116,7 @@ struct cbm_store {
     sqlite3_stmt *stmt_find_node_by_qn;
     sqlite3_stmt *stmt_find_node_by_qn_any; /* QN lookup without project filter */
     sqlite3_stmt *stmt_find_nodes_by_name;
+    sqlite3_stmt *stmt_find_nodes_by_base_name;
     sqlite3_stmt *stmt_find_nodes_by_name_any; /* name lookup without project filter */
     sqlite3_stmt *stmt_find_nodes_by_label;
     sqlite3_stmt *stmt_find_nodes_by_file;
@@ -1020,6 +1021,7 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_find_node_by_qn);
     finalize_stmt(&s->stmt_find_node_by_qn_any);
     finalize_stmt(&s->stmt_find_nodes_by_name);
+    finalize_stmt(&s->stmt_find_nodes_by_base_name);
     finalize_stmt(&s->stmt_find_nodes_by_name_any);
     finalize_stmt(&s->stmt_find_nodes_by_label);
     finalize_stmt(&s->stmt_find_nodes_by_file);
@@ -1748,6 +1750,21 @@ int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char
                               "start_line, end_line, properties FROM nodes "
                               "WHERE project = ?1 AND name = ?2;",
                               project, name, out, count);
+}
+
+int cbm_store_find_nodes_by_base_name(cbm_store_t *s, const char *project, const char *base_name,
+                                      cbm_node_t **out, int *count) {
+    if (!s) {
+        *out = NULL;
+        *count = 0;
+        return CBM_STORE_ERR;
+    }
+    return find_nodes_generic(
+        s, &s->stmt_find_nodes_by_base_name,
+        "SELECT id, project, label, name, qualified_name, file_path, "
+        "start_line, end_line, properties FROM nodes "
+        "WHERE project = ?1 AND json_extract(properties, '$.base_name') = ?2;",
+        project, base_name, out, count);
 }
 
 int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
@@ -3604,6 +3621,12 @@ static int search_where_basic(const cbm_search_params_t *params, char *where, in
                              binds, bind_idx, pool);
         where_add_regex(where, where_sz, wlen, nparams, binds, bind_idx, "n.qualified_name",
                         params->qn_pattern, params->case_sensitive);
+    }
+    if (params->base_name && params->base_name[0]) {
+        snprintf(bind_buf, sizeof(bind_buf), "json_extract(n.properties, '$.base_name') = ?%d",
+                 *bind_idx + SKIP_ONE);
+        *wlen = where_append(where, where_sz, *wlen, nparams, bind_buf);
+        where_bind_text(binds, bind_idx, params->base_name);
     }
     if (params->file_pattern) {
         char *lp = cbm_glob_to_like(params->file_pattern);

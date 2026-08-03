@@ -430,6 +430,32 @@ static const CBMType **c_extract_call_arg_types(CLSPContext *ctx, TSNode call_no
     return types;
 }
 
+/* Уточнить уже найденную функцию по типам аргументов внутри того же базового QN.
+ * Обычный поиск по имени выбирает область видимости, а этот шаг — перегрузку. */
+static const CBMRegisteredFunc *c_refine_overload_by_types(CLSPContext *ctx,
+                                                           const CBMRegisteredFunc *func,
+                                                           const CBMType **arg_types,
+                                                           int arg_count) {
+    if (!func || !func->base_qualified_name) {
+        return func;
+    }
+    const char *base_qn = func->base_qualified_name;
+    const char *dot = strrchr(base_qn, '.');
+    if (!dot || dot == base_qn || !dot[1]) {
+        return func;
+    }
+    const size_t package_len = (size_t)(dot - base_qn);
+    char *package_qn = (char *)cbm_arena_alloc(ctx->arena, package_len + 1);
+    if (!package_qn) {
+        return func;
+    }
+    memcpy(package_qn, base_qn, package_len);
+    package_qn[package_len] = '\0';
+    const CBMRegisteredFunc *refined = cbm_registry_lookup_symbol_by_types(
+        ctx->registry, package_qn, dot + 1, arg_types, arg_count);
+    return refined ? refined : func;
+}
+
 // --- Helper: parse template parameter defaults ---
 static void c_parse_template_params(CLSPContext *ctx, TSNode template_decl) {
     TSNode params = ts_node_child_by_field_name(template_decl, "parameters", 10);
@@ -3704,6 +3730,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                     if (!f)
                         f = cbm_registry_lookup_func(ctx->registry, qn);
                     if (f) {
+                        f = c_refine_overload_by_types(ctx, f, arg_types, arg_count);
                         c_emit_resolved_call(ctx, f->qualified_name, "lsp_scoped", 0.95f);
                         goto recurse;
                     }
@@ -3791,6 +3818,10 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                                 f = cbm_registry_lookup_func(ctx->registry, fqn);
                         }
                         if (f) {
+                            int arg_count = 0;
+                            const CBMType **arg_types =
+                                c_extract_call_arg_types(ctx, node, &arg_count);
+                            f = c_refine_overload_by_types(ctx, f, arg_types, arg_count);
                             c_emit_resolved_call(ctx, f->qualified_name, "lsp_template", 0.95f);
                             // Resolve pending template calls at this call site
                             if (ctx->pending_tc_count > 0 && f->type_param_names) {
@@ -3867,6 +3898,15 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                     // Regular function call
                     const char *fqn = c_resolve_name(ctx, name);
                     if (fqn) {
+                        const CBMRegisteredFunc *called =
+                            cbm_registry_lookup_func(ctx->registry, fqn);
+                        if (called) {
+                            int arg_count = 0;
+                            const CBMType **arg_types =
+                                c_extract_call_arg_types(ctx, node, &arg_count);
+                            called = c_refine_overload_by_types(ctx, called, arg_types, arg_count);
+                            fqn = called->qualified_name;
+                        }
                         // Check if this is implicit 'this' call
                         const char *strategy = "lsp_direct";
                         if (ctx->enclosing_class_qn) {
@@ -3879,8 +3919,8 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                         c_emit_resolved_call(ctx, fqn, strategy, 0.95f);
                         // Resolve pending template calls at this call site
                         if (ctx->pending_tc_count > 0) {
-                            const CBMRegisteredFunc *called =
-                                cbm_registry_lookup_func(ctx->registry, fqn);
+                            if (!called)
+                                called = cbm_registry_lookup_func(ctx->registry, fqn);
                             if (called && called->type_param_names) {
                                 int ac = 0;
                                 const CBMType **at = c_extract_call_arg_types(ctx, node, &ac);
@@ -4406,6 +4446,16 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
         if (scope) {
             func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", scope, func_qn);
         }
+    }
+    const char *func_base_qn = func_qn;
+    if (ctx->cpp_mode) {
+        TSNode wrapper = func_node;
+        TSNode parent = ts_node_parent(func_node);
+        if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "template_declaration") == 0) {
+            wrapper = parent;
+        }
+        func_qn = cbm_cpp_callable_qualified_name(ctx->arena, func_base_qn, wrapper, func_node,
+                                                  ctx->source);
     }
     ctx->enclosing_func_qn = func_qn;
 
@@ -5236,6 +5286,7 @@ void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, i
             memset(&rf, 0, sizeof(rf));
             rf.min_params = -1;
             rf.qualified_name = d->qualified_name;
+            rf.base_qualified_name = d->base_name;
             rf.short_name = d->name;
 
             // Build return type — prefer return_type (raw text) over return_types
@@ -5398,7 +5449,8 @@ static void c_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const cha
             CBMRegisteredFunc rf;
             memset(&rf, 0, sizeof(rf));
             rf.min_params = -1;
-            rf.qualified_name = d->qualified_name; /* borrowed */
+            rf.qualified_name = d->qualified_name;           /* borrowed */
+            rf.base_qualified_name = d->base_qualified_name; /* borrowed */
             rf.short_name = d->short_name;
 
             const char *def_module = d->def_module_qn ? d->def_module_qn : module_qn;

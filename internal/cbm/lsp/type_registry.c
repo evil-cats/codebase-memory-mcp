@@ -33,6 +33,10 @@ static uint64_t fnv1a_pair(const char *a, const char *b) {
     return h;
 }
 
+static const char *func_index_qn(const CBMRegisteredFunc *func) {
+    return func->base_qualified_name ? func->base_qualified_name : func->qualified_name;
+}
+
 static int next_pow2(int n) {
     int p = 1;
     while (p < n)
@@ -57,7 +61,7 @@ static void build_qn_index(CBMTypeRegistry *reg, CBMArena *idx_arena, bool for_f
         buckets[i] = -1;
 
     for (int i = 0; i < count; i++) {
-        const char *qn = for_funcs ? reg->funcs[i].qualified_name : reg->types[i].qualified_name;
+        const char *qn = for_funcs ? func_index_qn(&reg->funcs[i]) : reg->types[i].qualified_name;
         if (!qn)
             continue;
         uint64_t h = fnv1a(qn);
@@ -453,13 +457,22 @@ static const CBMRegisteredFunc *lookup_func_self(const CBMTypeRegistry *reg,
             if (reg->func_qn_entries[idx].hash != h)
                 continue;
             int p = reg->func_qn_entries[idx].payload_index;
-            if (reg->funcs[p].qualified_name &&
-                strcmp(reg->funcs[p].qualified_name, qualified_name) == 0) {
+            const char *indexed_qn = func_index_qn(&reg->funcs[p]);
+            if (indexed_qn && strcmp(indexed_qn, qualified_name) == 0) {
                 return &reg->funcs[p];
             }
         }
         /* Tail-scan funcs added after finalize (see lookup_method_self). */
         for (int i = reg->func_qn_entry_count; i < reg->func_count; i++) {
+            const char *indexed_qn = func_index_qn(&reg->funcs[i]);
+            if (indexed_qn && strcmp(indexed_qn, qualified_name) == 0) {
+                return &reg->funcs[i];
+            }
+        }
+        /* Индекс построен по базовому QN. Точный канонический QN запрашивается
+         * редко, поэтому для него допустим линейный резервный поиск без второго
+         * индекса. */
+        for (int i = 0; i < reg->func_count; i++) {
             if (reg->funcs[i].qualified_name &&
                 strcmp(reg->funcs[i].qualified_name, qualified_name) == 0) {
                 return &reg->funcs[i];
@@ -469,7 +482,10 @@ static const CBMRegisteredFunc *lookup_func_self(const CBMTypeRegistry *reg,
     }
 
     for (int i = 0; i < reg->func_count; i++) {
-        if (strcmp(reg->funcs[i].qualified_name, qualified_name) == 0) {
+        const char *indexed_qn = func_index_qn(&reg->funcs[i]);
+        if ((indexed_qn && strcmp(indexed_qn, qualified_name) == 0) ||
+            (reg->funcs[i].qualified_name &&
+             strcmp(reg->funcs[i].qualified_name, qualified_name) == 0)) {
             return &reg->funcs[i];
         }
     }
@@ -847,7 +863,8 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_types(const CBMTypeRegist
                 continue;
             int pi = reg->func_qn_entries[idx].payload_index;
             const CBMRegisteredFunc *f = &reg->funcs[pi];
-            if (!f->qualified_name || strcmp(f->qualified_name, buf) != 0)
+            const char *indexed_qn = func_index_qn(f);
+            if (!indexed_qn || strcmp(indexed_qn, buf) != 0)
                 continue;
             if (first_pi < 0 || pi < first_pi)
                 first_pi = pi;
@@ -869,7 +886,8 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_types(const CBMTypeRegist
 
     for (int i = 0; i < reg->func_count; i++) {
         const CBMRegisteredFunc *f = &reg->funcs[i];
-        if (strcmp(f->qualified_name, buf) == 0) {
+        const char *indexed_qn = func_index_qn(f);
+        if (indexed_qn && strcmp(indexed_qn, buf) == 0) {
             if (!first_match)
                 first_match = f;
             int s = score_overload_match(f, arg_types, arg_count);
@@ -919,7 +937,8 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_args(const CBMTypeRegistr
                 continue;
             int pi = reg->func_qn_entries[idx].payload_index;
             const CBMRegisteredFunc *f = &reg->funcs[pi];
-            if (!f->qualified_name || strcmp(f->qualified_name, buf) != 0)
+            const char *indexed_qn = func_index_qn(f);
+            if (!indexed_qn || strcmp(indexed_qn, buf) != 0)
                 continue;
             if (first_pi < 0 || pi < first_pi)
                 first_pi = pi;
@@ -946,7 +965,8 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_args(const CBMTypeRegistr
 
     for (int i = 0; i < reg->func_count; i++) {
         const CBMRegisteredFunc *f = &reg->funcs[i];
-        if (strcmp(f->qualified_name, buf) == 0) {
+        const char *indexed_qn = func_index_qn(f);
+        if (indexed_qn && strcmp(indexed_qn, buf) == 0) {
             if (!first_match)
                 first_match = f;
             int pc = count_func_params(f);

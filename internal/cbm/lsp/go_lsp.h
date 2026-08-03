@@ -76,6 +76,7 @@ void cbm_go_stdlib_register(CBMTypeRegistry* reg, CBMArena* arena);
 // String fields are borrowed (caller owns memory until cbm_run_go_lsp_cross returns).
 typedef struct {
     const char* qualified_name;
+    const char* base_qualified_name; // QN вызываемого символа без сигнатуры перегрузки
     const char* short_name;
     const char* label;          // "Function", "Method", "Type", "Interface"
     const char* receiver_type;  // for methods: receiver type QN (NULL for functions)

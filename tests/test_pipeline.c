@@ -5884,6 +5884,123 @@ TEST(incremental_detects_deleted_file) {
     PASS();
 }
 
+/* Инкрементальная переиндексация должна заменить только изменившуюся
+ * перегрузку: старый QN исчезает, соседняя сигнатура сохраняет свой QN. */
+TEST(incremental_cpp_overload_signature_change_removes_stale_node) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/overloads.cpp", g_incr_tmpdir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("#include <string_view>\n\n"
+          "int f(int value) { return value; }\n"
+          "int f(std::string_view text) { return (int)text.size(); }\n"
+          "int call_f() { return f(7); }\n",
+          f);
+    fclose(f);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t *before = NULL;
+    int before_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(s, project, "f", &before, &before_count), CBM_STORE_OK);
+    ASSERT_EQ(before_count, 2);
+    char *old_int_qn = NULL;
+    char *stable_string_qn = NULL;
+    for (int i = 0; i < before_count; i++) {
+        if (before[i].qualified_name && strstr(before[i].qualified_name, "f(int)")) {
+            old_int_qn = strdup(before[i].qualified_name);
+        }
+        if (before[i].qualified_name && strstr(before[i].qualified_name, "f(std::string_view)")) {
+            stable_string_qn = strdup(before[i].qualified_name);
+        }
+    }
+    ASSERT_NOT_NULL(old_int_qn);
+    ASSERT_NOT_NULL(stable_string_qn);
+    cbm_store_free_nodes(before, before_count);
+
+    cbm_node_t *callers = NULL;
+    int caller_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(s, project, "call_f", &callers, &caller_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(caller_count, 1);
+    cbm_edge_t *call_edges = NULL;
+    int call_edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(s, callers[0].id, "CALLS", &call_edges,
+                                                  &call_edge_count),
+              CBM_STORE_OK);
+    bool calls_int = false;
+    bool calls_string = false;
+    for (int i = 0; i < call_edge_count; i++) {
+        cbm_node_t target = {0};
+        if (cbm_store_find_node_by_id(s, call_edges[i].target_id, &target) == CBM_STORE_OK) {
+            calls_int = calls_int ||
+                        (target.qualified_name && strcmp(target.qualified_name, old_int_qn) == 0);
+            calls_string = calls_string || (target.qualified_name &&
+                                            strcmp(target.qualified_name, stable_string_qn) == 0);
+        }
+        cbm_node_free_fields(&target);
+    }
+    ASSERT_TRUE(calls_int);
+    ASSERT_FALSE(calls_string);
+    cbm_store_free_edges(call_edges, call_edge_count);
+    cbm_store_free_nodes(callers, caller_count);
+    cbm_store_close(s);
+
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("#include <string_view>\n\n\n\n"
+          "long f(long renamed = 0) noexcept { return renamed; }\n"
+          "long f(std::string_view renamed) noexcept { return (long)renamed.size(); }\n"
+          "long call_f() { return f(7L); }\n",
+          f);
+    fclose(f);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t stale = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, old_int_qn, &stale), CBM_STORE_NOT_FOUND);
+
+    cbm_node_t *after = NULL;
+    int after_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(s, project, "f", &after, &after_count), CBM_STORE_OK);
+    ASSERT_EQ(after_count, 2);
+    bool found_long = false;
+    bool found_stable_string = false;
+    for (int i = 0; i < after_count; i++) {
+        found_long =
+            found_long || (after[i].qualified_name && strstr(after[i].qualified_name, "f(long)"));
+        found_stable_string =
+            found_stable_string ||
+            (after[i].qualified_name && strcmp(after[i].qualified_name, stable_string_qn) == 0);
+    }
+    ASSERT_TRUE(found_long);
+    ASSERT_TRUE(found_stable_string);
+    cbm_store_free_nodes(after, after_count);
+    cbm_store_close(s);
+
+    free(old_int_qn);
+    free(stable_string_qn);
+    free(project);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_new_file_added) {
     /* Full index, add a new file, re-index → new file's nodes appear */
     if (setup_incremental_repo() != 0) {
@@ -7538,6 +7655,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_detects_changed_file);
     RUN_TEST(incremental_aborts_when_previous_coverage_is_unreadable);
     RUN_TEST(incremental_detects_deleted_file);
+    RUN_TEST(incremental_cpp_overload_signature_change_removes_stale_node);
     RUN_TEST(incremental_new_file_added);
     RUN_TEST(cancelled_full_reindex_preserves_committed_db);
     RUN_TEST(cancelled_incremental_reindex_preserves_committed_db);

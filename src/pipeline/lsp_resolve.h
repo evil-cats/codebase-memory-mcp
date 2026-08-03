@@ -64,6 +64,31 @@ static inline const char *cbm_lsp_bare_segment(const char *name) {
     return seg;
 }
 
+/* Сопоставить текстовое имя вызова с последним сегментом разрешённого QN.
+ * Канонический C++ QN продолжает имя параметрами шаблона и сигнатурой, поэтому
+ * `f` должен совпадать с `f(int)`, но не с `foobar(int)`. */
+static inline bool cbm_lsp_callable_leaf_matches(const char *resolved_qn,
+                                                 const char *textual_name) {
+    const char *textual = cbm_lsp_bare_segment(textual_name);
+    if (!resolved_qn || !textual || !textual[0]) {
+        return false;
+    }
+
+    size_t textual_len = strlen(textual);
+    const char *template_args = strchr(textual, '<');
+    if (template_args && strncmp(textual, "operator", strlen("operator")) != 0) {
+        textual_len = (size_t)(template_args - textual);
+    }
+    for (const char *match = resolved_qn; (match = strstr(match, textual)) != NULL; match++) {
+        const bool at_segment = match == resolved_qn || match[-1] == '.' || match[-1] == ':';
+        const char next = match[textual_len];
+        if (at_segment && (next == '\0' || next == '(' || next == '<')) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Tail helper: return the start of the final two dot-separated segments
  * ("Class.method") or NULL when the QN is too short. */
 static inline const char *cbm_pipeline_qn_class_method_tail(const char *qn) {
@@ -150,7 +175,6 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
         if (strcmp(rc->caller_qn, call->enclosing_func_qn) != 0) {
             continue;
         }
-        const char *short_name = cbm_lsp_bare_segment(rc->callee_qn);
         /* The call's callee_name is receiver-qualified for method/qualified
          * calls ("c.inc", "A.Helper", "Math::square", "p->run"); the LSP
          * records the resolved class-qualified callee_qn ("Class.inc"). Compare
@@ -160,7 +184,7 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
          * type-aware LSP strategy to the weaker textual registry. Free-function
          * calls (bare callee_name) are unaffected. */
         const char *call_short = cbm_lsp_bare_segment(call->callee_name);
-        if (strcmp(short_name, call_short) != 0) {
+        if (!cbm_lsp_callable_leaf_matches(rc->callee_qn, call->callee_name)) {
             /* Indirect/implicit resolution: the textual callee differs from the
              * resolved callee_qn's short name. A function-pointer / DLL call's
              * callee is the pointer name (`fp`); a C++ destructor's only textual
@@ -177,7 +201,7 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
                    strcmp(rc->strategy, "lsp_import_alias") == 0 ||
                    strcmp(rc->strategy, "lsp_destructor") == 0 ||
                    strcmp(rc->strategy, "php_method_dynamic") == 0) &&
-                  strcmp(cbm_lsp_bare_segment(rc->reason), call_short) == 0)) {
+                  cbm_lsp_callable_leaf_matches(rc->reason, call_short))) {
                 continue;
             }
         }
@@ -206,10 +230,8 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
         if (rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
             continue;
         }
-        const char *short_name = strrchr(rc->callee_qn, '.');
-        short_name = short_name ? short_name + SKIP_ONE : rc->callee_qn;
         const char *call_leaf = cbm_pipeline_call_callee_leaf(call->callee_name);
-        if (!call_leaf || strcmp(short_name, call_leaf) != 0) {
+        if (!call_leaf || !cbm_lsp_callable_leaf_matches(rc->callee_qn, call_leaf)) {
             continue;
         }
         if (!cbm_pipeline_qn_class_method_tail_eq(rc->caller_qn, call_tail)) {

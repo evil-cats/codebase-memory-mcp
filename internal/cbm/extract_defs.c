@@ -3311,6 +3311,12 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         }
     }
 
+    if (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) {
+        def.base_name = def.qualified_name;
+        def.qualified_name = cbm_cpp_callable_identity(a, def.base_name, node, func_node,
+                                                       ctx->source, &def.param_types);
+    }
+
     // Pony: fun/be/new (method/constructor/ffi_method) live in pony_func_types,
     // so the main def-walk extracts them here as "Function"; but one declared
     // inside a class/actor/struct/trait/interface/primitive IS a method. Detect
@@ -4235,11 +4241,18 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     }
 
     const char *method_qn = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
+    TSNode func_node = unwrap_template_inner(child, ctx->language);
 
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
+    const char **cpp_param_types = NULL;
     def.name = name;
     def.qualified_name = method_qn;
+    if (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) {
+        def.base_name = method_qn;
+        def.qualified_name = cbm_cpp_callable_identity(a, method_qn, child, func_node, ctx->source,
+                                                       &cpp_param_types);
+    }
     def.label = "Method";
     def.file_path = ctx->rel_path;
     def.parent_class = class_qn;
@@ -4248,7 +4261,11 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
 
-    TSNode params = ts_node_child_by_field_name(child, TS_FIELD("parameters"));
+    TSNode params = ts_node_child_by_field_name(func_node, TS_FIELD("parameters"));
+    if (ts_node_is_null(params) &&
+        (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA)) {
+        params = find_c_params(func_node);
+    }
     // ObjectScript exposes the parameter list under a `parameter_list` field.
     if (ts_node_is_null(params) && (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||
                                     ctx->language == CBM_LANG_OBJECTSCRIPT_ROUTINE)) {
@@ -4257,6 +4274,9 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     if (!ts_node_is_null(params)) {
         def.signature = cbm_node_text(a, params, ctx->source);
         def.param_types = extract_param_types(a, params, ctx->source, ctx->language);
+    }
+    if (cpp_param_types) {
+        def.param_types = cpp_param_types;
     }
 
     // Return type (same fields as extract_func_def)
@@ -4290,7 +4310,7 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     // C++: trailing return type (auto method() -> Type)
     if (def.return_type && strcmp(def.return_type, "auto") == 0 &&
         (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA)) {
-        resolve_cpp_trailing_return(a, child, ctx->source, &def);
+        resolve_cpp_trailing_return(a, func_node, ctx->source, &def);
     }
 
     def.decorators = extract_decorators(a, child, ctx->source, ctx->language, spec);

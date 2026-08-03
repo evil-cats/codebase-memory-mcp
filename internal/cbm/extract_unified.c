@@ -634,23 +634,37 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
      * "proj.file.bar" that no node carries (#554/#621). The out-of-line def is at
      * file scope, so enclosing_class_qn is NULL — derive the class from the
      * qualified declarator instead. */
-    if ((ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) &&
-        strcmp(ts_node_type(node), "function_definition") == 0) {
+    const bool is_cpp = ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA;
+    const char *base_qn = NULL;
+    if (is_cpp && strcmp(ts_node_type(node), "function_definition") == 0) {
         char *scope_name = cbm_cpp_out_of_line_parent_class(ctx->arena, node, ctx->source);
         if (scope_name && scope_name[0]) {
             const char *class_qn =
                 cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, scope_name);
-            return cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, name);
+            base_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, name);
         }
     }
 
-    if (state->enclosing_class_qn) {
-        return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name);
+    if (!base_qn && state->enclosing_class_qn) {
+        base_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name);
     }
-    /* Java/Go: directory-based module so this enclosing-func QN matches the def
-     * QN and the LSP caller_qn (the lsp_resolve join keys on exact equality). */
-    return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name,
-                                       ctx->language);
+    if (!base_qn) {
+        /* Для Java/Go модуль определяется каталогом: так QN вызывающей функции
+         * совпадает с QN определения и caller_qn из LSP (ключи соединяются по
+         * точному равенству). */
+        base_qn = cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name,
+                                              ctx->language);
+    }
+    if (!is_cpp) {
+        return base_qn;
+    }
+
+    TSNode wrapper = node;
+    TSNode parent = ts_node_parent(node);
+    if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "template_declaration") == 0) {
+        wrapper = parent;
+    }
+    return cbm_cpp_callable_qualified_name(ctx->arena, base_qn, wrapper, node, ctx->source);
 }
 
 // Compute class QN for scope tracking.
@@ -1344,7 +1358,19 @@ static bool is_export_of_declaration(TSNode node) {
 // Push scope markers for function, class, call, and import boundary nodes.
 static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                  WalkState *state, uint32_t depth) {
-    if (spec->function_node_types && cbm_kind_in_set(node, spec->function_node_types)) {
+    const bool is_cpp_namespace =
+        (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) &&
+        strcmp(ts_node_type(node), "namespace_definition") == 0;
+
+    if (is_cpp_namespace) {
+        /* Для унифицированного прохода namespace является квалифицирующей
+         * областью: функции и классы внутри него должны получить тот же QN,
+         * что и определения с результатами C++ LSP. */
+        const char *namespace_qn = compute_class_qn(ctx, node, state);
+        if (namespace_qn) {
+            push_scope(state, SCOPE_CLASS, depth, namespace_qn);
+        }
+    } else if (spec->function_node_types && cbm_kind_in_set(node, spec->function_node_types)) {
         /* OCaml: a nested local `let x = e in ...` is itself a value_definition,
          * but the def walk does not descend into function bodies, so it emits no
          * node for it. Pushing a func scope here would attribute in-body calls to

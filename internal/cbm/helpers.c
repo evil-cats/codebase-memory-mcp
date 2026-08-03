@@ -846,6 +846,573 @@ char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source)
     return text;
 }
 
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+    int prev_kind;
+    char prev_last;
+} cpp_canon_buf_t;
+
+typedef struct {
+    uint32_t start;
+    uint32_t end;
+} cpp_canon_span_t;
+
+typedef struct {
+    const char *source_name;
+    size_t source_len;
+    char canonical_name[32];
+} cpp_template_name_t;
+
+typedef struct {
+    TSNode parameters;
+    TSNode constraint;
+} cpp_template_layer_t;
+
+static bool cpp_canon_reserve(cpp_canon_buf_t *buf, size_t extra) {
+    if (buf->len + extra + SKIP_ONE <= buf->cap) {
+        return true;
+    }
+    size_t cap = buf->cap ? buf->cap : CBM_SZ_128;
+    while (cap < buf->len + extra + SKIP_ONE) {
+        cap *= 2;
+    }
+    char *grown = (char *)realloc(buf->data, cap);
+    if (!grown) {
+        return false;
+    }
+    buf->data = grown;
+    buf->cap = cap;
+    return true;
+}
+
+static bool cpp_canon_append_raw(cpp_canon_buf_t *buf, const char *text, size_t len) {
+    if (!cpp_canon_reserve(buf, len)) {
+        return false;
+    }
+    memcpy(buf->data + buf->len, text, len);
+    buf->len += len;
+    buf->data[buf->len] = '\0';
+    if (len > 0) {
+        buf->prev_last = text[len - SKIP_ONE];
+    }
+    return true;
+}
+
+static bool cpp_canon_is_word_char(unsigned char c) {
+    return c == '_' || c == '$' || c >= 0x80 || isalnum(c);
+}
+
+static bool cpp_canon_append_token(cpp_canon_buf_t *buf, const char *text, size_t len, int kind,
+                                   bool had_space) {
+    if (len == 0) {
+        return true;
+    }
+    const unsigned char first = (unsigned char)text[0];
+    const bool word_boundary = buf->prev_kind == SKIP_ONE && kind == SKIP_ONE;
+    const bool qualifier_boundary =
+        had_space && kind == SKIP_ONE &&
+        (buf->prev_last == '>' || buf->prev_last == ')' || buf->prev_last == ']' ||
+         buf->prev_last == '*' || buf->prev_last == '&');
+    const bool lexical_boundary = buf->len > 0 &&
+                                  cpp_canon_is_word_char((unsigned char)buf->prev_last) &&
+                                  cpp_canon_is_word_char(first);
+    if (buf->len > 0 && (word_boundary || qualifier_boundary || lexical_boundary)) {
+        if (!cpp_canon_append_raw(buf, " ", SKIP_ONE)) {
+            return false;
+        }
+    }
+    if (!cpp_canon_append_raw(buf, text, len)) {
+        return false;
+    }
+    buf->prev_kind = kind;
+    return true;
+}
+
+static bool cpp_span_at(const cpp_canon_span_t *spans, size_t count, uint32_t pos,
+                        uint32_t *end_out) {
+    for (size_t i = 0; i < count; i++) {
+        if (spans[i].start == pos) {
+            *end_out = spans[i].end;
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *cpp_template_replacement(const cpp_template_name_t *names, size_t count,
+                                            const char *token, size_t len) {
+    for (size_t i = 0; i < count; i++) {
+        if (names[i].source_len == len && strncmp(names[i].source_name, token, len) == 0) {
+            return names[i].canonical_name;
+        }
+    }
+    return NULL;
+}
+
+/* Нормализовать выбранный диапазон исходника: удалить пробелы и комментарии,
+ * сохранив только необходимые границы токенов, применить альфа-нормализацию
+ * параметров шаблона и пропустить заданные диапазоны AST. */
+static bool cpp_canon_render_range(cpp_canon_buf_t *buf, const char *source, uint32_t start,
+                                   uint32_t end, const cpp_canon_span_t *spans, size_t span_count,
+                                   const cpp_template_name_t *names, size_t name_count) {
+    bool had_space = false;
+    for (uint32_t i = start; i < end;) {
+        uint32_t skip_end = 0;
+        if (cpp_span_at(spans, span_count, i, &skip_end)) {
+            i = skip_end > i ? skip_end : i + SKIP_ONE;
+            had_space = true;
+            continue;
+        }
+        unsigned char c = (unsigned char)source[i];
+        if (isspace(c)) {
+            had_space = true;
+            i++;
+            continue;
+        }
+        if (c == '/' && i + SKIP_ONE < end && source[i + SKIP_ONE] == '/') {
+            i += 2;
+            while (i < end && source[i] != '\n') {
+                i++;
+            }
+            had_space = true;
+            continue;
+        }
+        if (c == '/' && i + SKIP_ONE < end && source[i + SKIP_ONE] == '*') {
+            i += 2;
+            while (i + SKIP_ONE < end && !(source[i] == '*' && source[i + SKIP_ONE] == '/')) {
+                i++;
+            }
+            if (i + SKIP_ONE < end) {
+                i += 2;
+            }
+            had_space = true;
+            continue;
+        }
+        if (cpp_canon_is_word_char(c)) {
+            uint32_t token_end = i + SKIP_ONE;
+            while (token_end < end && cpp_canon_is_word_char((unsigned char)source[token_end])) {
+                token_end++;
+            }
+            const char *replacement =
+                cpp_template_replacement(names, name_count, source + i, token_end - i);
+            const char *token = replacement ? replacement : source + i;
+            size_t token_len = replacement ? strlen(replacement) : (size_t)(token_end - i);
+            if (!cpp_canon_append_token(buf, token, token_len, SKIP_ONE, had_space)) {
+                return false;
+            }
+            i = token_end;
+            had_space = false;
+            continue;
+        }
+        if (c == '\'' || c == '"') {
+            const unsigned char quote = c;
+            uint32_t token_end = i + SKIP_ONE;
+            while (token_end < end) {
+                if (source[token_end] == '\\' && token_end + SKIP_ONE < end) {
+                    token_end += 2;
+                    continue;
+                }
+                if ((unsigned char)source[token_end++] == quote) {
+                    break;
+                }
+            }
+            if (!cpp_canon_append_token(buf, source + i, token_end - i, 2, had_space)) {
+                return false;
+            }
+            i = token_end;
+            had_space = false;
+            continue;
+        }
+
+        size_t token_len = SKIP_ONE;
+        if (i + 2 < end && source[i] == '.' && source[i + 1] == '.' && source[i + 2] == '.') {
+            token_len = 3;
+        } else if (i + 2 < end && source[i] == '<' && source[i + 1] == '=' &&
+                   source[i + 2] == '>') {
+            token_len = 3;
+        } else if (i + SKIP_ONE < end && ((source[i] == ':' && source[i + 1] == ':') ||
+                                          (source[i] == '&' && source[i + 1] == '&') ||
+                                          (source[i] == '-' && source[i + 1] == '>') ||
+                                          (source[i] == '<' && source[i + 1] == '<') ||
+                                          (source[i] == '>' && source[i + 1] == '>') ||
+                                          (source[i] == '<' && source[i + 1] == '=') ||
+                                          (source[i] == '>' && source[i + 1] == '=') ||
+                                          (source[i] == '=' && source[i + 1] == '=') ||
+                                          (source[i] == '!' && source[i + 1] == '='))) {
+            token_len = 2;
+        }
+        if (!cpp_canon_append_token(buf, source + i, token_len, 2, had_space)) {
+            return false;
+        }
+        i += (uint32_t)token_len;
+        had_space = false;
+    }
+    return true;
+}
+
+static TSNode cpp_find_function_declarator(TSNode callable_node) {
+    TSNode declarator = ts_node_child_by_field_name(callable_node, TS_FIELD("declarator"));
+    for (int depth = 0; depth < CBM_DECLARATOR_DEPTH_LIMIT * 2 && !ts_node_is_null(declarator);
+         depth++) {
+        if (strcmp(ts_node_type(declarator), "function_declarator") == 0) {
+            return declarator;
+        }
+        TSNode inner = ts_node_child_by_field_name(declarator, TS_FIELD("declarator"));
+        if (ts_node_is_null(inner)) {
+            uint32_t count = ts_node_named_child_count(declarator);
+            for (uint32_t i = 0; i < count; i++) {
+                TSNode child = ts_node_named_child(declarator, i);
+                if (strcmp(ts_node_type(child), "function_declarator") == 0) {
+                    return child;
+                }
+            }
+        }
+        declarator = inner;
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
+static bool cpp_add_default_exclusion(TSNode node, const char *source, cpp_canon_span_t *spans,
+                                      size_t capacity, size_t *count) {
+    TSNode value = ts_node_child_by_field_name(node, TS_FIELD("default_value"));
+    if (ts_node_is_null(value)) {
+        value = ts_node_child_by_field_name(node, TS_FIELD("default_type"));
+    }
+    if (ts_node_is_null(value)) {
+        return true;
+    }
+    if (*count >= capacity) {
+        return false;
+    }
+    uint32_t start = ts_node_start_byte(value);
+    const uint32_t node_start = ts_node_start_byte(node);
+    while (start > node_start && source[start - SKIP_ONE] != '=') {
+        start--;
+    }
+    if (start > node_start && source[start - SKIP_ONE] == '=') {
+        start--;
+    }
+    spans[*count] = (cpp_canon_span_t){start, ts_node_end_byte(value)};
+    (*count)++;
+    return true;
+}
+
+static TSNode cpp_template_parameter_name(TSNode parameter) {
+    TSNode name = ts_node_child_by_field_name(parameter, TS_FIELD("name"));
+    if (!ts_node_is_null(name)) {
+        return name;
+    }
+    TSNode declarator = ts_node_child_by_field_name(parameter, TS_FIELD("declarator"));
+    if (!ts_node_is_null(declarator)) {
+        TSNode synthetic = parameter;
+        name = cbm_resolve_c_declarator_name_node(synthetic);
+        if (!ts_node_is_null(name)) {
+            return name;
+        }
+    }
+    uint32_t count = ts_node_named_child_count(parameter);
+    for (uint32_t i = count; i > 0; i--) {
+        TSNode child = ts_node_named_child(parameter, i - SKIP_ONE);
+        const char *kind = ts_node_type(child);
+        if (strcmp(kind, "type_identifier") == 0 || strcmp(kind, "identifier") == 0) {
+            return child;
+        }
+        if (strcmp(kind, "type_parameter_declaration") == 0 ||
+            strcmp(kind, "optional_type_parameter_declaration") == 0) {
+            TSNode nested = cpp_template_parameter_name(child);
+            if (!ts_node_is_null(nested)) {
+                return nested;
+            }
+        }
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
+static TSNode cpp_template_inner(TSNode wrapper) {
+    uint32_t count = ts_node_named_child_count(wrapper);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(wrapper, i);
+        const char *kind = ts_node_type(child);
+        if (strcmp(kind, "template_parameter_list") == 0 || strcmp(kind, "requires_clause") == 0 ||
+            strcmp(kind, "comment") == 0) {
+            continue;
+        }
+        return child;
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
+static size_t cpp_count_template_layers(TSNode wrapper) {
+    size_t count = 0;
+    TSNode current = wrapper;
+    while (!ts_node_is_null(current) &&
+           strcmp(ts_node_type(current), "template_declaration") == 0) {
+        count++;
+        current = cpp_template_inner(current);
+    }
+    return count;
+}
+
+static void cpp_collect_template_layers(TSNode wrapper, cpp_template_layer_t *layers,
+                                        size_t layer_count) {
+    TSNode current = wrapper;
+    for (size_t count = 0; count < layer_count; count++) {
+        layers[count].parameters = ts_node_child_by_field_name(current, TS_FIELD("parameters"));
+        layers[count].constraint = ts_node_child_by_field_name(current, TS_FIELD("constraint"));
+        if (ts_node_is_null(layers[count].constraint)) {
+            layers[count].constraint = cbm_find_child_by_kind(current, "requires_clause");
+        }
+        current = cpp_template_inner(current);
+    }
+}
+
+static size_t cpp_template_name_capacity(const cpp_template_layer_t *layers, size_t layer_count) {
+    size_t capacity = 0;
+    for (size_t layer = 0; layer < layer_count; layer++) {
+        size_t param_count = ts_node_named_child_count(layers[layer].parameters);
+        if (param_count > SIZE_MAX - capacity) {
+            return SIZE_MAX;
+        }
+        capacity += param_count;
+    }
+    return capacity;
+}
+
+static size_t cpp_collect_template_names(const cpp_template_layer_t *layers, size_t layer_count,
+                                         const char *source, cpp_template_name_t *names) {
+    size_t count = 0;
+    for (size_t layer = 0; layer < layer_count; layer++) {
+        TSNode params = layers[layer].parameters;
+        uint32_t param_count = ts_node_named_child_count(params);
+        for (uint32_t i = 0; i < param_count; i++) {
+            TSNode parameter = ts_node_named_child(params, i);
+            TSNode name = cpp_template_parameter_name(parameter);
+            if (ts_node_is_null(name)) {
+                continue;
+            }
+            names[count].source_name = source + ts_node_start_byte(name);
+            names[count].source_len = ts_node_end_byte(name) - ts_node_start_byte(name);
+            snprintf(names[count].canonical_name, sizeof(names[count].canonical_name), "T%zu",
+                     count);
+            count++;
+        }
+    }
+    return count;
+}
+
+static bool cpp_append_template_layers(cpp_canon_buf_t *buf, const char *source,
+                                       const cpp_template_layer_t *layers, size_t layer_count,
+                                       const cpp_template_name_t *names, size_t name_count) {
+    for (size_t layer = 0; layer < layer_count; layer++) {
+        TSNode params = layers[layer].parameters;
+        uint32_t param_count = ts_node_named_child_count(params);
+        cpp_canon_span_t *spans =
+            param_count ? (cpp_canon_span_t *)calloc(param_count, sizeof(*spans)) : NULL;
+        if (param_count && !spans) {
+            return false;
+        }
+        size_t span_count = 0;
+        for (uint32_t i = 0; i < param_count; i++) {
+            if (!cpp_add_default_exclusion(ts_node_named_child(params, i), source, spans,
+                                           param_count, &span_count)) {
+                free(spans);
+                return false;
+            }
+        }
+        bool ok =
+            ts_node_is_null(params) ||
+            cpp_canon_render_range(buf, source, ts_node_start_byte(params),
+                                   ts_node_end_byte(params), spans, span_count, names, name_count);
+        free(spans);
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool cpp_append_parameters(CBMArena *a, cpp_canon_buf_t *buf, TSNode function_declarator,
+                                  const char *source, const cpp_template_name_t *names,
+                                  size_t name_count, const char ***param_types_out) {
+    if (!cpp_canon_append_raw(buf, "(", SKIP_ONE)) {
+        return false;
+    }
+    TSNode params = ts_node_child_by_field_name(function_declarator, TS_FIELD("parameters"));
+    uint32_t count = ts_node_named_child_count(params);
+    const char **param_types = NULL;
+    if (param_types_out) {
+        param_types = (const char **)cbm_arena_alloc(a, ((size_t)count + 1) * sizeof(const char *));
+        if (!param_types) {
+            return false;
+        }
+    }
+    int emitted = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode parameter = ts_node_named_child(params, i);
+        if (strcmp(ts_node_type(parameter), "comment") == 0) {
+            continue;
+        }
+        cpp_canon_span_t spans[2];
+        size_t span_count = 0;
+        TSNode name = cbm_resolve_c_declarator_name_node(parameter);
+        if (!ts_node_is_null(name)) {
+            spans[span_count++] =
+                (cpp_canon_span_t){ts_node_start_byte(name), ts_node_end_byte(name)};
+        }
+        if (!cpp_add_default_exclusion(parameter, source, spans, 2, &span_count)) {
+            return false;
+        }
+
+        cpp_canon_buf_t rendered = {0};
+        if (!cpp_canon_render_range(&rendered, source, ts_node_start_byte(parameter),
+                                    ts_node_end_byte(parameter), spans, span_count, names,
+                                    name_count)) {
+            free(rendered.data);
+            return false;
+        }
+        if (rendered.len == 0 || (count == SKIP_ONE && strcmp(rendered.data, "void") == 0)) {
+            free(rendered.data);
+            continue;
+        }
+        if (emitted > 0 && !cpp_canon_append_raw(buf, ",", SKIP_ONE)) {
+            free(rendered.data);
+            return false;
+        }
+        if (param_types) {
+            cpp_canon_buf_t semantic_type = {0};
+            if (!cpp_canon_render_range(&semantic_type, source, ts_node_start_byte(parameter),
+                                        ts_node_end_byte(parameter), spans, span_count, NULL, 0)) {
+                free(semantic_type.data);
+                free(rendered.data);
+                return false;
+            }
+            param_types[emitted] = cbm_arena_strdup(a, semantic_type.data);
+            free(semantic_type.data);
+            if (!param_types[emitted]) {
+                free(rendered.data);
+                return false;
+            }
+        }
+        emitted++;
+        if (!cpp_canon_append_raw(buf, rendered.data, rendered.len)) {
+            free(rendered.data);
+            return false;
+        }
+        free(rendered.data);
+    }
+    if (!cpp_canon_append_raw(buf, ")", SKIP_ONE)) {
+        return false;
+    }
+    if (param_types_out) {
+        param_types[emitted] = NULL;
+        *param_types_out = param_types;
+    }
+    return true;
+}
+
+static bool cpp_append_callable_qualifiers(cpp_canon_buf_t *buf, TSNode function_declarator,
+                                           const char *source, const cpp_template_name_t *names,
+                                           size_t name_count) {
+    uint32_t count = ts_node_named_child_count(function_declarator);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(function_declarator, i);
+        const char *kind = ts_node_type(child);
+        if (strcmp(kind, "type_qualifier") != 0 && strcmp(kind, "ref_qualifier") != 0) {
+            continue;
+        }
+        if (!cpp_canon_append_raw(buf, " ", SKIP_ONE) ||
+            !cpp_canon_render_range(buf, source, ts_node_start_byte(child), ts_node_end_byte(child),
+                                    NULL, 0, names, name_count)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool cpp_append_constraint(cpp_canon_buf_t *buf, TSNode constraint, const char *source,
+                                  const cpp_template_name_t *names, size_t name_count) {
+    if (ts_node_is_null(constraint)) {
+        return true;
+    }
+    return cpp_canon_append_raw(buf, " ", SKIP_ONE) &&
+           cpp_canon_render_range(buf, source, ts_node_start_byte(constraint),
+                                  ts_node_end_byte(constraint), NULL, 0, names, name_count);
+}
+
+const char *cbm_cpp_callable_identity(CBMArena *a, const char *base_name, TSNode wrapper_node,
+                                      TSNode callable_node, const char *source,
+                                      const char ***param_types_out) {
+    if (param_types_out) {
+        *param_types_out = NULL;
+    }
+    if (!a || !base_name || !source) {
+        return base_name;
+    }
+    TSNode identity_callable = callable_node;
+    while (!ts_node_is_null(identity_callable) &&
+           strcmp(ts_node_type(identity_callable), "template_declaration") == 0) {
+        identity_callable = cpp_template_inner(identity_callable);
+    }
+    TSNode function_declarator = cpp_find_function_declarator(identity_callable);
+    if (ts_node_is_null(function_declarator)) {
+        return base_name;
+    }
+
+    size_t layer_count = cpp_count_template_layers(wrapper_node);
+    cpp_template_layer_t *layers =
+        layer_count ? (cpp_template_layer_t *)calloc(layer_count, sizeof(*layers)) : NULL;
+    if (layer_count && !layers) {
+        return base_name;
+    }
+    cpp_collect_template_layers(wrapper_node, layers, layer_count);
+    size_t name_capacity = cpp_template_name_capacity(layers, layer_count);
+    cpp_template_name_t *names = name_capacity && name_capacity != SIZE_MAX
+                                     ? (cpp_template_name_t *)calloc(name_capacity, sizeof(*names))
+                                     : NULL;
+    if (name_capacity == SIZE_MAX || (name_capacity && !names)) {
+        free(layers);
+        return base_name;
+    }
+    size_t name_count = cpp_collect_template_names(layers, layer_count, source, names);
+
+    cpp_canon_buf_t buf = {0};
+    bool ok = cpp_canon_append_raw(&buf, base_name, strlen(base_name)) &&
+              cpp_append_template_layers(&buf, source, layers, layer_count, names, name_count) &&
+              cpp_append_parameters(a, &buf, function_declarator, source, names, name_count,
+                                    param_types_out) &&
+              cpp_append_callable_qualifiers(&buf, function_declarator, source, names, name_count);
+    for (size_t i = 0; ok && i < layer_count; i++) {
+        ok = cpp_append_constraint(&buf, layers[i].constraint, source, names, name_count);
+    }
+    TSNode trailing_constraint =
+        ts_node_child_by_field_name(function_declarator, TS_FIELD("constraint"));
+    if (ts_node_is_null(trailing_constraint)) {
+        trailing_constraint = cbm_find_child_by_kind(function_declarator, "requires_clause");
+    }
+    if (ok) {
+        ok = cpp_append_constraint(&buf, trailing_constraint, source, names, name_count);
+    }
+
+    if (!ok && param_types_out) {
+        *param_types_out = NULL;
+    }
+    const char *result = ok && buf.data ? cbm_arena_strdup(a, buf.data) : base_name;
+    free(buf.data);
+    free(names);
+    free(layers);
+    return result;
+}
+
+const char *cbm_cpp_callable_qualified_name(CBMArena *a, const char *base_name, TSNode wrapper_node,
+                                            TSNode callable_node, const char *source) {
+    return cbm_cpp_callable_identity(a, base_name, wrapper_node, callable_node, source, NULL);
+}
+
 static const char *func_node_name(CBMArena *a, TSNode func_node, const char *source,
                                   CBMLanguage lang) {
     // Wolfram: set_delayed_top/set_top/set_delayed/set — LHS is apply(user_symbol("f"), ...)
@@ -902,6 +1469,8 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
         return module_qn;
     }
 
+    const char *base_qn = NULL;
+
     // Check if the function is inside a class — compute classQN.funcName.
     // For nested classes the class QN must carry the FULL nesting chain
     // (Outer.Inner, not just Inner) so it matches the class/method node QN the
@@ -932,11 +1501,29 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
         }
         if (class_chain) {
             const char *class_qn = cbm_fqn_compute(a, project, rel_path, class_chain);
-            return cbm_arena_sprintf(a, "%s.%s", class_qn, name);
+            base_qn = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
         }
     }
 
-    return cbm_fqn_compute(a, project, rel_path, name);
+    if (!base_qn && (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA)) {
+        char *scope_name = cbm_cpp_out_of_line_parent_class(a, func_node, source);
+        if (scope_name && scope_name[0]) {
+            const char *class_qn = cbm_fqn_compute(a, project, rel_path, scope_name);
+            base_qn = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
+        }
+    }
+    if (!base_qn) {
+        base_qn = cbm_fqn_compute(a, project, rel_path, name);
+    }
+    if (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) {
+        TSNode wrapper = func_node;
+        TSNode parent = ts_node_parent(func_node);
+        if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "template_declaration") == 0) {
+            wrapper = parent;
+        }
+        return cbm_cpp_callable_qualified_name(a, base_qn, wrapper, func_node, source);
+    }
+    return base_qn;
 }
 
 // --- Cached enclosing function QN ---

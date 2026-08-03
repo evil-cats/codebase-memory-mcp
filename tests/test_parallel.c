@@ -1169,6 +1169,19 @@ TEST(lsp_resolve_qualified_static_call_normalizes_colons) {
     PASS();
 }
 
+TEST(lsp_resolve_matches_canonical_cpp_overload_qn) {
+    CBMResolvedCall items[] = {
+        make_rc("proj.mod.call_f()", "proj.mod.f(int)", 0.95f),
+    };
+    CBMResolvedCallArray arr = {items, 1, 1};
+    CBMCall call = make_call("proj.mod.call_f()", "f");
+    ASSERT(cbm_pipeline_find_lsp_resolution(&arr, &call, false) == &items[0]);
+
+    CBMCall other = make_call("proj.mod.call_f()", "foobar");
+    ASSERT(cbm_pipeline_find_lsp_resolution(&arr, &other, false) == NULL);
+    PASS();
+}
+
 TEST(lsp_resolve_misattribution_is_bounded) {
     /* Two same-named subs from different namespaces (A::foo, B::foo) resolved
      * within the same enclosing function. Both resolved short-names normalize
@@ -1209,6 +1222,7 @@ TEST(lsp_resolve_misattribution_is_bounded) {
 
 SUITE(parallel) {
     RUN_TEST(lsp_resolve_qualified_static_call_normalizes_colons);
+    RUN_TEST(lsp_resolve_matches_canonical_cpp_overload_qn);
     RUN_TEST(lsp_resolve_misattribution_is_bounded);
     RUN_TEST(grpc_service_name_preserves_service_suffix_issue294);
     RUN_TEST(grpc_no_phantom_route_from_plain_var_issue294);

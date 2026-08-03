@@ -119,6 +119,7 @@ typedef struct {
     const char *label;        /* NULL = any label */
     const char *name_pattern; /* regex on name, NULL = any */
     const char *qn_pattern;   /* regex on qualified_name, NULL = any */
+    const char *base_name;    /* exact properties.base_name, NULL = any */
     const char *file_pattern; /* glob on file_path, NULL = any */
     const char *relationship; /* edge type filter, NULL = any */
     const char *direction;    /* "inbound" / "outbound" / "any", NULL = any */
@@ -330,6 +331,10 @@ int cbm_store_find_node_by_qn_any(cbm_store_t *s, const char *qn, cbm_node_t *ou
 /* Find nodes by name (exact match). Returns allocated array, caller frees. */
 int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char *name,
                                  cbm_node_t **out, int *count);
+
+/* Найти набор перегрузок по точному properties.base_name. */
+int cbm_store_find_nodes_by_base_name(cbm_store_t *s, const char *project, const char *base_name,
+                                      cbm_node_t **out, int *count);
 
 /* Find nodes by name across all projects. Returns allocated array, caller frees. */
 int cbm_store_find_nodes_by_name_any(cbm_store_t *s, const char *name, cbm_node_t **out,

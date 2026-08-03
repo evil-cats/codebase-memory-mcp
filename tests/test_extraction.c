@@ -783,6 +783,222 @@ TEST(cpp_class) {
     PASS();
 }
 
+static const CBMDefinition *cpp_def_n(CBMFileResult *r, const char *name, int ordinal) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, name) == 0) {
+            if (ordinal-- == 0) {
+                return &r->defs.items[i];
+            }
+        }
+    }
+    return NULL;
+}
+
+TEST(cpp_overload_qualified_names) {
+    const char *src = "#include <string_view>\n"
+                      "namespace ns {\n"
+                      "void f(int value = 7) {}\n"
+                      "void f(std::string_view text) {}\n"
+                      "struct Buffer {\n"
+                      "  int* data() { return nullptr; }\n"
+                      "  const int* data() const { return nullptr; }\n"
+                      "  int* data() volatile { return nullptr; }\n"
+                      "  void run() & {}\n"
+                      "  void run() && {}\n"
+                      "};\n"
+                      "template <typename T> requires Good<T>\n"
+                      "void constrained(T value) noexcept {}\n"
+                      "}\n";
+    CBMFileResult *r = extract(src, CBM_LANG_CPP, "t", "overloads.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *f_int = cpp_def_n(r, "f", 0);
+    const CBMDefinition *f_view = cpp_def_n(r, "f", 1);
+    ASSERT_NOT_NULL(f_int);
+    ASSERT_NOT_NULL(f_view);
+    ASSERT_NOT_NULL(f_int->base_name);
+    ASSERT_STR_EQ(f_int->base_name, f_view->base_name);
+    ASSERT_NOT_NULL(strstr(f_int->base_name, ".ns.f"));
+    ASSERT_STR_NEQ(f_int->qualified_name, f_view->qualified_name);
+    ASSERT_NOT_NULL(strstr(f_int->qualified_name, "f(int)"));
+    ASSERT_NOT_NULL(strstr(f_view->qualified_name, "f(std::string_view)"));
+    ASSERT_NULL(strstr(f_int->qualified_name, "value"));
+    ASSERT_NULL(strstr(f_int->qualified_name, "=7"));
+
+    const CBMDefinition *data_mut = cpp_def_n(r, "data", 0);
+    const CBMDefinition *data_const = cpp_def_n(r, "data", 1);
+    ASSERT_NOT_NULL(data_mut);
+    ASSERT_NOT_NULL(data_const);
+    ASSERT_STR_EQ(data_mut->base_name, data_const->base_name);
+    ASSERT_NOT_NULL(strstr(data_mut->base_name, ".ns.Buffer.data"));
+    ASSERT_NOT_NULL(strstr(data_mut->qualified_name, "data()"));
+    ASSERT_NOT_NULL(strstr(data_const->qualified_name, "data() const"));
+    ASSERT_STR_NEQ(data_mut->qualified_name, data_const->qualified_name);
+
+    const CBMDefinition *data_volatile = cpp_def_n(r, "data", 2);
+    ASSERT_NOT_NULL(data_volatile);
+    ASSERT_STR_EQ(data_mut->base_name, data_volatile->base_name);
+    ASSERT_NOT_NULL(strstr(data_volatile->qualified_name, "data() volatile"));
+    ASSERT_STR_NEQ(data_mut->qualified_name, data_volatile->qualified_name);
+    ASSERT_STR_NEQ(data_const->qualified_name, data_volatile->qualified_name);
+
+    const CBMDefinition *run_lvalue = cpp_def_n(r, "run", 0);
+    const CBMDefinition *run_rvalue = cpp_def_n(r, "run", 1);
+    ASSERT_NOT_NULL(run_lvalue);
+    ASSERT_NOT_NULL(run_rvalue);
+    ASSERT_NOT_NULL(strstr(run_lvalue->qualified_name, "run() &"));
+    ASSERT_NOT_NULL(strstr(run_rvalue->qualified_name, "run() &&"));
+    ASSERT_STR_NEQ(run_lvalue->qualified_name, run_rvalue->qualified_name);
+
+    const CBMDefinition *constrained = cpp_def_n(r, "constrained", 0);
+    ASSERT_NOT_NULL(constrained);
+    ASSERT_NOT_NULL(strstr(constrained->qualified_name, "<typename T0>"));
+    ASSERT_NOT_NULL(strstr(constrained->qualified_name, "requires Good<T0>"));
+    ASSERT_NULL(strstr(constrained->qualified_name, "noexcept"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(cpp_overload_qualified_name_stability) {
+    const char *before = "int stable(const std::string_view& value = {}) noexcept { return 1; }\n"
+                         "template <typename T> requires Good<T> void templ(T value) {}\n";
+    const char *after =
+        "// Сдвиг строк не участвует в идентичности.\n\n\n"
+        "long stable(const std::string_view& renamed = {1}) noexcept(false) { return 1; }\n"
+        "template <typename U> requires Good<U> void templ(U renamed) {}\n";
+    const char *changed_type = "int stable(const std::string& value = {}) noexcept { return 1; }\n";
+    CBMFileResult *a = extract(before, CBM_LANG_CPP, "t", "stable.cpp");
+    CBMFileResult *b = extract(after, CBM_LANG_CPP, "t", "stable.cpp");
+    CBMFileResult *c = extract(changed_type, CBM_LANG_CPP, "t", "stable.cpp");
+    ASSERT_NOT_NULL(a);
+    ASSERT_NOT_NULL(b);
+    ASSERT_NOT_NULL(c);
+    ASSERT_FALSE(a->has_error);
+    ASSERT_FALSE(b->has_error);
+    ASSERT_FALSE(c->has_error);
+
+    const CBMDefinition *stable_a = cpp_def_n(a, "stable", 0);
+    const CBMDefinition *stable_b = cpp_def_n(b, "stable", 0);
+    const CBMDefinition *stable_c = cpp_def_n(c, "stable", 0);
+    const CBMDefinition *templ_a = cpp_def_n(a, "templ", 0);
+    const CBMDefinition *templ_b = cpp_def_n(b, "templ", 0);
+    ASSERT_NOT_NULL(stable_a);
+    ASSERT_NOT_NULL(stable_b);
+    ASSERT_NOT_NULL(stable_c);
+    ASSERT_NOT_NULL(templ_a);
+    ASSERT_NOT_NULL(templ_b);
+    ASSERT_STR_EQ(stable_a->qualified_name, stable_b->qualified_name);
+    ASSERT_STR_NEQ(stable_a->qualified_name, stable_c->qualified_name);
+    ASSERT_STR_EQ(templ_a->qualified_name, templ_b->qualified_name);
+
+    cbm_free_result(a);
+    cbm_free_result(b);
+    cbm_free_result(c);
+    PASS();
+}
+
+/* Канонизация не должна иметь скрытого предела на число параметров шаблона. */
+TEST(cpp_overload_many_template_params_stay_stable) {
+    char source[2][8192] = {{0}};
+    for (int variant = 0; variant < 2; variant++) {
+        char *buf = source[variant];
+        const size_t capacity = sizeof(source[variant]);
+        size_t len = 0;
+        for (int i = 0; i < 65; i++) {
+            int written = snprintf(buf + len, capacity - len, "%stypename %c%d = int",
+                                   i == 0 ? "template <" : ", ", variant == 0 ? 'A' : 'B', i);
+            ASSERT_GT(written, 0);
+            ASSERT_LT((size_t)written, capacity - len);
+            len += (size_t)written;
+        }
+        int written = snprintf(buf + len, capacity - len, ">\nvoid many(%c64 value = {}) {}\n",
+                               variant == 0 ? 'A' : 'B');
+        ASSERT_GT(written, 0);
+        ASSERT_LT((size_t)written, capacity - len);
+    }
+
+    CBMFileResult *before = extract(source[0], CBM_LANG_CPP, "t", "many.cpp");
+    CBMFileResult *after = extract(source[1], CBM_LANG_CPP, "t", "many.cpp");
+    ASSERT_NOT_NULL(before);
+    ASSERT_NOT_NULL(after);
+    ASSERT_FALSE(before->has_error);
+    ASSERT_FALSE(after->has_error);
+    const CBMDefinition *many_before = cpp_def_n(before, "many", 0);
+    const CBMDefinition *many_after = cpp_def_n(after, "many", 0);
+    ASSERT_NOT_NULL(many_before);
+    ASSERT_NOT_NULL(many_after);
+    ASSERT_STR_EQ(many_before->qualified_name, many_after->qualified_name);
+    ASSERT_NOT_NULL(strstr(many_before->qualified_name, "typename T64"));
+    ASSERT_NOT_NULL(strstr(many_before->qualified_name, ">(T64)"));
+    ASSERT_NULL(strstr(many_before->qualified_name, "=int"));
+    ASSERT_NULL(strstr(many_before->qualified_name, "value"));
+
+    cbm_free_result(before);
+    cbm_free_result(after);
+    PASS();
+}
+
+/* LSP должен связывать вызов с точной перегрузкой, а не с общим base QN. */
+TEST(cpp_overload_lsp_resolves_exact_callee) {
+    const char *src = "#include <string_view>\n"
+                      "namespace ns {\n"
+                      "int f(int value) { return value; }\n"
+                      "int f(std::string_view text) { return (int)text.size(); }\n"
+                      "int call_int() { return f(7); }\n"
+                      "int call_view() { return f(std::string_view{}); }\n"
+                      "}\n";
+    CBMFileResult *r = extract(src, CBM_LANG_CPP, "t", "overloads.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *f_int = cpp_def_n(r, "f", 0);
+    const CBMDefinition *f_view = cpp_def_n(r, "f", 1);
+    const CBMDefinition *call_int = cpp_def_n(r, "call_int", 0);
+    const CBMDefinition *call_view = cpp_def_n(r, "call_view", 0);
+    ASSERT_NOT_NULL(f_int);
+    ASSERT_NOT_NULL(f_view);
+    ASSERT_NOT_NULL(call_int);
+    ASSERT_NOT_NULL(call_view);
+    ASSERT_NOT_NULL(strstr(f_int->base_name, ".ns.f"));
+    ASSERT_NOT_NULL(strstr(call_int->qualified_name, ".ns.call_int()"));
+
+    bool raw_int_has_canonical_caller = false;
+    bool raw_view_has_canonical_caller = false;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (!call->callee_name || strcmp(call->callee_name, "f") != 0 || !call->enclosing_func_qn) {
+            continue;
+        }
+        raw_int_has_canonical_caller =
+            raw_int_has_canonical_caller ||
+            strcmp(call->enclosing_func_qn, call_int->qualified_name) == 0;
+        raw_view_has_canonical_caller =
+            raw_view_has_canonical_caller ||
+            strcmp(call->enclosing_func_qn, call_view->qualified_name) == 0;
+    }
+    ASSERT_TRUE(raw_int_has_canonical_caller);
+    ASSERT_TRUE(raw_view_has_canonical_caller);
+
+    const char *resolved_int = NULL;
+    const char *resolved_view = NULL;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *call = &r->resolved_calls.items[i];
+        if (call->caller_qn && strcmp(call->caller_qn, call_int->qualified_name) == 0) {
+            resolved_int = call->callee_qn;
+        }
+        if (call->caller_qn && strcmp(call->caller_qn, call_view->qualified_name) == 0 &&
+            call->callee_qn && strstr(call->callee_qn, ".f(")) {
+            resolved_view = call->callee_qn;
+        }
+    }
+    ASSERT_STR_EQ(resolved_int, f_int->qualified_name);
+    ASSERT_STR_EQ(resolved_view, f_view->qualified_name);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Group C: Scripting / Dynamic Languages
  * ═══════════════════════════════════════════════════════════════════ */
@@ -4792,6 +5008,10 @@ SUITE(extraction) {
     RUN_TEST(c_function);
     RUN_TEST(c_struct);
     RUN_TEST(cpp_class);
+    RUN_TEST(cpp_overload_qualified_names);
+    RUN_TEST(cpp_overload_qualified_name_stability);
+    RUN_TEST(cpp_overload_many_template_params_stay_stable);
+    RUN_TEST(cpp_overload_lsp_resolves_exact_callee);
 
     /* Scripting */
     RUN_TEST(python_function);

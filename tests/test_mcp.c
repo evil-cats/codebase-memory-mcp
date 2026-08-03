@@ -1770,7 +1770,7 @@ TEST(tool_search_graph_includes_node_properties) {
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "results:")); /* TOON table header */
-    ASSERT_NOT_NULL(strstr(inner, "(rows: name label lines in out;"));
+    ASSERT_NOT_NULL(strstr(inner, "(rows: qn_suffix name base_name label lines in out;"));
     ASSERT_NOT_NULL(strstr(inner, "HandleRequest"));
     ASSERT_NULL(strstr(inner, "func HandleRequest")); /* signature not spilled */
     ASSERT_NULL(strstr(inner, "is_exported"));
@@ -1786,7 +1786,7 @@ TEST(tool_search_graph_includes_node_properties) {
     ASSERT_NOT_NULL(resp);
     inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "(rows: name label lines in out signature;"));
+    ASSERT_NOT_NULL(strstr(inner, "(rows: qn_suffix name base_name label lines in out signature;"));
     /* values with spaces are QUOTED so column positions survive */
     ASSERT_NOT_NULL(strstr(inner, "\"func HandleRequest() error\""));
     ASSERT_NOT_NULL(strstr(inner, "func HandleRequest"));
@@ -2506,6 +2506,163 @@ TEST(tool_trace_call_path_ambiguous) {
     free(inner);
     free(resp);
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Перегрузки должны оставаться отдельными во всех трёх MCP-инструментах:
+ * поиск перечисляет набор, неточный выбор возвращает кандидатов, а точный QN
+ * читает и трассирует только одну сигнатуру. */
+TEST(tool_cpp_overloads_are_separate_and_exactly_addressable) {
+    char tmp_dir[256] = "/tmp/cbm_overload_mcp_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp_dir));
+
+    char source_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/overloads.cpp", tmp_dir);
+    FILE *fp = fopen(source_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("int f(int value) {\n"
+          "    return value;\n"
+          "}\n"
+          "int f(std::string_view value) {\n"
+          "    return (int)value.size();\n"
+          "}\n",
+          fp);
+    fclose(fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "overload-proj";
+    const char *base = "overload-proj.ns.f";
+    const char *qn_int = "overload-proj.ns.f(int)";
+    const char *qn_string = "overload-proj.ns.f(std::string_view)";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, tmp_dir), CBM_STORE_OK);
+
+    cbm_node_t f_int = {.project = proj,
+                        .label = "Function",
+                        .name = "f",
+                        .qualified_name = qn_int,
+                        .file_path = "overloads.cpp",
+                        .start_line = 1,
+                        .end_line = 3,
+                        .properties_json =
+                            "{\"base_name\":\"overload-proj.ns.f\",\"signature\":\"f(int)\"}"};
+    cbm_node_t f_string = {.project = proj,
+                           .label = "Function",
+                           .name = "f",
+                           .qualified_name = qn_string,
+                           .file_path = "overloads.cpp",
+                           .start_line = 4,
+                           .end_line = 6,
+                           .properties_json = "{\"base_name\":\"overload-proj.ns.f\","
+                                              "\"signature\":\"f(std::string_view)\"}"};
+    cbm_node_t int_target = {.project = proj,
+                             .label = "Function",
+                             .name = "int_target",
+                             .qualified_name = "overload-proj.targets.int_target",
+                             .file_path = "overloads.cpp",
+                             .start_line = 1,
+                             .end_line = 1};
+    cbm_node_t string_target = {.project = proj,
+                                .label = "Function",
+                                .name = "string_target",
+                                .qualified_name = "overload-proj.targets.string_target",
+                                .file_path = "overloads.cpp",
+                                .start_line = 4,
+                                .end_line = 4};
+    int64_t id_int = cbm_store_upsert_node(st, &f_int);
+    int64_t id_string = cbm_store_upsert_node(st, &f_string);
+    int64_t id_int_target = cbm_store_upsert_node(st, &int_target);
+    int64_t id_string_target = cbm_store_upsert_node(st, &string_target);
+    ASSERT_GT(id_int, 0);
+    ASSERT_GT(id_string, 0);
+    ASSERT_GT(id_int_target, 0);
+    ASSERT_GT(id_string_target, 0);
+    cbm_edge_t int_edge = {
+        .project = proj, .source_id = id_int, .target_id = id_int_target, .type = "CALLS"};
+    cbm_edge_t string_edge = {
+        .project = proj, .source_id = id_string, .target_id = id_string_target, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &int_edge), 0);
+    ASSERT_GT(cbm_store_insert_edge(st, &string_edge), 0);
+
+    char *raw =
+        cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"overload-proj\",\"base_name\":\"overload-proj.ns.f\","
+                            "\"detail\":\"ids\"}");
+    char *inner = extract_text_content(raw);
+    free(raw);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, qn_int));
+    ASSERT_NOT_NULL(strstr(inner, qn_string));
+    free(inner);
+
+    raw =
+        cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"overload-proj\",\"base_name\":\"overload-proj.ns.f\"}");
+    inner = extract_text_content(raw);
+    free(raw);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, base));
+    ASSERT_NOT_NULL(strstr(inner, "f(int)"));
+    ASSERT_NOT_NULL(strstr(inner, "f(std::string_view)"));
+    free(inner);
+
+    raw = cbm_mcp_handle_tool(
+        srv, "get_code_snippet",
+        "{\"project\":\"overload-proj\",\"qualified_name\":\"overload-proj.ns.f\"}");
+    inner = extract_text_content(raw);
+    free(raw);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"status\":\"ambiguous\""));
+    ASSERT_NOT_NULL(strstr(inner, qn_int));
+    ASSERT_NOT_NULL(strstr(inner, qn_string));
+    free(inner);
+
+    raw = cbm_mcp_handle_tool(srv, "get_code_snippet",
+                              "{\"project\":\"overload-proj\","
+                              "\"qualified_name\":\"overload-proj.ns.f(int)\"}");
+    inner = extract_text_content(raw);
+    free(raw);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "int f(int value)"));
+    ASSERT_NULL(strstr(inner, "std::string_view value"));
+    ASSERT_NOT_NULL(strstr(inner, "\"base_name\":\"overload-proj.ns.f\""));
+    free(inner);
+
+    raw = cbm_mcp_handle_tool(srv, "trace_path",
+                              "{\"project\":\"overload-proj\",\"function_name\":\"f\","
+                              "\"direction\":\"outbound\"}");
+    inner = extract_text_content(raw);
+    free(raw);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "ambiguous"));
+    free(inner);
+
+    raw = cbm_mcp_handle_tool(
+        srv, "trace_path",
+        "{\"project\":\"overload-proj\",\"function_name\":\"overload-proj.ns.f\","
+        "\"direction\":\"outbound\"}");
+    inner = extract_text_content(raw);
+    free(raw);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "ambiguous"));
+    free(inner);
+
+    raw = cbm_mcp_handle_tool(
+        srv, "trace_path",
+        "{\"project\":\"overload-proj\","
+        "\"qualified_name\":\"overload-proj.ns.f(int)\",\"direction\":\"outbound\"}");
+    inner = extract_text_content(raw);
+    free(raw);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "int_target"));
+    ASSERT_NULL(strstr(inner, "string_target"));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    unlink(source_path);
+    rmdir(tmp_dir);
     PASS();
 }
 
@@ -9598,6 +9755,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_not_found);
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_call_path_ambiguous);
+    RUN_TEST(tool_cpp_overloads_are_separate_and_exactly_addressable);
     RUN_TEST(tool_trace_union_records_min_hop_across_seeds);
     RUN_TEST(tool_trace_pagination_exactly_once);
     RUN_TEST(tool_trace_call_path_prefers_definition);

@@ -503,8 +503,7 @@ void cbm_registry_free(cbm_registry_t *r) {
 
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label) {
-    (void)name;
-    if (!r || !qualified_name || !label) {
+    if (!r || !name || !name[0] || !qualified_name || !label) {
         return;
     }
 
@@ -538,11 +537,10 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
 
     /* Index by simple name.
      * No array dedup needed: exact-map check above guarantees uniqueness. */
-    const char *simple = simple_name(qualified_name);
-    qn_array_t *arr = cbm_ht_get(r->by_name, simple);
+    qn_array_t *arr = cbm_ht_get(r->by_name, name);
     if (!arr) {
         arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));
-        cbm_ht_set(r->by_name, strdup(simple), arr);
+        cbm_ht_set(r->by_name, strdup(name), arr);
     }
     cbm_da_push(arr, (char *)owned_qn);
 }
@@ -780,6 +778,35 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
 }
 
 /* Strategy 3+4: Name lookup + suffix match */
+static bool qn_array_is_one_overload_set(const qn_array_t *arr, const char *name) {
+    if (!arr || arr->count < 2 || !name || !name[0]) {
+        return false;
+    }
+    const char *expected_base = NULL;
+    size_t expected_base_len = 0;
+    const size_t name_len = strlen(name);
+    for (int i = 0; i < arr->count; i++) {
+        const char *qn = arr->items[i];
+        const char *match = NULL;
+        for (const char *p = qn; (p = strstr(p, name)) != NULL; p += name_len) {
+            if ((p == qn || p[-1] == '.') && (p[name_len] == '(' || p[name_len] == '<')) {
+                match = p;
+            }
+        }
+        if (!match) {
+            return false;
+        }
+        size_t base_len = (size_t)(match - qn) + name_len;
+        if (i == 0) {
+            expected_base = qn;
+            expected_base_len = base_len;
+        } else if (expected_base_len != base_len || strncmp(expected_base, qn, base_len) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
                                             const char *module_qn, const char **import_vals,
                                             int import_count) {
@@ -790,6 +817,15 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
     }
     if (arr->count > REG_MAX_CANDIDATES) {
         return empty_result(); /* unresolvably ambiguous — see REG_MAX_CANDIDATES */
+    }
+
+    /* Текстовый резолвер не знает типы аргументов. Если все кандидаты —
+     * перегрузки одного вызываемого символа, выбор по порядку или расстоянию до
+     * импорта был бы ложной точностью. Типизированный LSP-проход выберет
+     * канонический QN; без него лучше не создавать CALLS, чем связать вызов с
+     * чужой перегрузкой. */
+    if (qn_array_is_one_overload_set(arr, lookup)) {
+        return empty_result();
     }
 
     /* Strategy 3.5: a qualified callee disambiguates among multiple same-name
