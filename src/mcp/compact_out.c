@@ -240,6 +240,19 @@ void cbm_tree_scalar_bool(cbm_sb_t *sb, const char *key, bool v) {
     cbm_sb_append_n(sb, "\n", 1);
 }
 
+void cbm_tree_list_header(cbm_sb_t *sb, const char *key, int n) {
+    char num[32];
+    snprintf(num, sizeof(num), ": %d\n", n);
+    cbm_sb_append(sb, key);
+    cbm_sb_append(sb, num);
+}
+
+void cbm_tree_list_item_str(cbm_sb_t *sb, const char *val) {
+    cbm_sb_append_n(sb, "  ", 2);
+    append_value(sb, val ? val : "");
+    cbm_sb_append_n(sb, "\n", 1);
+}
+
 /* ── Tables ─────────────────────────────────────────────────────── */
 
 /* Tree-syntax table header: `key: N  (cols: a b c)` — count first (agents

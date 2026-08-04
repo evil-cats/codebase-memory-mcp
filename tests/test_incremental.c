@@ -1889,7 +1889,10 @@ TEST(tool_arch_no_aspects) {
 
 TEST(tool_detect_changes_default) {
     double ms;
-    char *r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\"}", g_project);
+    /* scope остаётся неявным и тем самым проверяет default=impact, а HEAD даёт
+     * точному режиму воспроизводимую базу даже в fixture без ветки main. */
+    char *r = call_tool_timed("detect_changes", &ms,
+                              "{\"project\":\"%s\",\"base_branch\":\"HEAD\"}", g_project);
     TOOL_OK(r, ms);
     /* New tree contract: base + direction scalars, a changed_files section,
      * and the seed/impact accounting. (The old changed_count/impacted_symbols/
@@ -1897,6 +1900,7 @@ TEST(tool_detect_changes_default) {
     ASSERT(strstr(r, "changed_files:") != NULL);
     ASSERT(strstr(r, "direction:") != NULL);
     ASSERT(strstr(r, "seed_symbols:") != NULL);
+    ASSERT(strstr(r, "changed_symbols:") != NULL);
     free(r);
     PASS();
 }

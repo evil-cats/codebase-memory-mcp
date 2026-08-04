@@ -38,6 +38,10 @@ void cbm_tree_scalar_str(cbm_sb_t *sb, const char *key, const char *val);
 void cbm_tree_scalar_int(cbm_sb_t *sb, const char *key, long long v);
 void cbm_tree_scalar_bool(cbm_sb_t *sb, const char *key, bool v);
 
+/* Одноколоночный список: `key: N`, затем значения с отступом в две позиции. */
+void cbm_tree_list_header(cbm_sb_t *sb, const char *key, int n);
+void cbm_tree_list_item_str(cbm_sb_t *sb, const char *val);
+
 /* `key[n]{col1,col2,...}:` table header; rows follow at 2-space indent. */
 void cbm_tree_table_header(cbm_sb_t *sb, const char *key, int n, const char *const *cols,
                            int ncols);

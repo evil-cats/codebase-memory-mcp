@@ -578,6 +578,21 @@ TEST(tree_cell_sanitizes_control_and_invalid_utf8) {
     PASS();
 }
 
+TEST(tree_list_quotes_whitespace_values) {
+    cbm_sb_t sb;
+    cbm_sb_init(&sb);
+    cbm_tree_list_header(&sb, "changed_symbols", 2);
+    cbm_tree_list_item_str(&sb, "src.f(int)");
+    cbm_tree_list_item_str(&sb, "src.Request.data() const");
+    char *out = cbm_sb_finish(&sb);
+    ASSERT_NOT_NULL(out);
+    ASSERT_STR_EQ(out, "changed_symbols: 2\n"
+                       "  src.f(int)\n"
+                       "  \"src.Request.data() const\"\n");
+    free(out);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING
  * ══════════════════════════════════════════════════════════════════ */
@@ -758,6 +773,58 @@ TEST(mcp_tools_list) {
     ASSERT_NOT_NULL(strstr(json, "detect_changes"));
     ASSERT_NOT_NULL(strstr(json, "manage_adr"));
     ASSERT_NOT_NULL(strstr(json, "ingest_traces"));
+    free(json);
+    PASS();
+}
+
+TEST(mcp_detect_changes_publishes_symbols_contract) {
+    char *json = cbm_mcp_tools_list();
+    ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *tools = yyjson_obj_get(yyjson_doc_get_root(doc), "tools");
+    ASSERT_NOT_NULL(tools);
+
+    yyjson_val *detect = NULL;
+    size_t index = 0;
+    size_t max = 0;
+    yyjson_val *tool = NULL;
+    yyjson_arr_foreach(tools, index, max, tool) {
+        yyjson_val *name = yyjson_obj_get(tool, "name");
+        if (name && strcmp(yyjson_get_str(name), "detect_changes") == 0) {
+            detect = tool;
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(detect);
+    const char *description = yyjson_get_str(yyjson_obj_get(detect, "description"));
+    ASSERT_NOT_NULL(description);
+    ASSERT_NOT_NULL(strstr(description, "Function/Method"));
+    ASSERT_NOT_NULL(strstr(description, "line ranges intersect"));
+
+    yyjson_val *schema = yyjson_obj_get(detect, "inputSchema");
+    yyjson_val *properties = schema ? yyjson_obj_get(schema, "properties") : NULL;
+    yyjson_val *scope = properties ? yyjson_obj_get(properties, "scope") : NULL;
+    yyjson_val *scope_enum = scope ? yyjson_obj_get(scope, "enum") : NULL;
+    ASSERT_NOT_NULL(scope_enum);
+    ASSERT_EQ(yyjson_arr_size(scope_enum), 3);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(scope_enum, 0)), "files");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(scope_enum, 1)), "symbols");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(scope_enum, 2)), "impact");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(scope, "default")), "impact");
+
+    yyjson_val *fields = properties ? yyjson_obj_get(properties, "fields") : NULL;
+    yyjson_val *unique = fields ? yyjson_obj_get(fields, "uniqueItems") : NULL;
+    yyjson_val *field_items = fields ? yyjson_obj_get(fields, "items") : NULL;
+    yyjson_val *field_enum = field_items ? yyjson_obj_get(field_items, "enum") : NULL;
+    ASSERT_TRUE(unique && yyjson_get_bool(unique));
+    ASSERT_NOT_NULL(field_enum);
+    ASSERT_EQ(yyjson_arr_size(field_enum), 3);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(field_enum, 0)), "label");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(field_enum, 1)), "file");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(field_enum, 2)), "lines");
+
+    yyjson_doc_free(doc);
     free(json);
     PASS();
 }
@@ -6168,6 +6235,679 @@ TEST(tool_detect_changes_contained_commands_clean_up_error_and_success) {
     PASS();
 }
 
+/* Git-фикстуры detect_changes всегда коммитятся с локальной тестовой
+ * идентичностью и без зависимости от пользовательской конфигурации. */
+static bool detect_test_commit_all(const char *repo, const char *message) {
+    const char *const add_args[] = {"add", "--all", NULL};
+    const char *const commit_args[] = {
+        "-c",     "user.name=cbm-test",
+        "-c",     "user.email=cbm-test@example.invalid",
+        "-c",     "commit.gpgsign=false",
+        "commit", "-q",
+        "-m",     message,
+        NULL,
+    };
+    return mcp_test_git(repo, add_args) == 0 && mcp_test_git(repo, commit_args) == 0;
+}
+
+static int64_t detect_test_add_callable(cbm_store_t *store, const char *project, const char *label,
+                                        const char *name, const char *qn, const char *file,
+                                        int start_line, int end_line) {
+    cbm_node_t node = {.project = project,
+                       .label = label,
+                       .name = name,
+                       .qualified_name = qn,
+                       .file_path = file,
+                       .start_line = start_line,
+                       .end_line = end_line};
+    return cbm_store_upsert_node(store, &node);
+}
+
+/* Возвращает только text из прямого MCP-результата, чтобы тесты проверяли
+ * фактический публичный JSON/tree payload, а не экранированную оболочку. */
+static char *detect_test_call(cbm_mcp_server_t *server, const char *arguments) {
+    char *response = cbm_mcp_handle_tool(server, "detect_changes", arguments);
+    char *text = extract_text_content(response);
+    free(response);
+    return text;
+}
+
+TEST(tool_detect_changes_symbols_selects_exact_ranges_formats_and_impact_seeds) {
+    char repo[CBM_SZ_4K];
+    (void)snprintf(repo, sizeof(repo), "%s/cbm-detect-symbols-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    const char *const init_args[] = {"init", "-q", NULL};
+    ASSERT_EQ(mcp_test_git(repo, init_args), 0);
+
+    const char *sample_before = "int unchanged(int value) {\n"
+                                "    return value;\n"
+                                "}\n"
+                                "\n"
+                                "int data_const() {\n"
+                                "    return 1;\n"
+                                "}\n";
+    const char *sample_after = "int unchanged(int value) {\n"
+                               "    return value;\n"
+                               "}\n"
+                               "\n"
+                               "int data_const() {\n"
+                               "    return 2;\n"
+                               "}\n";
+    const char *twice_before = "int twice() {\n"
+                               "    int a = 1;\n"
+                               "\n"
+                               "    int b = 2;\n"
+                               "    return a + b;\n"
+                               "}\n";
+    const char *twice_after = "int twice() {\n"
+                              "    int a = 3;\n"
+                              "\n"
+                              "    int b = 4;\n"
+                              "    return a + b;\n"
+                              "}\n";
+    const char *shift_before = "int shifted() {\n    return 7;\n}\n";
+    const char *shift_after = "// inserted above the function\n"
+                              "int shifted() {\n    return 7;\n}\n";
+    const char *between_before = "int first() {\n"
+                                 "    return 1;\n"
+                                 "}\n\n"
+                                 "// old marker\n\n"
+                                 "int second() {\n"
+                                 "    return 2;\n"
+                                 "}\n";
+    const char *between_after = "int first() {\n"
+                                "    return 1;\n"
+                                "}\n\n"
+                                "\n"
+                                "int second() {\n"
+                                "    return 2;\n"
+                                "}\n";
+    const char *deletion_before = "int deletion() {\n"
+                                  "    int removed = 1;\n"
+                                  "    return removed;\n"
+                                  "}\n";
+    const char *deletion_after = "int deletion() {\n"
+                                 "    return 1;\n"
+                                 "}\n";
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "sample.cpp"), sample_before), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "twice.cpp"), twice_before), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "shift.cpp"), shift_before), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "between.cpp"), between_before), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "deletion.cpp"), deletion_before), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "gone.cpp"), "int gone() {\n    return 0;\n}\n"), 0);
+    ASSERT_TRUE(detect_test_commit_all(repo, "baseline"));
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "sample.cpp"), sample_after), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "twice.cpp"), twice_after), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "shift.cpp"), shift_after), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "between.cpp"), between_after), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "deletion.cpp"), deletion_after), 0);
+    ASSERT_EQ(cbm_unlink(TH_PATH(repo, "gone.cpp")), 0);
+
+    const char *project = "detect-symbols-project";
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(server);
+    cbm_store_t *store = cbm_mcp_server_store(server);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, repo), CBM_STORE_OK);
+    cbm_mcp_server_set_project(server, project);
+
+    int64_t unchanged = detect_test_add_callable(store, project, "Method", "data",
+                                                 "src.Request.data()", "sample.cpp", 1, 3);
+    int64_t data = detect_test_add_callable(store, project, "Method", "data",
+                                            "src.Request.data() const", "sample.cpp", 5, 7);
+    int64_t twice = detect_test_add_callable(store, project, "Function", "twice", "src.twice()",
+                                             "twice.cpp", 1, 6);
+    int64_t deletion = detect_test_add_callable(store, project, "Function", "deletion",
+                                                "src.deletion()", "deletion.cpp", 1, 3);
+    ASSERT_GT(detect_test_add_callable(store, project, "Function", "shifted", "src.shifted()",
+                                       "shift.cpp", 2, 4),
+              0);
+    ASSERT_GT(detect_test_add_callable(store, project, "Function", "first", "src.first()",
+                                       "between.cpp", 1, 3),
+              0);
+    ASSERT_GT(detect_test_add_callable(store, project, "Function", "second", "src.second()",
+                                       "between.cpp", 6, 8),
+              0);
+    int64_t call_data = detect_test_add_callable(store, project, "Function", "call_data",
+                                                 "src.call_data()", "callers.cpp", 1, 3);
+    int64_t call_twice = detect_test_add_callable(store, project, "Function", "call_twice",
+                                                  "src.call_twice()", "callers.cpp", 5, 7);
+    int64_t call_unchanged = detect_test_add_callable(store, project, "Function", "call_unchanged",
+                                                      "src.call_unchanged()", "callers.cpp", 9, 11);
+    ASSERT_GT(unchanged, 0);
+    ASSERT_GT(data, 0);
+    ASSERT_GT(twice, 0);
+    ASSERT_GT(deletion, 0);
+    ASSERT_GT(call_data, 0);
+    ASSERT_GT(call_twice, 0);
+    ASSERT_GT(call_unchanged, 0);
+    cbm_edge_t edge_data = {
+        .project = project, .source_id = call_data, .target_id = data, .type = "CALLS"};
+    cbm_edge_t edge_twice = {
+        .project = project, .source_id = call_twice, .target_id = twice, .type = "CALLS"};
+    cbm_edge_t edge_unchanged = {
+        .project = project, .source_id = call_unchanged, .target_id = unchanged, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(store, &edge_data), 0);
+    ASSERT_GT(cbm_store_insert_edge(store, &edge_twice), 0);
+    ASSERT_GT(cbm_store_insert_edge(store, &edge_unchanged), 0);
+
+    char *minimal = detect_test_call(
+        server, "{\"project\":\"detect-symbols-project\",\"base_branch\":\"missing-base\","
+                "\"since\":\"HEAD\",\"scope\":\"symbols\",\"format\":\"json\","
+                "\"direction\":\"sideways\",\"depth\":99,\"limit\":1}");
+    ASSERT_NOT_NULL(minimal);
+    yyjson_doc *minimal_doc = yyjson_read(minimal, strlen(minimal), 0);
+    ASSERT_NOT_NULL(minimal_doc);
+    yyjson_val *minimal_root = yyjson_doc_get_root(minimal_doc);
+    ASSERT_EQ(yyjson_obj_size(minimal_root), 3);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(minimal_root, "base")), "HEAD");
+    const char *merge_base = yyjson_get_str(yyjson_obj_get(minimal_root, "merge_base"));
+    ASSERT_NOT_NULL(merge_base);
+    ASSERT_EQ(strlen(merge_base), 40);
+    yyjson_val *changed = yyjson_obj_get(minimal_root, "changed_symbols");
+    ASSERT_EQ(yyjson_arr_size(changed), 3);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(changed, 0)), "src.Request.data() const");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(changed, 1)), "src.deletion()");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(changed, 2)), "src.twice()");
+    ASSERT_NULL(strstr(minimal, "src.Request.data()\""));
+    ASSERT_NULL(strstr(minimal, "gone"));
+    ASSERT_NULL(yyjson_obj_get(minimal_root, "changed_files"));
+    ASSERT_NULL(yyjson_obj_get(minimal_root, "direction"));
+    yyjson_doc_free(minimal_doc);
+    free(minimal);
+
+    char *tree =
+        detect_test_call(server, "{\"project\":\"detect-symbols-project\",\"since\":\"HEAD\","
+                                 "\"scope\":\"symbols\",\"format\":\"tree\"}");
+    ASSERT_NOT_NULL(tree);
+    ASSERT_NOT_NULL(strstr(tree, "base: HEAD\n"));
+    ASSERT_NOT_NULL(strstr(tree, "changed_symbols: 3\n"));
+    ASSERT_NOT_NULL(strstr(tree, "  \"src.Request.data() const\"\n"));
+    ASSERT_NOT_NULL(strstr(tree, "  src.deletion()\n"));
+    ASSERT_NOT_NULL(strstr(tree, "  src.twice()\n"));
+    ASSERT_NULL(strstr(tree, "direction:"));
+    ASSERT_NULL(strstr(tree, "changed_files:"));
+    ASSERT_NULL(strstr(tree, "├──"));
+    ASSERT_NULL(strstr(tree, "└──"));
+    free(tree);
+
+    char *with_fields =
+        detect_test_call(server, "{\"project\":\"detect-symbols-project\",\"since\":\"HEAD\","
+                                 "\"scope\":\"symbols\",\"format\":\"json\","
+                                 "\"fields\":[\"label\",\"file\",\"lines\"]}");
+    ASSERT_NOT_NULL(with_fields);
+    yyjson_doc *fields_doc = yyjson_read(with_fields, strlen(with_fields), 0);
+    ASSERT_NOT_NULL(fields_doc);
+    yyjson_val *fields_root = yyjson_doc_get_root(fields_doc);
+    ASSERT_EQ(yyjson_obj_size(fields_root), 3);
+    yyjson_val *field_symbols = yyjson_obj_get(fields_root, "changed_symbols");
+    yyjson_val *data_symbol = yyjson_arr_get(field_symbols, 0);
+    ASSERT_EQ(yyjson_obj_size(data_symbol), 4);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(data_symbol, "qn")), "src.Request.data() const");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(data_symbol, "label")), "Method");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(data_symbol, "file")), "sample.cpp");
+    yyjson_val *lines = yyjson_obj_get(data_symbol, "lines");
+    ASSERT_EQ(yyjson_arr_size(lines), 2);
+    ASSERT_EQ(yyjson_get_int(yyjson_arr_get(lines, 0)), 5);
+    ASSERT_EQ(yyjson_get_int(yyjson_arr_get(lines, 1)), 7);
+    yyjson_doc_free(fields_doc);
+    free(with_fields);
+
+    char *file_only =
+        detect_test_call(server, "{\"project\":\"detect-symbols-project\",\"since\":\"HEAD\","
+                                 "\"scope\":\"symbols\",\"format\":\"json\","
+                                 "\"fields\":[\"file\"]}");
+    ASSERT_NOT_NULL(file_only);
+    yyjson_doc *file_only_doc = yyjson_read(file_only, strlen(file_only), 0);
+    ASSERT_NOT_NULL(file_only_doc);
+    yyjson_val *file_only_symbol =
+        yyjson_arr_get(yyjson_obj_get(yyjson_doc_get_root(file_only_doc), "changed_symbols"), 0);
+    ASSERT_EQ(yyjson_obj_size(file_only_symbol), 2);
+    ASSERT_NOT_NULL(yyjson_obj_get(file_only_symbol, "qn"));
+    ASSERT_NOT_NULL(yyjson_obj_get(file_only_symbol, "file"));
+    ASSERT_NULL(yyjson_obj_get(file_only_symbol, "label"));
+    ASSERT_NULL(yyjson_obj_get(file_only_symbol, "lines"));
+    yyjson_doc_free(file_only_doc);
+    free(file_only);
+
+    char *fields_tree = detect_test_call(
+        server, "{\"project\":\"detect-symbols-project\",\"since\":\"HEAD\","
+                "\"scope\":\"symbols\",\"fields\":[\"label\",\"file\",\"lines\"]}");
+    ASSERT_NOT_NULL(fields_tree);
+    ASSERT_NOT_NULL(strstr(fields_tree, "changed_symbols: 3  (cols: qn label file lines)\n"));
+    ASSERT_NOT_NULL(strstr(fields_tree, "  \"src.Request.data() const\" Method sample.cpp 5-7\n"));
+    free(fields_tree);
+
+    char *bad_field =
+        detect_test_call(server, "{\"project\":\"detect-symbols-project\",\"scope\":\"symbols\","
+                                 "\"fields\":[\"diff_ranges\"]}");
+    ASSERT_NOT_NULL(bad_field);
+    ASSERT_NOT_NULL(strstr(bad_field, "unknown detect_changes field"));
+    free(bad_field);
+
+    char *duplicate_field =
+        detect_test_call(server, "{\"project\":\"detect-symbols-project\",\"scope\":\"symbols\","
+                                 "\"fields\":[\"file\",\"file\"]}");
+    ASSERT_NOT_NULL(duplicate_field);
+    ASSERT_NOT_NULL(strstr(duplicate_field, "duplicate detect_changes field"));
+    free(duplicate_field);
+
+    char *impact = detect_test_call(
+        server, "{\"project\":\"detect-symbols-project\",\"since\":\"HEAD\","
+                "\"format\":\"json\",\"direction\":\"inbound\",\"depth\":1,\"limit\":10}");
+    ASSERT_NOT_NULL(impact);
+    yyjson_doc *impact_doc = yyjson_read(impact, strlen(impact), 0);
+    ASSERT_NOT_NULL(impact_doc);
+    yyjson_val *impact_root = yyjson_doc_get_root(impact_doc);
+    yyjson_val *impact_changed = yyjson_obj_get(impact_root, "changed_symbols");
+    ASSERT_EQ(yyjson_arr_size(impact_changed), 3);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(impact_root, "seed_symbols")), 3);
+    yyjson_val *impacted = yyjson_obj_get(impact_root, "impacted");
+    ASSERT_EQ(yyjson_arr_size(impacted), 2);
+    bool saw_data_caller = false;
+    bool saw_twice_caller = false;
+    size_t impacted_index = 0;
+    size_t impacted_max = 0;
+    yyjson_val *impacted_item = NULL;
+    yyjson_arr_foreach(impacted, impacted_index, impacted_max, impacted_item) {
+        const char *qn = yyjson_get_str(yyjson_obj_get(impacted_item, "qn"));
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(impacted_item, "hop")), 1);
+        saw_data_caller = saw_data_caller || strcmp(qn, "src.call_data()") == 0;
+        saw_twice_caller = saw_twice_caller || strcmp(qn, "src.call_twice()") == 0;
+        ASSERT_STR_NEQ(qn, "src.call_unchanged()");
+        ASSERT_STR_NEQ(qn, "src.Request.data() const");
+        ASSERT_STR_NEQ(qn, "src.deletion()");
+        ASSERT_STR_NEQ(qn, "src.twice()");
+    }
+    ASSERT_TRUE(saw_data_caller);
+    ASSERT_TRUE(saw_twice_caller);
+    yyjson_doc_free(impact_doc);
+    free(impact);
+
+    cbm_mcp_server_free(server);
+    ASSERT_EQ(th_rmtree(repo), 0);
+    PASS();
+}
+
+TEST(tool_detect_changes_symbols_handles_untracked_staged_committed_and_pure_rename) {
+    char repo[CBM_SZ_4K];
+    (void)snprintf(repo, sizeof(repo), "%s/cbm-detect-states-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    const char *const init_args[] = {"init", "-q", NULL};
+    ASSERT_EQ(mcp_test_git(repo, init_args), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "pure-old.cpp"), "int renamed() {\n    return 1;\n}\n"),
+              0);
+    ASSERT_TRUE(detect_test_commit_all(repo, "baseline"));
+
+    const char *project = "detect-states-project";
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(server);
+    cbm_store_t *store = cbm_mcp_server_store(server);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, repo), CBM_STORE_OK);
+    cbm_mcp_server_set_project(server, project);
+
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "new.cpp"), "int zeta() {\n    return 1;\n}\n\n"
+                                                      "int alpha() {\n    return 2;\n}\n"),
+              0);
+    ASSERT_GT(
+        detect_test_add_callable(store, project, "Method", "zeta", "src.zeta()", "new.cpp", 1, 3),
+        0);
+    ASSERT_GT(detect_test_add_callable(store, project, "Function", "alpha", "src.alpha()",
+                                       "new.cpp", 5, 7),
+              0);
+    ASSERT_GT(detect_test_add_callable(store, project, "Class", "Ignored", "src.Ignored", "new.cpp",
+                                       1, 7),
+              0);
+    ASSERT_GT(detect_test_add_callable(store, project, "Function", "invalid", "src.invalid()",
+                                       "new.cpp", 0, 0),
+              0);
+
+    const char *symbols_args =
+        "{\"project\":\"detect-states-project\",\"since\":\"HEAD\","
+        "\"scope\":\"symbols\",\"format\":\"json\",\"limit\":1,\"fields\":[]}";
+    char *untracked = detect_test_call(server, symbols_args);
+    ASSERT_NOT_NULL(untracked);
+    yyjson_doc *untracked_doc = yyjson_read(untracked, strlen(untracked), 0);
+    ASSERT_NOT_NULL(untracked_doc);
+    yyjson_val *untracked_symbols =
+        yyjson_obj_get(yyjson_doc_get_root(untracked_doc), "changed_symbols");
+    ASSERT_EQ(yyjson_arr_size(untracked_symbols), 2);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(untracked_symbols, 0)), "src.alpha()");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(untracked_symbols, 1)), "src.zeta()");
+    yyjson_doc_free(untracked_doc);
+    free(untracked);
+
+    const char *const add_new_args[] = {"add", "new.cpp", NULL};
+    ASSERT_EQ(mcp_test_git(repo, add_new_args), 0);
+    char *staged = detect_test_call(server, symbols_args);
+    ASSERT_NOT_NULL(staged);
+    yyjson_doc *staged_doc = yyjson_read(staged, strlen(staged), 0);
+    ASSERT_NOT_NULL(staged_doc);
+    ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(yyjson_doc_get_root(staged_doc), "changed_symbols")),
+              2);
+    yyjson_doc_free(staged_doc);
+    free(staged);
+
+    ASSERT_TRUE(detect_test_commit_all(repo, "add new functions"));
+    char *committed =
+        detect_test_call(server, "{\"project\":\"detect-states-project\",\"since\":\"HEAD~1\","
+                                 "\"scope\":\"symbols\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(committed);
+    yyjson_doc *committed_doc = yyjson_read(committed, strlen(committed), 0);
+    ASSERT_NOT_NULL(committed_doc);
+    ASSERT_EQ(
+        yyjson_arr_size(yyjson_obj_get(yyjson_doc_get_root(committed_doc), "changed_symbols")), 2);
+    yyjson_doc_free(committed_doc);
+    free(committed);
+
+    const char *const rename_args[] = {"mv", "pure-old.cpp", "pure-new.cpp", NULL};
+    ASSERT_EQ(mcp_test_git(repo, rename_args), 0);
+    ASSERT_GT(detect_test_add_callable(store, project, "Function", "renamed", "src.renamed()",
+                                       "pure-new.cpp", 1, 3),
+              0);
+    char *renamed = detect_test_call(server, symbols_args);
+    ASSERT_NOT_NULL(renamed);
+    yyjson_doc *renamed_doc = yyjson_read(renamed, strlen(renamed), 0);
+    ASSERT_NOT_NULL(renamed_doc);
+    ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(yyjson_doc_get_root(renamed_doc), "changed_symbols")),
+              0);
+    yyjson_doc_free(renamed_doc);
+    free(renamed);
+
+    cbm_mcp_server_free(server);
+    ASSERT_EQ(th_rmtree(repo), 0);
+    PASS();
+}
+
+TEST(tool_detect_changes_symbols_distinguishes_cpp_overloads_and_stable_qn) {
+    char repo[CBM_SZ_4K];
+    (void)snprintf(repo, sizeof(repo), "%s/cbm-detect-overloads-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    const char *const init_args[] = {"init", "-q", NULL};
+    ASSERT_EQ(mcp_test_git(repo, init_args), 0);
+
+    const char *before = "#include <string_view>\n"
+                         "int f(int value) {\n"
+                         "    return value;\n"
+                         "}\n"
+                         "int f(std::string_view value) {\n"
+                         "    return (int)value.size();\n"
+                         "}\n"
+                         "struct Worker {\n"
+                         "    void run() & {\n"
+                         "        int value = 1;\n"
+                         "    }\n"
+                         "    void run() && {\n"
+                         "        int value = 2;\n"
+                         "    }\n"
+                         "};\n"
+                         "int stable(int value) {\n"
+                         "    return value;\n"
+                         "}\n";
+    const char *after = "#include <string_view>\n"
+                        "int f(int value) {\n"
+                        "    return value;\n"
+                        "}\n"
+                        "int f(std::string_view value) {\n"
+                        "    return (int)value.size() + 1;\n"
+                        "}\n"
+                        "struct Worker {\n"
+                        "    void run() & {\n"
+                        "        int value = 1;\n"
+                        "    }\n"
+                        "    void run() && {\n"
+                        "        int value = 3;\n"
+                        "    }\n"
+                        "};\n"
+                        "int stable(int renamed) {\n"
+                        "    return renamed;\n"
+                        "}\n";
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "overloads.cpp"), before), 0);
+    ASSERT_TRUE(detect_test_commit_all(repo, "baseline"));
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "overloads.cpp"), after), 0);
+
+    const char *project = "detect-overloads-project";
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(server);
+    cbm_store_t *store = cbm_mcp_server_store(server);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, repo), CBM_STORE_OK);
+    cbm_mcp_server_set_project(server, project);
+    ASSERT_GT(detect_test_add_callable(store, project, "Function", "f", "src.f(int)",
+                                       "overloads.cpp", 2, 4),
+              0);
+    ASSERT_GT(detect_test_add_callable(store, project, "Function", "f", "src.f(std::string_view)",
+                                       "overloads.cpp", 5, 7),
+              0);
+    ASSERT_GT(detect_test_add_callable(store, project, "Method", "run", "src.Worker.run() &",
+                                       "overloads.cpp", 9, 11),
+              0);
+    ASSERT_GT(detect_test_add_callable(store, project, "Method", "run", "src.Worker.run() &&",
+                                       "overloads.cpp", 12, 14),
+              0);
+    ASSERT_GT(detect_test_add_callable(store, project, "Function", "stable", "src.stable(int)",
+                                       "overloads.cpp", 16, 18),
+              0);
+
+    char *response =
+        detect_test_call(server, "{\"project\":\"detect-overloads-project\",\"since\":\"HEAD\","
+                                 "\"scope\":\"symbols\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    yyjson_doc *doc = yyjson_read(response, strlen(response), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *symbols = yyjson_obj_get(yyjson_doc_get_root(doc), "changed_symbols");
+    ASSERT_EQ(yyjson_arr_size(symbols), 3);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(symbols, 0)), "src.Worker.run() &&");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(symbols, 1)), "src.f(std::string_view)");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(symbols, 2)), "src.stable(int)");
+    ASSERT_NULL(strstr(response, "src.f(int)"));
+    ASSERT_NULL(strstr(response, "src.Worker.run() &\""));
+
+    yyjson_doc_free(doc);
+    free(response);
+    cbm_mcp_server_free(server);
+    ASSERT_EQ(th_rmtree(repo), 0);
+    PASS();
+}
+
+TEST(tool_detect_changes_symbols_handles_crossing_hunk_comments_and_deleted_function) {
+    char repo[CBM_SZ_4K];
+    (void)snprintf(repo, sizeof(repo), "%s/cbm-detect-edge-ranges-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    const char *const init_args[] = {"init", "-q", NULL};
+    ASSERT_EQ(mcp_test_git(repo, init_args), 0);
+
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "cross.cpp"), "int cross_first() {\n"
+                                                        "    return 1;\n"
+                                                        "}\n"
+                                                        "int cross_second() {\n"
+                                                        "    return 2;\n"
+                                                        "}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "commented.cpp"), "int commented() {\n"
+                                                            "    // old wording\n"
+                                                            "    return 1;\n"
+                                                            "}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "outside.cpp"), "int plain() {\n"
+                                                          "    return 1;\n"
+                                                          "}\n"
+                                                          "\n"
+                                                          "// old outside wording\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "removed.cpp"), "int kept_before() {\n"
+                                                          "    return 1;\n"
+                                                          "}\n"
+                                                          "\n"
+                                                          "int removed() {\n"
+                                                          "    return 2;\n"
+                                                          "}\n"
+                                                          "\n"
+                                                          "int kept_after() {\n"
+                                                          "    return 3;\n"
+                                                          "}\n"),
+              0);
+    ASSERT_TRUE(detect_test_commit_all(repo, "baseline"));
+
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "cross.cpp"),
+                            "int cross_first() {\n"
+                            "    return 1;\n"
+                            "} // changed first boundary\n"
+                            "int cross_second() { // changed second boundary\n"
+                            "    return 2;\n"
+                            "}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "commented.cpp"), "int commented() {\n"
+                                                            "    // new wording\n"
+                                                            "    return 1;\n"
+                                                            "}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "outside.cpp"), "int plain() {\n"
+                                                          "    return 1;\n"
+                                                          "}\n"
+                                                          "\n"
+                                                          "// new outside wording\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "removed.cpp"), "int kept_before() {\n"
+                                                          "    return 1;\n"
+                                                          "}\n"
+                                                          "\n"
+                                                          "int kept_after() {\n"
+                                                          "    return 3;\n"
+                                                          "}\n"),
+              0);
+
+    const char *project = "detect-edge-ranges-project";
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(server);
+    cbm_store_t *store = cbm_mcp_server_store(server);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, repo), CBM_STORE_OK);
+    cbm_mcp_server_set_project(server, project);
+    ASSERT_GT(detect_test_add_callable(store, project, "Function", "cross_first",
+                                       "src.cross_first()", "cross.cpp", 1, 3),
+              0);
+    ASSERT_GT(detect_test_add_callable(store, project, "Function", "cross_second",
+                                       "src.cross_second()", "cross.cpp", 4, 6),
+              0);
+    ASSERT_GT(detect_test_add_callable(store, project, "Function", "commented", "src.commented()",
+                                       "commented.cpp", 1, 4),
+              0);
+    ASSERT_GT(detect_test_add_callable(store, project, "Function", "plain", "src.plain()",
+                                       "outside.cpp", 1, 3),
+              0);
+    ASSERT_GT(detect_test_add_callable(store, project, "Function", "kept_before",
+                                       "src.kept_before()", "removed.cpp", 1, 3),
+              0);
+    ASSERT_GT(detect_test_add_callable(store, project, "Function", "kept_after", "src.kept_after()",
+                                       "removed.cpp", 5, 7),
+              0);
+
+    char *response =
+        detect_test_call(server, "{\"project\":\"detect-edge-ranges-project\",\"since\":\"HEAD\","
+                                 "\"scope\":\"symbols\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    yyjson_doc *doc = yyjson_read(response, strlen(response), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *symbols = yyjson_obj_get(yyjson_doc_get_root(doc), "changed_symbols");
+    ASSERT_EQ(yyjson_arr_size(symbols), 3);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(symbols, 0)), "src.commented()");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(symbols, 1)), "src.cross_first()");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(symbols, 2)), "src.cross_second()");
+    ASSERT_NULL(strstr(response, "src.plain()"));
+    ASSERT_NULL(strstr(response, "src.kept_before()"));
+    ASSERT_NULL(strstr(response, "src.kept_after()"));
+    ASSERT_NULL(strstr(response, "removed"));
+
+    yyjson_doc_free(doc);
+    free(response);
+    cbm_mcp_server_free(server);
+    ASSERT_EQ(th_rmtree(repo), 0);
+    PASS();
+}
+
+/* Сквозная проверка не подменяет индекс ручными узлами: сначала фактический
+ * index_repository строит граф текущей рабочей копии, затем оба формата
+ * detect_changes читают из него ровно изменённую C++-перегрузку. */
+TEST(tool_detect_changes_symbols_uses_reindexed_tree_sitter_ranges) {
+    char repo[CBM_SZ_4K];
+    (void)snprintf(repo, sizeof(repo), "%s/cbm-detect-reindexed-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    char cache[CBM_SZ_4K];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-detect-reindexed-cache-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_TRUE(!saved_cache || saved_cache_copy);
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+
+    const char *const init_args[] = {"init", "-q", NULL};
+    ASSERT_EQ(mcp_test_git(repo, init_args), 0);
+    const char *before = "struct Buffer {\n"
+                         "    int data() { return 1; }\n"
+                         "    int data() const { return 2; }\n"
+                         "};\n"
+                         "int untouched() { return 3; }\n";
+    const char *after = "struct Buffer {\n"
+                        "    int data() { return 1; }\n"
+                        "    int data() const { return 4; }\n"
+                        "};\n"
+                        "int untouched() { return 3; }\n";
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "sample.cpp"), before), 0);
+    ASSERT_TRUE(detect_test_commit_all(repo, "baseline"));
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "sample.cpp"), after), 0);
+
+    char *project = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(project);
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(server);
+    char index_args[CBM_SZ_8K];
+    (void)snprintf(index_args, sizeof(index_args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}",
+                   repo);
+    char *index_response = cbm_mcp_handle_tool(server, "index_repository", index_args);
+    ASSERT_NOT_NULL(index_response);
+    ASSERT_TRUE(response_contains_json_fragment(index_response, "\"status\":\"indexed\""));
+    free(index_response);
+
+    char detect_args[CBM_SZ_8K];
+    (void)snprintf(detect_args, sizeof(detect_args),
+                   "{\"project\":\"%s\",\"since\":\"HEAD\",\"scope\":\"symbols\","
+                   "\"format\":\"json\"}",
+                   project);
+    char *json = detect_test_call(server, detect_args);
+    ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *symbols = yyjson_obj_get(yyjson_doc_get_root(doc), "changed_symbols");
+    ASSERT_EQ(yyjson_arr_size(symbols), 1);
+    const char *qn = yyjson_get_str(yyjson_arr_get(symbols, 0));
+    ASSERT_NOT_NULL(qn);
+    ASSERT_NOT_NULL(strstr(qn, "Buffer.data() const"));
+    ASSERT_NULL(strstr(json, "Buffer.data()\""));
+    ASSERT_NULL(strstr(json, "untouched"));
+
+    (void)snprintf(detect_args, sizeof(detect_args),
+                   "{\"project\":\"%s\",\"since\":\"HEAD\",\"scope\":\"symbols\","
+                   "\"format\":\"tree\"}",
+                   project);
+    char *tree = detect_test_call(server, detect_args);
+    ASSERT_NOT_NULL(tree);
+    char quoted_qn[CBM_SZ_4K];
+    (void)snprintf(quoted_qn, sizeof(quoted_qn), "  \"%s\"\n", qn);
+    ASSERT_NOT_NULL(strstr(tree, "changed_symbols: 1\n"));
+    ASSERT_NOT_NULL(strstr(tree, quoted_qn));
+    ASSERT_NULL(strstr(tree, "untouched"));
+
+    free(tree);
+    yyjson_doc_free(doc);
+    free(json);
+    cbm_mcp_server_free(server);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    free(project);
+    ASSERT_EQ(th_rmtree(cache), 0);
+    ASSERT_EQ(th_rmtree(repo), 0);
+    PASS();
+}
+
 TEST(tool_ingest_traces_basic) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -9722,6 +10462,7 @@ SUITE(mcp) {
     RUN_TEST(jsonrpc_parse_notification);
     RUN_TEST(jsonrpc_parse_invalid);
     RUN_TEST(tree_cell_sanitizes_control_and_invalid_utf8);
+    RUN_TEST(tree_list_quotes_whitespace_values);
     RUN_TEST(jsonrpc_parse_tools_call);
     RUN_TEST(jsonrpc_parse_string_id_issue253);
     RUN_TEST(jsonrpc_format_response_string_id_issue253);
@@ -9742,6 +10483,7 @@ SUITE(mcp) {
     /* MCP protocol helpers */
     RUN_TEST(mcp_initialize_response);
     RUN_TEST(mcp_tools_list);
+    RUN_TEST(mcp_detect_changes_publishes_symbols_contract);
     RUN_TEST(mcp_tools_list_latest_metadata);
     RUN_TEST(mcp_tools_have_behavior_annotations);
     RUN_TEST(mcp_index_repository_hides_internal_options);
@@ -9878,6 +10620,11 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_get_accepts_symlink_path);
     RUN_TEST(tool_detect_changes_not_found_rich_error);
     RUN_TEST(tool_detect_changes_contained_commands_clean_up_error_and_success);
+    RUN_TEST(tool_detect_changes_symbols_selects_exact_ranges_formats_and_impact_seeds);
+    RUN_TEST(tool_detect_changes_symbols_handles_untracked_staged_committed_and_pure_rename);
+    RUN_TEST(tool_detect_changes_symbols_distinguishes_cpp_overloads_and_stable_qn);
+    RUN_TEST(tool_detect_changes_symbols_handles_crossing_hunk_comments_and_deleted_function);
+    RUN_TEST(tool_detect_changes_symbols_uses_reindexed_tree_sitter_ranges);
     RUN_TEST(tool_ingest_traces_basic);
     RUN_TEST(tool_ingest_traces_empty);
 

@@ -621,29 +621,35 @@ static const tool_def_t TOOLS[] = {
      "}"},
 
     {"detect_changes", "Detect changes",
-     "Map a git diff to its BLAST RADIUS. Resolves changed files to the symbols they define, then "
-     "runs ONE multi-source graph traversal to the transitive impact set. RESPONSE: base + "
-     "merge_base SHA, changed_files list, then impacted = prefix-grouped tree rows (name label "
-     "hop; "
-     "full qn = group prefix + dot + name) + an impacted_modules rollup; impacted_total + "
-     "truncated are exact. Seeds (the changed symbols) are excluded from impacted; a changed file "
-     "reached from another changed file is not counted as extra impact. format=\"json\" returns "
-     "the "
-     "same model as structured JSON.",
+     "Resolve Git changes against the current worktree. scope=\"symbols\" returns the complete, "
+     "sorted set of current Function/Method nodes whose indexed line ranges intersect the "
+     "zero-context diff; it performs no graph traversal. scope=\"impact\" (default) uses exactly "
+     "those changed symbols as the seeds for ONE multi-source blast-radius traversal and keeps "
+     "the existing changed_files/impacted response. scope=\"files\" preserves the existing "
+     "changed-file response and performs no graph traversal. Optional fields add label, file, "
+     "and/or current lines to changed_symbols. direction, depth, and limit do not affect symbols; "
+     "limit applies only to impacted rows and never truncates changed_symbols.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"scope\":{\"type\":"
-     "\"string\",\"enum\":[\"files\",\"impact\"],\"description\":\"files: changed files only "
-     "(no traversal). impact (default): files + the transitive impact set.\"},"
+     "\"string\",\"enum\":[\"files\",\"symbols\",\"impact\"],\"default\":\"impact\","
+     "\"description\":\"files: changed files only. symbols: exact changed Function/Method nodes "
+     "only, with no traversal. impact: changed files plus traversal seeded only by those exact "
+     "changed symbols.\"},"
+     "\"fields\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[\"label\","
+     "\"file\",\"lines\"]},\"uniqueItems\":true,\"maxItems\":3,\"description\":\"Optional "
+     "per-symbol fields. Without fields, changed_symbols is an array of qualified-name strings.\"},"
      "\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\",\"both\"],\"default\":"
      "\"inbound\",\"description\":\"inbound (default) = the blast radius: transitive CALLERS of "
      "the "
      "changed symbols. outbound = what the changed code depends on. both = union.\"},"
      "\"depth\":{\"type\":\"integer\",\"default\":2,\"description\":\"Max traversal hops from the "
      "changed symbols.\"},\"limit\":{\"type\":\"integer\",\"default\":200,\"maximum\":5000,"
-     "\"description\":\"Per-symbol impacted rows shown (nearest hops first). impacted_total is "
+     "\"description\":\"Maximum impacted rows shown (nearest hops first). impacted_total is "
      "always exact and the impacted_modules rollup always complete regardless.\"},"
      "\"base_branch\":{\"type\":"
-     "\"string\",\"default\":\"main\"},\"since\":{\"type\":\"string\",\"description\":"
-     "\"Git ref or tag to compare from (e.g. HEAD~5, v0.5.0). Diffs <ref>...HEAD.\"},"
+     "\"string\",\"default\":\"main\",\"description\":\"Git ref used as the comparison "
+     "base when since is absent.\"},\"since\":{\"type\":\"string\",\"description\":"
+     "\"Git ref or tag to compare from (e.g. HEAD~5, v0.5.0). Its merge-base with HEAD is "
+     "compared to the current worktree.\"},"
      "\"format\":{\"type\":\"string\",\"enum\":[\"tree\",\"json\"],\"default\":\"tree\"}},"
      "\"required\":"
      "[\"project\"]}"},
@@ -9733,27 +9739,412 @@ static int mcp_run_shell_command_cancellable(cbm_mcp_server_t *srv, const char *
     return contained ? 0 : -1;
 }
 
-/* Collect BFS seed ids: every symbol DEFINED in a changed file (everything but
- * the structural container labels — those have no CALLS edges). These anchor
- * the multi-source impact traversal. */
-static void detect_collect_seeds(cbm_store_t *store, const char *project, const char *file,
-                                 int64_t **seeds, int *n, int *cap) {
-    cbm_node_t *nodes = NULL;
-    int ncount = 0;
-    cbm_store_find_nodes_by_file(store, project, file, &nodes, &ncount);
-    for (int i = 0; i < ncount; i++) {
-        const char *lb = nodes[i].label;
-        if (lb && strcmp(lb, "File") != 0 && strcmp(lb, "Folder") != 0 &&
-            strcmp(lb, "Project") != 0 && strcmp(lb, "Module") != 0 && strcmp(lb, "Package") != 0 &&
-            strcmp(lb, "Section") != 0) {
-            if (*n >= *cap) {
-                *cap = *cap ? *cap * 2 : 16;
-                *seeds = safe_realloc(*seeds, (size_t)*cap * sizeof(int64_t));
-            }
-            (*seeds)[(*n)++] = nodes[i].id;
+typedef struct {
+    int start_line;
+    int end_line;
+} detect_range_t;
+
+typedef struct {
+    char *path;
+    bool whole_file;
+    detect_range_t *ranges;
+    int range_count;
+    int range_cap;
+} detect_file_change_t;
+
+typedef struct {
+    detect_file_change_t *items;
+    int count;
+    int cap;
+} detect_file_list_t;
+
+typedef struct {
+    int64_t id;
+    char *qn;
+    char *label;
+    char *file;
+    int start_line;
+    int end_line;
+} detect_symbol_t;
+
+typedef struct {
+    detect_symbol_t *items;
+    int count;
+    int cap;
+} detect_symbol_list_t;
+
+typedef enum {
+    DETECT_FIELD_LABEL,
+    DETECT_FIELD_FILE,
+    DETECT_FIELD_LINES,
+} detect_field_t;
+
+typedef struct {
+    detect_field_t items[3];
+    int count;
+} detect_fields_t;
+
+/* Освобождает пути и диапазоны, накопленные из нескольких Git-источников. */
+static void detect_file_list_free(detect_file_list_t *files) {
+    if (!files) {
+        return;
+    }
+    for (int i = 0; i < files->count; i++) {
+        free(files->items[i].path);
+        free(files->items[i].ranges);
+    }
+    free(files->items);
+    memset(files, 0, sizeof(*files));
+}
+
+/* Возвращает единственную запись пути; признак полного файла объединяется при
+ * повторном появлении пути в diff и status. */
+static detect_file_change_t *detect_file_list_add(detect_file_list_t *files, const char *path,
+                                                  bool whole_file) {
+    for (int i = 0; i < files->count; i++) {
+        if (strcmp(files->items[i].path, path) == 0) {
+            files->items[i].whole_file = files->items[i].whole_file || whole_file;
+            return &files->items[i];
         }
     }
-    cbm_store_free_nodes(nodes, ncount);
+    if (files->count >= files->cap) {
+        int new_cap = files->cap ? files->cap * 2 : 16;
+        detect_file_change_t *grown =
+            realloc(files->items, (size_t)new_cap * sizeof(*files->items));
+        if (!grown) {
+            return NULL;
+        }
+        files->items = grown;
+        files->cap = new_cap;
+    }
+    char *owned_path = heap_strdup(path);
+    if (!owned_path) {
+        return NULL;
+    }
+    detect_file_change_t *item = &files->items[files->count++];
+    memset(item, 0, sizeof(*item));
+    item->path = owned_path;
+    item->whole_file = whole_file;
+    return item;
+}
+
+/* Сохраняет фрагменты отдельно: разнесённые hunks не превращаются в один
+ * широкий диапазон, который ложно задел бы промежуточные функции. */
+static bool detect_file_add_range(detect_file_change_t *file, int start_line, int end_line) {
+    if (!file) {
+        return false;
+    }
+    if (file->range_count >= file->range_cap) {
+        int new_cap = file->range_cap ? file->range_cap * 2 : 8;
+        detect_range_t *grown = realloc(file->ranges, (size_t)new_cap * sizeof(*file->ranges));
+        if (!grown) {
+            return false;
+        }
+        file->ranges = grown;
+        file->range_cap = new_cap;
+    }
+    file->ranges[file->range_count++] =
+        (detect_range_t){.start_line = start_line, .end_line = end_line};
+    return true;
+}
+
+/* Освобождает копии данных узлов, нужные после закрытия результата SQLite. */
+static void detect_symbol_list_free(detect_symbol_list_t *symbols) {
+    if (!symbols) {
+        return;
+    }
+    for (int i = 0; i < symbols->count; i++) {
+        free(symbols->items[i].qn);
+        free(symbols->items[i].label);
+        free(symbols->items[i].file);
+    }
+    free(symbols->items);
+    memset(symbols, 0, sizeof(*symbols));
+}
+
+/* Добавляет узел один раз по каноническому QN: повторные hunks одного символа
+ * не должны создавать дубликаты ни в ответе, ни среди начальных узлов BFS. */
+static bool detect_symbol_list_add(detect_symbol_list_t *symbols, const cbm_node_t *node) {
+    const char *qn = node && node->qualified_name ? node->qualified_name : "";
+    if (!qn[0]) {
+        return true;
+    }
+    for (int i = 0; i < symbols->count; i++) {
+        if (strcmp(symbols->items[i].qn, qn) == 0) {
+            return true;
+        }
+    }
+    if (symbols->count >= symbols->cap) {
+        int new_cap = symbols->cap ? symbols->cap * 2 : 16;
+        detect_symbol_t *grown = realloc(symbols->items, (size_t)new_cap * sizeof(*symbols->items));
+        if (!grown) {
+            return false;
+        }
+        symbols->items = grown;
+        symbols->cap = new_cap;
+    }
+    char *owned_qn = heap_strdup(qn);
+    char *owned_label = heap_strdup(node->label ? node->label : "");
+    char *owned_file = heap_strdup(node->file_path ? node->file_path : "");
+    if (!owned_qn || !owned_label || !owned_file) {
+        free(owned_qn);
+        free(owned_label);
+        free(owned_file);
+        return false;
+    }
+    detect_symbol_t *item = &symbols->items[symbols->count++];
+    *item = (detect_symbol_t){.id = node->id,
+                              .qn = owned_qn,
+                              .label = owned_label,
+                              .file = owned_file,
+                              .start_line = node->start_line,
+                              .end_line = node->end_line};
+    return true;
+}
+
+/* Разбирает диапазон новой стороны из `@@ -old +start,count @@`. Для удаления
+ * count=0 остаётся точка-якорь start, а не пустой или расширенный диапазон. */
+static bool detect_parse_hunk_range(const char *line, int *start_line, int *end_line) {
+    const char *plus = line ? strstr(line, " +") : NULL;
+    if (!plus) {
+        return false;
+    }
+    char *number_end = NULL;
+    long start = strtol(plus + 2, &number_end, 10);
+    if (number_end == plus + 2 || start < 0 || start > INT_MAX) {
+        return false;
+    }
+    long count = 1;
+    if (*number_end == ',') {
+        const char *count_start = number_end + 1;
+        count = strtol(count_start, &number_end, 10);
+        if (number_end == count_start || count < 0 || count > INT_MAX) {
+            return false;
+        }
+    }
+    if (count > 0 && start > INT_MAX - count + 1) {
+        return false;
+    }
+    *start_line = (int)start;
+    *end_line = count == 0 ? (int)start : (int)(start + count - 1);
+    return true;
+}
+
+/* Потоково читает zero-context patch и прикрепляет каждый new-side hunk к
+ * пути после `+++ b/`; удалённая сторона `/dev/null` намеренно не создаёт QN. */
+static bool detect_parse_patch(FILE *patch, detect_file_list_t *files) {
+    char line[CBM_SZ_4K];
+    detect_file_change_t *current = NULL;
+    bool at_line_start = true;
+    while (fgets(line, sizeof(line), patch)) {
+        size_t len = strlen(line);
+        bool complete_line = len > 0 && line[len - 1] == '\n';
+        if (at_line_start && strncmp(line, "+++ ", 4) == 0) {
+            while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+                line[--len] = '\0';
+            }
+            char *path = line + 4;
+            if (strcmp(path, "/dev/null") == 0) {
+                current = NULL;
+            } else {
+                if (strncmp(path, "b/", 2) == 0) {
+                    path += 2;
+                }
+                current = detect_file_list_add(files, path, false);
+                if (!current) {
+                    return false;
+                }
+            }
+        } else if (at_line_start && current && strncmp(line, "@@ ", 3) == 0) {
+            int start_line = 0;
+            int end_line = 0;
+            if (!detect_parse_hunk_range(line, &start_line, &end_line) ||
+                !detect_file_add_range(current, start_line, end_line)) {
+                return false;
+            }
+        }
+        at_line_start = complete_line;
+    }
+    return !ferror(patch);
+}
+
+/* Выбирает из актуального индекса только Function/Method с валидными строками,
+ * чьи текущие диапазоны пересекают хотя бы один hunk либо новый файл целиком. */
+static bool detect_collect_changed_symbols(cbm_store_t *store, const char *project,
+                                           const detect_file_list_t *files,
+                                           detect_symbol_list_t *symbols) {
+    for (int i = 0; i < files->count; i++) {
+        const detect_file_change_t *file = &files->items[i];
+        if (!file->whole_file && file->range_count == 0) {
+            continue;
+        }
+        cbm_node_t *nodes = NULL;
+        int node_count = 0;
+        if (cbm_store_find_nodes_by_file(store, project, file->path, &nodes, &node_count) !=
+            CBM_STORE_OK) {
+            cbm_store_free_nodes(nodes, node_count);
+            return false;
+        }
+        for (int j = 0; j < node_count; j++) {
+            const cbm_node_t *node = &nodes[j];
+            bool callable = node->label && (strcmp(node->label, "Function") == 0 ||
+                                            strcmp(node->label, "Method") == 0);
+            bool valid_range = node->start_line > 0 && node->end_line >= node->start_line;
+            bool changed = file->whole_file;
+            for (int k = 0; !changed && k < file->range_count; k++) {
+                changed = node->start_line <= file->ranges[k].end_line &&
+                          file->ranges[k].start_line <= node->end_line;
+            }
+            if (callable && valid_range && changed && !detect_symbol_list_add(symbols, node)) {
+                cbm_store_free_nodes(nodes, node_count);
+                return false;
+            }
+        }
+        cbm_store_free_nodes(nodes, node_count);
+    }
+    return true;
+}
+
+static int detect_symbol_qn_cmp(const void *left, const void *right) {
+    const detect_symbol_t *a = left;
+    const detect_symbol_t *b = right;
+    return strcmp(a->qn, b->qn);
+}
+
+/* Проверяет fields строго: неизвестные, нестроковые и повторные значения не
+ * должны молча менять форму ответа. */
+static bool detect_parse_fields(const char *args, detect_fields_t *fields, char *error,
+                                size_t error_size) {
+    memset(fields, 0, sizeof(*fields));
+    yyjson_doc *doc = yyjson_read(args, strlen(args), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *value = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "fields") : NULL;
+    if (!value) {
+        yyjson_doc_free(doc);
+        return true;
+    }
+    if (!yyjson_is_arr(value)) {
+        snprintf(error, error_size, "invalid fields: expected an array");
+        yyjson_doc_free(doc);
+        return false;
+    }
+    size_t index = 0;
+    size_t max = 0;
+    yyjson_val *item = NULL;
+    yyjson_arr_foreach(value, index, max, item) {
+        const char *name = yyjson_get_str(item);
+        detect_field_t field;
+        if (!name) {
+            snprintf(error, error_size, "invalid fields: every value must be a string");
+            yyjson_doc_free(doc);
+            return false;
+        }
+        if (strcmp(name, "label") == 0) {
+            field = DETECT_FIELD_LABEL;
+        } else if (strcmp(name, "file") == 0) {
+            field = DETECT_FIELD_FILE;
+        } else if (strcmp(name, "lines") == 0) {
+            field = DETECT_FIELD_LINES;
+        } else {
+            snprintf(error, error_size,
+                     "unknown detect_changes field \"%s\" — use label, file, or lines", name);
+            yyjson_doc_free(doc);
+            return false;
+        }
+        for (int i = 0; i < fields->count; i++) {
+            if (fields->items[i] == field) {
+                snprintf(error, error_size, "duplicate detect_changes field \"%s\"", name);
+                yyjson_doc_free(doc);
+                return false;
+            }
+        }
+        if (fields->count >= (int)(sizeof(fields->items) / sizeof(fields->items[0]))) {
+            snprintf(error, error_size, "too many detect_changes fields");
+            yyjson_doc_free(doc);
+            return false;
+        }
+        fields->items[fields->count++] = field;
+    }
+    yyjson_doc_free(doc);
+    return true;
+}
+
+static const char *detect_field_name(detect_field_t field) {
+    switch (field) {
+    case DETECT_FIELD_LABEL:
+        return "label";
+    case DETECT_FIELD_FILE:
+        return "file";
+    case DETECT_FIELD_LINES:
+        return "lines";
+    }
+    return "";
+}
+
+/* Сериализует полный отсортированный набор QN: список без fields и таблицу с
+ * единожды объявленными колонками при расширенном запросе. */
+static void detect_emit_changed_symbols_tree(cbm_sb_t *sb, const detect_symbol_list_t *symbols,
+                                             const detect_fields_t *fields) {
+    if (fields->count == 0) {
+        cbm_tree_list_header(sb, "changed_symbols", symbols->count);
+        for (int i = 0; i < symbols->count; i++) {
+            cbm_tree_list_item_str(sb, symbols->items[i].qn);
+        }
+        return;
+    }
+    const char *columns[4] = {"qn", NULL, NULL, NULL};
+    for (int i = 0; i < fields->count; i++) {
+        columns[i + 1] = detect_field_name(fields->items[i]);
+    }
+    cbm_tree_table_header(sb, "changed_symbols", symbols->count, columns, fields->count + 1);
+    for (int i = 0; i < symbols->count; i++) {
+        const detect_symbol_t *symbol = &symbols->items[i];
+        cbm_tree_row_begin(sb);
+        cbm_tree_cell_str(sb, symbol->qn, true);
+        for (int j = 0; j < fields->count; j++) {
+            if (fields->items[j] == DETECT_FIELD_LABEL) {
+                cbm_tree_cell_str(sb, symbol->label, false);
+            } else if (fields->items[j] == DETECT_FIELD_FILE) {
+                cbm_tree_cell_str(sb, symbol->file, false);
+            } else {
+                char lines[64];
+                snprintf(lines, sizeof(lines), "%d-%d", symbol->start_line, symbol->end_line);
+                cbm_tree_cell_str(sb, lines, false);
+            }
+        }
+        cbm_tree_row_end(sb);
+    }
+}
+
+/* JSON сохраняет ту же логическую модель: строки по умолчанию, либо объекты с
+ * обязательным qn и только явно запрошенными полями. */
+static yyjson_mut_val *detect_changed_symbols_json(yyjson_mut_doc *doc,
+                                                   const detect_symbol_list_t *symbols,
+                                                   const detect_fields_t *fields) {
+    yyjson_mut_val *array = yyjson_mut_arr(doc);
+    for (int i = 0; i < symbols->count; i++) {
+        const detect_symbol_t *symbol = &symbols->items[i];
+        if (fields->count == 0) {
+            yyjson_mut_arr_add_strcpy(doc, array, symbol->qn);
+            continue;
+        }
+        yyjson_mut_val *object = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, object, "qn", symbol->qn);
+        for (int j = 0; j < fields->count; j++) {
+            if (fields->items[j] == DETECT_FIELD_LABEL) {
+                yyjson_mut_obj_add_strcpy(doc, object, "label", symbol->label);
+            } else if (fields->items[j] == DETECT_FIELD_FILE) {
+                yyjson_mut_obj_add_strcpy(doc, object, "file", symbol->file);
+            } else {
+                yyjson_mut_val *lines = yyjson_mut_arr(doc);
+                yyjson_mut_arr_add_int(doc, lines, symbol->start_line);
+                yyjson_mut_arr_add_int(doc, lines, symbol->end_line);
+                yyjson_mut_obj_add_val(doc, object, "lines", lines);
+            }
+        }
+        yyjson_mut_arr_add_val(array, object);
+    }
+    return array;
 }
 
 /* Module key for the impacted rollup = the first TWO path segments
@@ -9866,17 +10257,36 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     char *base_branch = cbm_mcp_get_string_arg(args, "base_branch");
     char *since = cbm_mcp_get_string_arg(args, "since");
     char *scope = cbm_mcp_get_string_arg(args, "scope");
+    detect_fields_t fields;
+    char fields_error[CBM_SZ_256] = "";
+    if (!detect_parse_fields(args, &fields, fields_error, sizeof(fields_error))) {
+        free(project);
+        free(base_branch);
+        free(since);
+        free(scope);
+        return cbm_mcp_text_result(fields_error, true);
+    }
     int depth = cbm_mcp_get_int_arg(args, "depth", MCP_DEFAULT_BFS_DEPTH);
     depth = clamp_mcp_depth(depth, "detect_changes");
 
-    /* scope: "files" = just changed files, "symbols" = files + symbols (default) */
-    bool want_symbols = !scope || strcmp(scope, "symbols") == 0 || strcmp(scope, "impact") == 0;
+    bool scope_symbols = scope && strcmp(scope, "symbols") == 0;
+    bool scope_impact = !scope || strcmp(scope, "impact") == 0;
+    bool scope_files = scope && strcmp(scope, "files") == 0;
+    if (!scope_symbols && !scope_impact && !scope_files) {
+        char scope_error[CBM_SZ_256];
+        snprintf(scope_error, sizeof(scope_error),
+                 "invalid scope \"%s\" — use files, symbols, or impact", scope ? scope : "");
+        free(project);
+        free(base_branch);
+        free(since);
+        free(scope);
+        return cbm_mcp_text_result(scope_error, true);
+    }
+    bool want_exact_symbols = scope_symbols || scope_impact;
 
-    /* `since` (e.g. "HEAD~10", "v0.5.0") is the documented diff base but was
-     * previously parsed and never used: it takes precedence over base_branch.
-     * Route it through base_branch so the shared shell-arg validation and the
-     * existing `<base>...HEAD` (three-dot) diff apply unchanged — `since` thus
-     * adopts the same merge-base semantics base_branch already uses. */
+    /* `since` (например, HEAD~10 или v0.5.0) задаёт базу diff и имеет приоритет
+     * над base_branch. Перенос владения позволяет применить общую проверку
+     * shell-аргумента и затем строить точный diff от разрешённого merge-base. */
     if (since && since[0]) {
         free(base_branch);
         base_branch = since; /* transfer ownership */
@@ -9987,13 +10397,13 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     /* Direction of impact. Default inbound = the BLAST RADIUS: the transitive
      * CALLERS of the changed symbols, which may need review. outbound = what
      * the changed code depends on; both = union. */
-    char *direction = cbm_mcp_get_string_arg(args, "direction");
-    if (!direction) {
+    char *direction = scope_symbols ? NULL : cbm_mcp_get_string_arg(args, "direction");
+    if (!scope_symbols && !direction) {
         direction = heap_strdup("inbound");
     }
-    /* Teaching error, same contract as trace_path: never silently correct an
-     * unknown direction — the caller would misread the result's semantics. */
-    if (strcmp(direction, "inbound") != 0 && strcmp(direction, "outbound") != 0 &&
+    /* В symbols направление не имеет смысла и намеренно не разбирается. В
+     * остальных режимах неизвестное значение нельзя молча исправлять. */
+    if (!scope_symbols && strcmp(direction, "inbound") != 0 && strcmp(direction, "outbound") != 0 &&
         strcmp(direction, "both") != 0) {
         char errbuf[CBM_SZ_256];
         snprintf(errbuf, sizeof(errbuf),
@@ -10023,14 +10433,9 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         imp_limit = MCP_BFS_LIMIT_MAX;
     }
 
-    /* Collect changed file paths into a C array (drives seeds, the rollup, and
-     * both output encodings). */
-    char **files = NULL;
-    int file_count = 0;
-    int file_cap = 0;
-    int64_t *seeds = NULL;
-    int seed_count = 0;
-    int seed_cap = 0;
+    /* Список путей объединяет три Git-источника; status дополнительно отмечает
+     * untracked/staged-new файлы, которые считаются изменёнными целиком. */
+    detect_file_list_t files = {0};
 
     char line[CBM_SZ_1K];
     while (fgets(line, sizeof(line), fp)) {
@@ -10044,8 +10449,10 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         /* Strip the `git status --porcelain` 2-char code + space; for a rename
          * ("R  old -> new") keep the destination path. */
         char *path_line = line;
-        if (len > PAIR_LEN && line[PAIR_LEN] == ' ' && strchr(" MADRCU?!", line[0]) &&
-            strchr(" MADRCU?!", line[1])) {
+        bool status_line = len > PAIR_LEN && line[PAIR_LEN] == ' ' &&
+                           strchr(" MADRCU?!", line[0]) && strchr(" MADRCU?!", line[1]);
+        bool whole_file = status_line && ((line[0] == '?' && line[1] == '?') || line[0] == 'A');
+        if (status_line) {
             path_line = line + PAIR_LEN + SKIP_ONE;
             char *arrow = strstr(path_line, " -> ");
             if (arrow) {
@@ -10056,33 +10463,24 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         if (path_line[0] == '\0') {
             continue;
         }
-        /* Dedup: the three git sources are sorted+unioned on POSIX but not on
-         * Windows (separate commands), and a path can repeat. */
-        bool dup = false;
-        for (int i = 0; i < file_count; i++) {
-            if (strcmp(files[i], path_line) == 0) {
-                dup = true;
-                break;
-            }
-        }
-        if (dup) {
-            continue;
-        }
-        if (file_count >= file_cap) {
-            file_cap = file_cap ? file_cap * 2 : 16;
-            files = safe_realloc(files, (size_t)file_cap * sizeof(char *));
-        }
-        files[file_count++] = heap_strdup(path_line);
-        if (want_symbols) {
-            detect_collect_seeds(store, project, path_line, &seeds, &seed_count, &seed_cap);
+        if (!detect_file_list_add(&files, path_line, whole_file)) {
+            (void)fclose(fp);
+            (void)cbm_unlink(output_path);
+            detect_file_list_free(&files);
+            free(direction);
+            free(root_path);
+            free(project);
+            free(base_branch);
+            free(scope);
+            return cbm_mcp_text_result("out of memory while collecting changed files", true);
         }
     }
     (void)fclose(fp);
     (void)cbm_unlink(output_path);
     int git_status = git_result.exit_code;
 
-    /* merge-base SHA: the exact commit the diff is measured against, so the
-     * result is reproducible even as base_branch advances. Best-effort. */
+    /* merge-base SHA: точная база последующего patch. Для symbols/impact её
+     * отсутствие является ошибкой; files сохраняет прежний best-effort режим. */
     char merge_base[64] = "";
     {
         char mbcmd[CBM_SZ_2K];
@@ -10115,11 +10513,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
             (void)cbm_unlink(mb_output_path);
         }
         if (mb_cancelled || mb_containment_failed) {
-            for (int i = 0; i < file_count; i++) {
-                free(files[i]);
-            }
-            free(files);
-            free(seeds);
+            detect_file_list_free(&files);
             free(direction);
             free(root_path);
             free(project);
@@ -10132,15 +10526,104 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
-    /* The impact traversal: ONE multi-source BFS over all seeds. */
+    detect_symbol_list_t changed_symbols = {0};
+    if (want_exact_symbols) {
+        if (!merge_base[0]) {
+            detect_file_list_free(&files);
+            free(direction);
+            free(root_path);
+            free(project);
+            free(base_branch);
+            free(scope);
+            return cbm_mcp_text_result("git merge-base failed: could not resolve the diff base",
+                                       true);
+        }
+
+        /* Один итоговый patch merge-base -> worktree включает committed,
+         * staged и unstaged изменения отслеживаемых файлов. */
+        char patch_command[CBM_SZ_8K];
+#ifdef _WIN32
+        snprintf(patch_command, sizeof(patch_command),
+                 "git -C \"%s\" -c core.quotePath=false diff --find-renames --no-ext-diff "
+                 "--no-color --unified=0 \"%s\" 2>NUL",
+                 root_path, merge_base);
+#else
+        snprintf(patch_command, sizeof(patch_command),
+                 "git -C '%s' -c core.quotePath=false diff --find-renames --no-ext-diff "
+                 "--no-color --unified=0 '%s' 2>/dev/null",
+                 root_path, merge_base);
+#endif
+        char patch_path[CBM_SZ_2K] = {0};
+        cbm_proc_result_t patch_result = {0};
+        int patch_run =
+            mcp_run_shell_command_cancellable(srv, patch_command, patch_path, &patch_result);
+        bool patch_cancelled = patch_result.cancellation_requested || mcp_request_cancelled(srv);
+        FILE *patch =
+            patch_run == 0 && patch_result.exit_code == 0 ? cbm_fopen(patch_path, "rb") : NULL;
+        bool patch_ok = patch && !patch_cancelled && detect_parse_patch(patch, &files);
+        if (patch) {
+            (void)fclose(patch);
+        }
+        if (patch_path[0]) {
+            (void)cbm_unlink(patch_path);
+        }
+        if (!patch_ok) {
+            detect_file_list_free(&files);
+            free(direction);
+            free(root_path);
+            free(project);
+            free(base_branch);
+            free(scope);
+            return cbm_mcp_text_result(
+                patch_cancelled ? "detect_changes cancelled for this request"
+                                : "git diff failed while resolving changed symbol ranges",
+                true);
+        }
+        if (!detect_collect_changed_symbols(store, project, &files, &changed_symbols)) {
+            detect_file_list_free(&files);
+            detect_symbol_list_free(&changed_symbols);
+            free(direction);
+            free(root_path);
+            free(project);
+            free(base_branch);
+            free(scope);
+            return cbm_mcp_text_result("could not resolve changed symbols from the current index",
+                                       true);
+        }
+        if (changed_symbols.count > 1) {
+            qsort(changed_symbols.items, (size_t)changed_symbols.count,
+                  sizeof(*changed_symbols.items), detect_symbol_qn_cmp);
+        }
+    }
+
+    int64_t *seeds = NULL;
+    int seed_count = changed_symbols.count;
+    if (scope_impact && seed_count > 0) {
+        seeds = malloc((size_t)seed_count * sizeof(*seeds));
+        if (!seeds) {
+            detect_file_list_free(&files);
+            detect_symbol_list_free(&changed_symbols);
+            free(direction);
+            free(root_path);
+            free(project);
+            free(base_branch);
+            free(scope);
+            return cbm_mcp_text_result("out of memory while preparing impact traversal", true);
+        }
+        for (int i = 0; i < seed_count; i++) {
+            seeds[i] = changed_symbols.items[i].id;
+        }
+    }
+
+    /* Impact использует один BFS от полного набора точных изменённых узлов. */
     cbm_traverse_result_t impact = {0};
     bool truncated = false;
-    if (want_symbols && seed_count > 0) {
+    if (scope_impact && seed_count > 0) {
         (void)cbm_store_bfs_multi(store, seeds, seed_count, direction, NULL, 0, depth,
                                   MCP_BFS_LIMIT_MAX, &impact, &truncated);
     }
 
-    bool is_error = (git_status != 0 && file_count == 0);
+    bool is_error = (git_status != 0 && files.count == 0);
     char *out_str = NULL;
 
     if (!legacy_json) {
@@ -10150,25 +10633,30 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         if (merge_base[0]) {
             cbm_tree_scalar_str(&sb, "merge_base", merge_base);
         }
-        cbm_tree_scalar_str(&sb, "direction", direction);
-        if (is_error) {
-            char hint_buf[CBM_SZ_256];
-            snprintf(hint_buf, sizeof(hint_buf),
-                     "git diff exited with status %d. Check that branch '%s' exists.", git_status,
-                     base_branch);
-            cbm_tree_scalar_str(&sb, "hint", hint_buf);
+        if (scope_symbols) {
+            detect_emit_changed_symbols_tree(&sb, &changed_symbols, &fields);
+        } else {
+            cbm_tree_scalar_str(&sb, "direction", direction);
+            if (is_error) {
+                char hint_buf[CBM_SZ_256];
+                snprintf(hint_buf, sizeof(hint_buf),
+                         "git diff exited with status %d. Check that branch '%s' exists.",
+                         git_status, base_branch);
+                cbm_tree_scalar_str(&sb, "hint", hint_buf);
+            }
+            /* changed files (the git result) */
+            char cf[CBM_SZ_64];
+            snprintf(cf, sizeof(cf), "changed_files: %d\n", files.count);
+            cbm_sb_append(&sb, cf);
+            for (int i = 0; i < files.count; i++) {
+                cbm_sb_append(&sb, "  ");
+                cbm_sb_append(&sb, files.items[i].path);
+                cbm_sb_append(&sb, "\n");
+            }
+            cbm_tree_scalar_int(&sb, "seed_symbols", seed_count);
         }
-        /* changed files (the git result) */
-        char cf[CBM_SZ_64];
-        snprintf(cf, sizeof(cf), "changed_files: %d\n", file_count);
-        cbm_sb_append(&sb, cf);
-        for (int i = 0; i < file_count; i++) {
-            cbm_sb_append(&sb, "  ");
-            cbm_sb_append(&sb, files[i]);
-            cbm_sb_append(&sb, "\n");
-        }
-        cbm_tree_scalar_int(&sb, "seed_symbols", seed_count);
-        if (want_symbols) {
+        if (scope_impact) {
+            detect_emit_changed_symbols_tree(&sb, &changed_symbols, &fields);
             detect_emit_impacted_tree(&sb, &impact, imp_limit);
             /* module rollup: a quotient view of the blast radius */
             if (impact.visited_count > 0) {
@@ -10209,73 +10697,82 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         if (merge_base[0]) {
             yyjson_mut_obj_add_strcpy(doc, root_obj, "merge_base", merge_base);
         }
-        yyjson_mut_obj_add_strcpy(doc, root_obj, "direction", direction);
-        yyjson_mut_val *cf = yyjson_mut_arr(doc);
-        for (int i = 0; i < file_count; i++) {
-            yyjson_mut_arr_add_strcpy(doc, cf, files[i]);
-        }
-        yyjson_mut_obj_add_val(doc, root_obj, "changed_files", cf);
-        yyjson_mut_obj_add_int(doc, root_obj, "seed_symbols", seed_count);
-        yyjson_mut_obj_add_int(doc, root_obj, "impacted_total", impact.visited_count);
-        int imp_shown = impact.visited_count < imp_limit ? impact.visited_count : imp_limit;
-        yyjson_mut_obj_add_int(doc, root_obj, "impacted_shown", imp_shown);
-        yyjson_mut_val *imp = yyjson_mut_arr(doc);
-        for (int i = 0; i < imp_shown; i++) {
-            yyjson_mut_val *o = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_strcpy(
-                doc, o, "qn",
-                impact.visited[i].node.qualified_name ? impact.visited[i].node.qualified_name : "");
-            yyjson_mut_obj_add_strcpy(
-                doc, o, "label", impact.visited[i].node.label ? impact.visited[i].node.label : "");
-            yyjson_mut_obj_add_strcpy(
-                doc, o, "file",
-                impact.visited[i].node.file_path ? impact.visited[i].node.file_path : "");
-            yyjson_mut_obj_add_int(doc, o, "hop", impact.visited[i].hop);
-            yyjson_mut_arr_add_val(imp, o);
-        }
-        yyjson_mut_obj_add_val(doc, root_obj, "impacted", imp);
-        /* Model parity with the tree encoding: the complete module rollup. */
-        if (impact.visited_count > 0) {
-            char (*mods)[CBM_SZ_128] = malloc(DETECT_MODCAP * CBM_SZ_128);
-            int *mcnt = malloc(DETECT_MODCAP * sizeof(int));
-            if (mods && mcnt) {
-                int overflow = 0;
-                int nmods = detect_module_rollup(&impact, mods, mcnt, &overflow);
-                yyjson_mut_val *rollup = yyjson_mut_arr(doc);
-                for (int j = 0; j < nmods; j++) {
-                    yyjson_mut_val *o = yyjson_mut_obj(doc);
-                    yyjson_mut_obj_add_strcpy(doc, o, "module", mods[j]);
-                    yyjson_mut_obj_add_int(doc, o, "count", mcnt[j]);
-                    yyjson_mut_arr_add_val(rollup, o);
-                }
-                if (overflow > 0) {
-                    yyjson_mut_val *o = yyjson_mut_obj(doc);
-                    yyjson_mut_obj_add_strcpy(doc, o, "module", "(other)");
-                    yyjson_mut_obj_add_int(doc, o, "count", overflow);
-                    yyjson_mut_arr_add_val(rollup, o);
-                }
-                yyjson_mut_obj_add_val(doc, root_obj, "impacted_modules", rollup);
+        if (scope_symbols) {
+            yyjson_mut_obj_add_val(doc, root_obj, "changed_symbols",
+                                   detect_changed_symbols_json(doc, &changed_symbols, &fields));
+        } else {
+            yyjson_mut_obj_add_strcpy(doc, root_obj, "direction", direction);
+            yyjson_mut_val *cf = yyjson_mut_arr(doc);
+            for (int i = 0; i < files.count; i++) {
+                yyjson_mut_arr_add_strcpy(doc, cf, files.items[i].path);
             }
-            free(mods);
-            free(mcnt);
-        }
-        yyjson_mut_obj_add_bool(doc, root_obj, "truncated", truncated);
-        if (is_error) {
-            char hint_buf[CBM_SZ_256];
-            snprintf(hint_buf, sizeof(hint_buf),
-                     "git diff exited with status %d. Check that branch '%s' exists.", git_status,
-                     base_branch);
-            yyjson_mut_obj_add_strcpy(doc, root_obj, "hint", hint_buf);
+            yyjson_mut_obj_add_val(doc, root_obj, "changed_files", cf);
+            yyjson_mut_obj_add_int(doc, root_obj, "seed_symbols", seed_count);
+            if (scope_impact) {
+                yyjson_mut_obj_add_val(doc, root_obj, "changed_symbols",
+                                       detect_changed_symbols_json(doc, &changed_symbols, &fields));
+            }
+            yyjson_mut_obj_add_int(doc, root_obj, "impacted_total", impact.visited_count);
+            int imp_shown = impact.visited_count < imp_limit ? impact.visited_count : imp_limit;
+            yyjson_mut_obj_add_int(doc, root_obj, "impacted_shown", imp_shown);
+            yyjson_mut_val *imp = yyjson_mut_arr(doc);
+            for (int i = 0; i < imp_shown; i++) {
+                yyjson_mut_val *o = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, o, "qn",
+                                          impact.visited[i].node.qualified_name
+                                              ? impact.visited[i].node.qualified_name
+                                              : "");
+                yyjson_mut_obj_add_strcpy(
+                    doc, o, "label",
+                    impact.visited[i].node.label ? impact.visited[i].node.label : "");
+                yyjson_mut_obj_add_strcpy(
+                    doc, o, "file",
+                    impact.visited[i].node.file_path ? impact.visited[i].node.file_path : "");
+                yyjson_mut_obj_add_int(doc, o, "hop", impact.visited[i].hop);
+                yyjson_mut_arr_add_val(imp, o);
+            }
+            yyjson_mut_obj_add_val(doc, root_obj, "impacted", imp);
+            /* Model parity with the tree encoding: the complete module rollup. */
+            if (impact.visited_count > 0) {
+                char (*mods)[CBM_SZ_128] = malloc(DETECT_MODCAP * CBM_SZ_128);
+                int *mcnt = malloc(DETECT_MODCAP * sizeof(int));
+                if (mods && mcnt) {
+                    int overflow = 0;
+                    int nmods = detect_module_rollup(&impact, mods, mcnt, &overflow);
+                    yyjson_mut_val *rollup = yyjson_mut_arr(doc);
+                    for (int j = 0; j < nmods; j++) {
+                        yyjson_mut_val *o = yyjson_mut_obj(doc);
+                        yyjson_mut_obj_add_strcpy(doc, o, "module", mods[j]);
+                        yyjson_mut_obj_add_int(doc, o, "count", mcnt[j]);
+                        yyjson_mut_arr_add_val(rollup, o);
+                    }
+                    if (overflow > 0) {
+                        yyjson_mut_val *o = yyjson_mut_obj(doc);
+                        yyjson_mut_obj_add_strcpy(doc, o, "module", "(other)");
+                        yyjson_mut_obj_add_int(doc, o, "count", overflow);
+                        yyjson_mut_arr_add_val(rollup, o);
+                    }
+                    yyjson_mut_obj_add_val(doc, root_obj, "impacted_modules", rollup);
+                }
+                free(mods);
+                free(mcnt);
+            }
+            yyjson_mut_obj_add_bool(doc, root_obj, "truncated", truncated);
+            if (is_error) {
+                char hint_buf[CBM_SZ_256];
+                snprintf(hint_buf, sizeof(hint_buf),
+                         "git diff exited with status %d. Check that branch '%s' exists.",
+                         git_status, base_branch);
+                yyjson_mut_obj_add_strcpy(doc, root_obj, "hint", hint_buf);
+            }
         }
         out_str = yy_doc_to_str(doc);
         yyjson_mut_doc_free(doc);
     }
 
     cbm_store_traverse_free(&impact);
-    for (int i = 0; i < file_count; i++) {
-        free(files[i]);
-    }
-    free(files);
+    detect_file_list_free(&files);
+    detect_symbol_list_free(&changed_symbols);
     free(seeds);
     free(direction);
     free(root_path);
