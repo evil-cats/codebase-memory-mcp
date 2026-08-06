@@ -7102,7 +7102,10 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
                 "\n"
                 "func Run() {\n"
                 "\t// server\n"
-                "}\n");
+                "}\n"
+                "\n"
+                "func SingleLine() {}\n"
+                "var snippetNeighbor = \"must not leak\"\n");
     fclose(fp);
 
     /* Create server with in-memory store */
@@ -7164,6 +7167,16 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     n_run2.start_line = 11;
     n_run2.end_line = 13;
     cbm_store_upsert_node(st, &n_run2);
+
+    cbm_node_t n_single = {0};
+    n_single.project = proj_name;
+    n_single.label = "Function";
+    n_single.name = "SingleLine";
+    n_single.qualified_name = "cmd.server.main.SingleLine";
+    n_single.file_path = "main.go";
+    n_single.start_line = 15;
+    n_single.end_line = 15;
+    cbm_store_upsert_node(st, &n_single);
 
     /* Create edges: HandleRequest -> ProcessOrder, HandleRequest -> Run1 */
     cbm_edge_t e1 = {.project = proj_name, .source_id = id_hr, .target_id = id_po, .type = "CALLS"};
@@ -7277,6 +7290,27 @@ TEST(snippet_exact_qn) {
     /* Caller/callee counts: 0 callers, 2 callees */
     ASSERT_NOT_NULL(strstr(resp, "\"callers\":0"));
     ASSERT_NOT_NULL(strstr(resp, "\"callees\":2"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* Однострочный символ должен возвращаться без резервного расширения диапазона. */
+TEST(snippet_single_line_exact_range) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = call_snippet(srv, "{\"qualified_name\":\"cmd.server.main.SingleLine\","
+                                   "\"project\":\"test-project\","
+                                   "\"include_neighbors\":false}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"start_line\":15"));
+    ASSERT_NOT_NULL(strstr(resp, "\"end_line\":15"));
+    ASSERT_NOT_NULL(strstr(resp, "func SingleLine() {}"));
+    ASSERT_NULL(strstr(resp, "snippetNeighbor"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -10660,6 +10694,7 @@ SUITE(mcp) {
 
     /* Snippet resolution (port of snippet_test.go) */
     RUN_TEST(snippet_exact_qn);
+    RUN_TEST(snippet_single_line_exact_range);
     RUN_TEST(snippet_qn_suffix);
     RUN_TEST(snippet_unique_short_name);
     RUN_TEST(snippet_name_tier);
