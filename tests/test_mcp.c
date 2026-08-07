@@ -1895,11 +1895,10 @@ TEST(tool_get_code_snippet_clips_whole_file_node) {
 }
 
 TEST(tool_search_graph_includes_node_properties) {
-    /* Node properties are OPT-IN columns in the default TOON output: the
-     * default row is qn/label/file/lines/degrees only, `fields` adds the
-     * requested property columns, and format:"json" restores the legacy
-     * verbose objects with the full property blob. The setup_snippet_server
-     * inserts HandleRequest with a signature/return_type/is_exported blob. */
+    /* Свойства узла в `search_graph` включаются только через `fields`: базовая
+     * строка содержит полный qn, метаданные и степени, а JSON сохраняет тот же
+     * плоский порядок столбцов. setup_snippet_server создаёт HandleRequest с
+     * signature/return_type/is_exported. */
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
@@ -1915,7 +1914,7 @@ TEST(tool_search_graph_includes_node_properties) {
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "results:")); /* TOON table header */
-    ASSERT_NOT_NULL(strstr(inner, "(rows: qn_suffix name label lines in out;"));
+    ASSERT_NOT_NULL(strstr(inner, "(cols: qn name label file lines in out)"));
     ASSERT_NOT_NULL(strstr(inner, "HandleRequest"));
     ASSERT_NULL(strstr(inner, "test-project."));
     ASSERT_NULL(strstr(inner, "func HandleRequest")); /* signature not spilled */
@@ -1932,16 +1931,15 @@ TEST(tool_search_graph_includes_node_properties) {
     ASSERT_NOT_NULL(resp);
     inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "(rows: qn_suffix name label lines in out signature;"));
+    ASSERT_NOT_NULL(strstr(inner, "(cols: qn name label file lines in out signature)"));
     /* values with spaces are QUOTED so column positions survive */
     ASSERT_NOT_NULL(strstr(inner, "\"func HandleRequest() error\""));
     ASSERT_NOT_NULL(strstr(inner, "func HandleRequest"));
     free(inner);
     free(resp);
 
-    /* format:"json" = json-stringified tree: same grouped model, column-
-     * ordered row arrays — never per-row key envelopes or property blobs.
-     * fields adds columns there too. */
+    /* format:"json" = плоские строковые массивы с теми же столбцами, без
+     * групп, префиксов и развёрнутых property blobs. */
     resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":44,\"method\":\"tools/call\","
              "\"params\":{\"name\":\"search_graph\","
@@ -1951,13 +1949,68 @@ TEST(tool_search_graph_includes_node_properties) {
     ASSERT_NOT_NULL(resp);
     inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "\"qn_prefix\"")); /* grouped tree model */
+    ASSERT_NOT_NULL(strstr(inner, "\"qn\""));
     ASSERT_NOT_NULL(strstr(inner, "\"cols\""));
     ASSERT_NOT_NULL(strstr(inner, "\"rows\""));
     ASSERT_NOT_NULL(strstr(inner, "\"signature\""));      /* requested column */
     ASSERT_NOT_NULL(strstr(inner, "func HandleRequest")); /* its value */
+    ASSERT_NULL(strstr(inner, "\"qn_prefix\""));
+    ASSERT_NULL(strstr(inner, "\"groups\""));
     ASSERT_NULL(strstr(inner, "test-project."));
     ASSERT_NULL(strstr(inner, "is_exported")); /* blob never spills */
+    free(inner);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_search_graph_keeps_cpp_variadic_qn_intact) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *qn = "libs.sniper.log.log.log_info<typename...T0>(const char*,const T0&...)";
+    cbm_node_t node = {0};
+    node.project = "test-project";
+    node.label = "Function";
+    node.name = "log_info";
+    node.qualified_name = qn;
+    node.file_path = "libs/sniper/log/log.h";
+    node.start_line = 315;
+    node.end_line = 319;
+    node.properties_json = "{\"signature\":\"(const char* fmt, const Args&... args)\"}";
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":46,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"test-project\",\"name_pattern\":\"^log_info$\","
+             "\"fields\":[\"signature\"],\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, qn));
+    ASSERT_NULL(strstr(inner, "qn_suffix"));
+    ASSERT_NULL(strstr(inner, "group prefix"));
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":47,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"test-project\",\"name_pattern\":\"^log_info$\","
+             "\"format\":\"json\",\"fields\":[\"signature\"],\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, qn));
+    ASSERT_NOT_NULL(strstr(inner, "\"rows\""));
+    ASSERT_NULL(strstr(inner, "\"qn_prefix\""));
+    ASSERT_NULL(strstr(inner, "\"groups\""));
     free(inner);
     free(resp);
 
@@ -2659,6 +2712,77 @@ TEST(tool_trace_call_path_ambiguous) {
     PASS();
 }
 
+TEST(tool_trace_path_keeps_cpp_variadic_qn_intact) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "trace-qn-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/trace-qn"), CBM_STORE_OK);
+
+    const char *seed_qn =
+        "libs.sniper.log.log.log_info<typename...T0>(const char*,const T0&...)";
+    const char *callee_qn =
+        "libs.sniper.log.log.log_write<typename...T0>(const char*,const T0&...)";
+    cbm_node_t seed = {.project = proj,
+                       .label = "Function",
+                       .name = "log_info",
+                       .qualified_name = seed_qn,
+                       .file_path = "libs/sniper/log/log.h",
+                       .start_line = 315,
+                       .end_line = 319};
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "log_write",
+                         .qualified_name = callee_qn,
+                         .file_path = "libs/sniper/log/log.h",
+                         .start_line = 357,
+                         .end_line = 361};
+    int64_t seed_id = cbm_store_upsert_node(st, &seed);
+    int64_t callee_id = cbm_store_upsert_node(st, &callee);
+    ASSERT_GT(seed_id, 0);
+    ASSERT_GT(callee_id, 0);
+    cbm_edge_t edge = {
+        .project = proj, .source_id = seed_id, .target_id = callee_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{"
+             "\"qualified_name\":\"libs.sniper.log.log.log_info<typename...T0>(const char*,"
+             "const T0&...)\",\"project\":\"trace-qn-proj\",\"direction\":\"outbound\","
+             "\"depth\":1}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "callees: 1  (cols: qn hop)"));
+    ASSERT_NOT_NULL(strstr(inner, callee_qn));
+    ASSERT_NULL(strstr(inner, "qn_suffix"));
+    ASSERT_NULL(strstr(inner, "group prefix"));
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":64,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{"
+             "\"qualified_name\":\"libs.sniper.log.log.log_info<typename...T0>(const char*,"
+             "const T0&...)\",\"project\":\"trace-qn-proj\",\"direction\":\"outbound\","
+             "\"depth\":1,\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, callee_qn));
+    ASSERT_NOT_NULL(strstr(inner, "\"rows\""));
+    ASSERT_NULL(strstr(inner, "\"qn_prefix\""));
+    ASSERT_NULL(strstr(inner, "\"groups\""));
+    free(inner);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Перегрузки должны оставаться отдельными во всех трёх MCP-инструментах:
  * поиск перечисляет набор, неточный выбор возвращает кандидатов, а точный QN
  * читает и трассирует только одну сигнатуру. */
@@ -2874,8 +2998,8 @@ TEST(tool_trace_union_records_min_hop_across_seeds) {
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
     /* tgt is one hop from seed B — the union must record hop 1, not seed A's 2. */
-    ASSERT_NOT_NULL(strstr(inner, "  tgt 1"));
-    ASSERT_NULL(strstr(inner, "  tgt 2"));
+    ASSERT_NOT_NULL(strstr(inner, "  c.tgt 1"));
+    ASSERT_NULL(strstr(inner, "  c.tgt 2"));
     free(inner);
     free(resp);
     cbm_mcp_server_free(srv);
@@ -2966,7 +3090,7 @@ TEST(tool_trace_pagination_exactly_once) {
     /* Exactly-once: every callee appears on exactly ONE page. */
     for (int i = 0; i < CALLEES; i++) {
         char qn[48];
-        snprintf(qn, sizeof(qn), "  c%02d 1\n", i);
+        snprintf(qn, sizeof(qn), "  m.c%02d 1\n", i);
         int seen = 0;
         for (int p = 0; p < 3; p++) {
             if (strstr(pages[p], qn)) {
@@ -10580,6 +10704,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_cycles_detects_scc);
     RUN_TEST(tool_get_code_snippet_clips_whole_file_node);
     RUN_TEST(tool_search_graph_includes_node_properties);
+    RUN_TEST(tool_search_graph_keeps_cpp_variadic_qn_intact);
     RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
     RUN_TEST(tool_lean_defaults_schema_and_status);
     RUN_TEST(tool_output_regression_gate);
@@ -10599,6 +10724,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_not_found);
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_call_path_ambiguous);
+    RUN_TEST(tool_trace_path_keeps_cpp_variadic_qn_intact);
     RUN_TEST(tool_cpp_overloads_are_separate_and_exactly_addressable);
     RUN_TEST(tool_trace_union_records_min_hop_across_seeds);
     RUN_TEST(tool_trace_pagination_exactly_once);

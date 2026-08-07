@@ -386,15 +386,14 @@ static const tool_def_t TOOLS[] = {
      "(2) name_pattern='.*regex.*' for exact pattern matching; (3) semantic_query=[...] for "
      "vector cosine search that bridges vocabulary (finds 'publish' when you search 'send'). "
      "The three modes are independent and can be combined in a single call. "
-     "RESPONSE: prefix-grouped tree rows by default — a shared (qn-prefix, file) group "
-     "header printed once, then `qn_suffix name label lines in out` per row "
-     "(full qn = group prefix + dot + qn_suffix). C++ overloads are separate rows. "
+     "RESPONSE: flat rows by default. Each row starts with its complete `qn`, followed by "
+     "name, label, file, lines, in, and out. C++ overloads are separate rows. "
      "Use name_pattern to find all overloads by their existing short name. "
      "in/out = TOTAL degree across ALL edge types (DEFINES, "
      "USAGE, CALLS, ...), NOT caller/callee counts — use trace_path for callers. Add per-node "
      "property columns via "
      "fields (e.g. [\"complexity\",\"signature\",\"docstring\"]); format=\"json\" returns "
-     "the SAME tree model as structured JSON. "
+     "the same flat row model as structured JSON. "
      "PAGINATION: results are capped at limit (default 50). The response always includes "
      "'total' (full match count before limit) and 'has_more' (true when total > "
      "offset+returned). Detect truncation with has_more, then page by re-calling with "
@@ -424,8 +423,8 @@ static const tool_def_t TOOLS[] = {
      "\"description\":\"Skip the first N matching nodes. Combine with 'limit' to page: "
      "increment offset by limit and re-call while has_more is true.\"},"
      "\"format\":{\"type\":\"string\",\"enum\":[\"tree\",\"json\"],\"default\":\"tree\","
-     "\"description\":\"Response encoding. tree (default): prefix-grouped text rows. "
-     "json: the SAME tree model as structured JSON (groups + column-ordered row arrays).\"},"
+     "\"description\":\"Response encoding. tree (default): flat text rows with a complete qn "
+     "in every row. json: the same flat model with column-ordered row arrays.\"},"
      "\"fields\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":"
      "\"Extra per-node property columns, e.g. complexity, cognitive, "
      "signature, docstring, return_type, is_test, lines(int). Core row columns "
@@ -476,13 +475,12 @@ static const tool_def_t TOOLS[] = {
      "Use INSTEAD OF grep for callers, dependencies, impact analysis, or data flow tracing. "
      "Pass qualified_name for an exact overload. Short or base names that match multiple "
      "overloads return candidates and are never merged. "
-     "RESPONSE: prefix-grouped tree rows — callees/callers grouped under their shared "
-     "qn-prefix, `qn_suffix hop` per row (full qn = group prefix + dot + qn_suffix); exact "
+     "RESPONSE: flat callee/caller rows — each row starts with its complete `qn`, then hop; exact "
      "callees_total/callers_total on every page = ALL nodes reachable within depth (transitive, "
      "not just direct; test files excluded unless include_tests). risk/args flags use a flat "
      "table. "
      "`truncated: true` + `next` = more rows — pass next back as cursor. "
-     "format=\"json\" returns the SAME tree model as structured JSON.",
+     "format=\"json\" returns the same flat row model as structured JSON.",
      "{\"type\":\"object\",\"properties\":{\"function_name\":{\"type\":\"string\","
      "\"description\":\"Short name for discovery; ambiguous matches return candidates.\"},"
      "\"qualified_name\":{\"type\":\"string\",\"description\":"
@@ -509,8 +507,8 @@ static const tool_def_t TOOLS[] = {
      "\"description\":\"Include test files in results. When false (default), test files are "
      "filtered out. When true, test nodes are included with a test column/marker.\"},"
      "\"format\":{\"type\":\"string\",\"enum\":[\"tree\",\"json\"],\"default\":\"tree\","
-     "\"description\":\"Response encoding. tree (default): prefix-grouped text rows. "
-     "json: the SAME tree model as structured JSON (groups + column-ordered row arrays).\"}},"
+     "\"description\":\"Response encoding. tree (default): flat text rows with a complete qn "
+     "in every row. json: the same flat model with column-ordered row arrays.\"}},"
      "\"required\":[\"project\"]}"},
 
     {"get_code_snippet", "Get code snippet",
@@ -3020,10 +3018,9 @@ static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const 
     return type_error;
 }
 
-/* ── Tree output for search_graph ───────────────────────────────────
- * Default response encoding: grouped tree rows (compact_out.h). The same
- * model is available as structured JSON via format:"json"; include_connected
- * adds a `connected` column in BOTH encodings. */
+/* ── Плоский вывод `search_graph` ───────────────────────────────────
+ * Каждый результат содержит полный QN. format:"json" повторяет тот же набор
+ * строк; include_connected добавляет столбец `connected` в оба представления. */
 
 enum { SG_MAX_EXTRA_FIELDS = 12 };
 
@@ -3125,13 +3122,17 @@ static void sg_lines_str(char *out, size_t sz, int start, int end) {
     }
 }
 
-/* Emit the regex-path search results as a TOON table. */
-static void emit_search_results_toon(cbm_sb_t *sb, const cbm_search_output_t *out, int offset,
-                                     const char *const *fields, int nfields, bool detail_ids) {
+static int sg_cmp_by_qn(const void *pa, const void *pb);
+
+/* Выводит результаты `search_graph` плоскими строками с полным QN в каждой из них. */
+static void emit_search_results_toon(cbm_sb_t *sb, cbm_search_output_t *out, int offset,
+                                     const char *const *fields, int nfields, cbm_store_t *store,
+                                     const char *relationship, bool include_connected,
+                                     bool detail_ids) {
     cbm_tree_scalar_int(sb, "total", out->total);
     if (detail_ids) {
-        /* ids tier: bare qn enumeration — for "list everything matching X"
-         * sweeps where per-row metadata is noise (LocAgent's fold tier). */
+        /* Режим ids сохраняет только полный QN для широких перечислений, где
+         * остальные данные строки не нужны. */
         static const char *const id_cols[] = {"qn"};
         cbm_tree_table_header(sb, "results", out->count, id_cols, 1);
         for (int i = 0; i < out->count; i++) {
@@ -3142,13 +3143,19 @@ static void emit_search_results_toon(cbm_sb_t *sb, const cbm_search_output_t *ou
         cbm_tree_scalar_bool(sb, "has_more", out->total > offset + out->count);
         return;
     }
-    const char *cols[7 + SG_MAX_EXTRA_FIELDS] = {"qn",    "name", "label", "file",
+    const char *cols[8 + SG_MAX_EXTRA_FIELDS] = {"qn",    "name", "label", "file",
                                                  "lines", "in",   "out"};
     int ncols = 7;
     for (int f = 0; f < nfields; f++) {
         cols[ncols++] = fields[f];
     }
+    if (include_connected) {
+        cols[ncols++] = "connected";
+    }
     cbm_tree_table_header(sb, "results", out->count, cols, ncols);
+    if (out->count > 1) {
+        qsort(out->results, (size_t)out->count, sizeof(cbm_search_result_t), sg_cmp_by_qn);
+    }
     for (int i = 0; i < out->count; i++) {
         const cbm_search_result_t *sr = &out->results[i];
         char lines[CBM_SZ_32];
@@ -3162,21 +3169,18 @@ static void emit_search_results_toon(cbm_sb_t *sb, const cbm_search_output_t *ou
         cbm_tree_cell_int(sb, sr->in_degree, false);
         cbm_tree_cell_int(sb, sr->out_degree, false);
         sg_toon_extra_cells(sb, sr->node.properties_json, fields, nfields);
+        if (include_connected && sr->node.id > 0) {
+            char joined[CBM_SZ_1K];
+            enrich_connected_joined(store, sr->node.id, relationship, joined, sizeof(joined));
+            cbm_tree_cell_str(sb, joined, false);
+        }
         cbm_tree_row_end(sb);
     }
     cbm_tree_scalar_bool(sb, "has_more", out->total > offset + out->count);
 }
 
-/* ── Tree format (Phase-2 A/B candidate) ────────────────────────────
- * Prefix-factored, file-grouped output: the shared (qn-prefix, file) pair is
- * printed ONCE per group, rows beneath carry only the short name + data
- * cells. The reconstruction rule (qn = group-prefix + "." + name) is stated
- * once in the header so agents can copy exact join keys into follow-up
- * calls. Research basis: HDT front-coding (prefix factoring), LocAgent tree
- * ablation (tree > flat/DOT for LLM comprehension), Lost-in-Distance
- * (related rows adjacent — grouping by module does exactly that). */
-
-/* qn-prefix = qualified_name minus its last '.'-segment. Returns length. */
+/* Возвращает длину QN до последнего сегмента для сгруппированного формата
+ * `detect_changes`. */
 static size_t sg_qn_prefix_len(const char *qn) {
     const char *last = qn ? strrchr(qn, '.') : NULL;
     return last ? (size_t)(last - qn) : 0;
@@ -3190,103 +3194,16 @@ static int sg_cmp_by_qn(const void *pa, const void *pb) {
     return strcmp(qa, qb);
 }
 
-static void emit_search_results_tree(cbm_sb_t *sb, cbm_search_output_t *out, int offset,
+/* Записывает `search_graph` как плоские JSON-строки: QN самодостаточен и не
+ * требует восстановления из отдельного префикса и суффикса. */
+static void emit_search_results_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                     cbm_search_output_t *out, int offset,
                                      const char *const *fields, int nfields, cbm_store_t *store,
                                      const char *relationship, bool include_connected) {
-    char buf[CBM_SZ_512];
-    char extra_cols[CBM_SZ_256] = "";
-    for (int f = 0; f < nfields; f++) {
-        strncat(extra_cols, " ", sizeof(extra_cols) - strlen(extra_cols) - 1);
-        strncat(extra_cols, fields[f], sizeof(extra_cols) - strlen(extra_cols) - 1);
-    }
-    if (include_connected) {
-        strncat(extra_cols, " connected", sizeof(extra_cols) - strlen(extra_cols) - 1);
-    }
-    snprintf(buf, sizeof(buf),
-             "total: %d\nresults: %d  (rows: qn_suffix name label lines in out%s; "
-             "qn = group prefix + \".\" + qn_suffix)\n",
-             out->total, out->count, extra_cols);
-    cbm_sb_append(sb, buf);
-    /* Sort by qn so same-prefix rows are adjacent (module clustering). */
-    if (out->count > 1) {
-        qsort(out->results, (size_t)out->count, sizeof(cbm_search_result_t), sg_cmp_by_qn);
-    }
-    char cur_group[CBM_SZ_1K] = "";
-    for (int i = 0; i < out->count; i++) {
-        const cbm_search_result_t *sr = &out->results[i];
-        const char *qn = sr->node.qualified_name ? sr->node.qualified_name : "";
-        const char *file = sr->node.file_path ? sr->node.file_path : "";
-        size_t plen = sg_qn_prefix_len(qn);
-        char group[CBM_SZ_1K];
-        snprintf(group, sizeof(group), "%.*s (%s)", (int)plen, qn, file);
-        if (strcmp(group, cur_group) != 0) {
-            snprintf(cur_group, sizeof(cur_group), "%s", group);
-            cbm_sb_append(sb, group);
-            cbm_sb_append(sb, ":\n");
-        }
-        const char *shortname = plen ? qn + plen + 1 : qn;
-        char lines[CBM_SZ_32];
-        sg_lines_str(lines, sizeof(lines), sr->node.start_line, sr->node.end_line);
-        cbm_tree_row_begin(sb);
-        cbm_tree_cell_str(sb, shortname, true);
-        cbm_tree_cell_str(sb, sr->node.name, false);
-        cbm_tree_cell_str(sb, sr->node.label, false);
-        cbm_tree_cell_str(sb, lines, false);
-        cbm_tree_cell_int(sb, sr->in_degree, false);
-        cbm_tree_cell_int(sb, sr->out_degree, false);
-        /* Extra property columns (fields param). Routed through the shared
-         * cell emitters so values with spaces (signatures, docstrings) are
-         * QUOTED — a raw append would shift every following column. Missing
-         * values emit as "-" (the emitter's empty-cell placeholder). */
-        if (nfields > 0) {
-            yyjson_doc *pd =
-                (sr->node.properties_json && sr->node.properties_json[0])
-                    ? yyjson_read(sr->node.properties_json, strlen(sr->node.properties_json), 0)
-                    : NULL;
-            yyjson_val *pr = pd ? yyjson_doc_get_root(pd) : NULL;
-            for (int f = 0; f < nfields; f++) {
-                yyjson_val *v = (pr && yyjson_is_obj(pr)) ? yyjson_obj_get(pr, fields[f]) : NULL;
-                if (v && yyjson_is_str(v)) {
-                    cbm_tree_cell_str(sb, yyjson_get_str(v), false);
-                } else if (v && yyjson_is_int(v)) {
-                    cbm_tree_cell_int(sb, yyjson_get_int(v), false);
-                } else if (v && yyjson_is_real(v)) {
-                    cbm_tree_cell_real(sb, yyjson_get_real(v), false);
-                } else if (v && yyjson_is_bool(v)) {
-                    cbm_tree_cell_bool(sb, yyjson_get_bool(v), false);
-                } else {
-                    cbm_tree_cell_str(sb, "", false); /* emits "-" */
-                }
-            }
-            if (pd) {
-                yyjson_doc_free(pd);
-            }
-        }
-        if (include_connected && sr->node.id > 0) {
-            char joined[CBM_SZ_1K];
-            enrich_connected_joined(store, sr->node.id, relationship, joined, sizeof(joined));
-            cbm_tree_cell_str(sb, joined, false); /* empty emits "-" */
-        }
-        cbm_sb_append(sb, "\n");
-    }
-    snprintf(buf, sizeof(buf), "has_more: %s\n",
-             out->total > offset + out->count ? "true" : "false");
-    cbm_sb_append(sb, buf);
-}
-
-/* json-stringified tree: the SAME grouped model as the text tree, serialized
- * as JSON for agents that need structured parsing — groups with a shared
- * (qn_prefix, file) and column-ordered row ARRAYS (never per-row key
- * envelopes; that legacy shape was 84% key overhead). */
-static void emit_search_results_tree_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
-                                          cbm_search_output_t *out, int offset,
-                                          const char *const *fields, int nfields,
-                                          cbm_store_t *store, const char *relationship,
-                                          bool include_connected) {
     yyjson_mut_obj_add_int(doc, root, "total", out->total);
     yyjson_mut_obj_add_int(doc, root, "count", out->count);
     yyjson_mut_val *cols = yyjson_mut_arr(doc);
-    static const char *const col_names[] = {"qn_suffix", "name", "label", "lines", "in", "out"};
+    static const char *const col_names[] = {"qn", "name", "label", "file", "lines", "in", "out"};
     for (size_t i = 0; i < sizeof(col_names) / sizeof(col_names[0]); i++) {
         yyjson_mut_arr_add_str(doc, cols, col_names[i]);
     }
@@ -3300,34 +3217,18 @@ static void emit_search_results_tree_json(yyjson_mut_doc *doc, yyjson_mut_val *r
     if (out->count > 1) {
         qsort(out->results, (size_t)out->count, sizeof(cbm_search_result_t), sg_cmp_by_qn);
     }
-    yyjson_mut_val *groups = yyjson_mut_arr(doc);
-    yyjson_mut_val *cur = NULL;
-    yyjson_mut_val *cur_rows = NULL;
-    char cur_key[CBM_SZ_1K] = "";
+    yyjson_mut_val *rows = yyjson_mut_arr(doc);
     for (int i = 0; i < out->count; i++) {
         const cbm_search_result_t *sr = &out->results[i];
         const char *qn = sr->node.qualified_name ? sr->node.qualified_name : "";
         const char *file = sr->node.file_path ? sr->node.file_path : "";
-        size_t plen = sg_qn_prefix_len(qn);
-        char key[CBM_SZ_1K];
-        snprintf(key, sizeof(key), "%.*s|%s", (int)plen, qn, file);
-        if (!cur || strcmp(key, cur_key) != 0) {
-            snprintf(cur_key, sizeof(cur_key), "%s", key);
-            cur = yyjson_mut_obj(doc);
-            char prefix[CBM_SZ_1K];
-            snprintf(prefix, sizeof(prefix), "%.*s", (int)plen, qn);
-            yyjson_mut_obj_add_strcpy(doc, cur, "qn_prefix", prefix);
-            yyjson_mut_obj_add_strcpy(doc, cur, "file", file);
-            cur_rows = yyjson_mut_arr(doc);
-            yyjson_mut_obj_add_val(doc, cur, "rows", cur_rows);
-            yyjson_mut_arr_add_val(groups, cur);
-        }
         char lines[CBM_SZ_32];
         sg_lines_str(lines, sizeof(lines), sr->node.start_line, sr->node.end_line);
         yyjson_mut_val *row = yyjson_mut_arr(doc);
-        yyjson_mut_arr_add_strcpy(doc, row, plen ? qn + plen + 1 : qn);
+        yyjson_mut_arr_add_strcpy(doc, row, qn);
         yyjson_mut_arr_add_strcpy(doc, row, sr->node.name ? sr->node.name : "");
         yyjson_mut_arr_add_strcpy(doc, row, sr->node.label ? sr->node.label : "");
+        yyjson_mut_arr_add_strcpy(doc, row, file);
         yyjson_mut_arr_add_strcpy(doc, row, lines);
         yyjson_mut_arr_add_int(doc, row, sr->in_degree);
         yyjson_mut_arr_add_int(doc, row, sr->out_degree);
@@ -3358,9 +3259,9 @@ static void emit_search_results_tree_json(yyjson_mut_doc *doc, yyjson_mut_val *r
         if (include_connected && sr->node.id > 0) {
             yyjson_mut_arr_add_val(row, enrich_connected(doc, store, sr->node.id, relationship));
         }
-        yyjson_mut_arr_add_val(cur_rows, row);
+        yyjson_mut_arr_add_val(rows, row);
     }
-    yyjson_mut_obj_add_val(doc, root, "groups", groups);
+    yyjson_mut_obj_add_val(doc, root, "rows", rows);
     yyjson_mut_obj_add_bool(doc, root, "has_more", out->total > offset + out->count);
 }
 
@@ -3396,8 +3297,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         return not_indexed;
     }
 
-    /* Response encoding: grouped tree rows by default; format:"json" emits
-     * the SAME tree model as structured JSON (groups + row arrays). */
+    /* Response encoding: плоские строки по умолчанию; format:"json" выдаёт
+     * те же строки как структурированные массивы. */
     char *format_arg = cbm_mcp_get_string_arg(args, "format");
     bool legacy_json = format_arg && strcmp(format_arg, "json") == 0;
     free(format_arg);
@@ -3490,14 +3391,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             cbm_search_output_t tout = {0};
             if (!semantic_only) {
                 cbm_store_search(store, &params, &tout);
-                /* Grouped tree output is THE default; the flat table remains
-                 * only for detail:"ids" (single column — nothing to group). */
-                if (detail_ids) {
-                    emit_search_results_toon(&sb, &tout, offset, fields, nfields, detail_ids);
-                } else {
-                    emit_search_results_tree(&sb, &tout, offset, fields, nfields, store,
-                                             relationship, include_connected);
-                }
+                emit_search_results_toon(&sb, &tout, offset, fields, nfields, store, relationship,
+                                         include_connected, detail_ids);
                 if (core_fields_requested) {
                     cbm_tree_scalar_str(
                         &sb, "hint",
@@ -3574,16 +3469,14 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
-    /* format:"json" = json-stringified tree: same grouped model as the
-     * default text output, structured for parsing. include_connected adds a
-     * nested per-row `connected` array — the legacy per-node-object shape is
-     * gone. */
+    /* format:"json" = структурированные плоские строки, как и в текстовом
+     * выводе. include_connected добавляет в строку массив `connected`. */
     {
         const char *jfields[SG_MAX_EXTRA_FIELDS];
         yyjson_doc *jfields_owner = NULL;
         int jnfields = sg_parse_fields(args, jfields, SG_MAX_EXTRA_FIELDS, &jfields_owner, NULL);
-        emit_search_results_tree_json(doc, root, &out, offset, jfields, jnfields, store,
-                                      relationship, include_connected);
+        emit_search_results_json(doc, root, &out, offset, jfields, jnfields, store, relationship,
+                                 include_connected);
         if (jfields_owner) {
             yyjson_doc_free(jfields_owner);
         }
@@ -5965,14 +5858,13 @@ static int trace_watermark_index(const cbm_traverse_result_t *tr, int hop, int64
     return tr->visited_count;
 }
 
-/* json-stringified tree for one trace leg: same grouped model as the text
- * output — {cols, groups:[{qn_prefix, rows:[[name,hop,...]]}]}. Optional
- * risk/args columns mirror the flags. */
-static yyjson_mut_val *bfs_to_tree_json(yyjson_mut_doc *doc, cbm_traverse_result_t *tr,
+/* Формирует одну ветвь `trace_path` как плоские JSON-строки. Полный QN хранится
+ * в строке целиком, а необязательные столбцы risk/args следуют за hop. */
+static yyjson_mut_val *bfs_to_flat_json(yyjson_mut_doc *doc, cbm_traverse_result_t *tr,
                                         bool risk_labels, bool include_tests, bool data_flow) {
     yyjson_mut_val *leg = yyjson_mut_obj(doc);
     yyjson_mut_val *cols = yyjson_mut_arr(doc);
-    yyjson_mut_arr_add_str(doc, cols, "name");
+    yyjson_mut_arr_add_str(doc, cols, "qn");
     yyjson_mut_arr_add_str(doc, cols, "hop");
     if (risk_labels) {
         yyjson_mut_arr_add_str(doc, cols, "risk");
@@ -5981,31 +5873,15 @@ static yyjson_mut_val *bfs_to_tree_json(yyjson_mut_doc *doc, cbm_traverse_result
         yyjson_mut_arr_add_str(doc, cols, "args");
     }
     yyjson_mut_obj_add_val(doc, leg, "cols", cols);
-    yyjson_mut_val *groups = yyjson_mut_arr(doc);
-    yyjson_mut_val *cur_rows = NULL;
-    char cur_group[CBM_SZ_1K] = "";
-    bool have_group = false;
+    yyjson_mut_val *rows = yyjson_mut_arr(doc);
     for (int i = 0; i < tr->visited_count; i++) {
         if (!include_tests && is_test_file(tr->visited[i].node.file_path)) {
             continue;
         }
         const char *qn =
             tr->visited[i].node.qualified_name ? tr->visited[i].node.qualified_name : "";
-        size_t plen = sg_qn_prefix_len(qn);
-        if (plen >= sizeof(cur_group)) {
-            plen = 0;
-        }
-        if (!have_group || strncmp(cur_group, qn, plen) != 0 || cur_group[plen] != '\0') {
-            snprintf(cur_group, sizeof(cur_group), "%.*s", (int)plen, qn);
-            have_group = true;
-            yyjson_mut_val *g = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_strcpy(doc, g, "qn_prefix", cur_group);
-            cur_rows = yyjson_mut_arr(doc);
-            yyjson_mut_obj_add_val(doc, g, "rows", cur_rows);
-            yyjson_mut_arr_add_val(groups, g);
-        }
         yyjson_mut_val *row = yyjson_mut_arr(doc);
-        yyjson_mut_arr_add_strcpy(doc, row, plen ? qn + plen + 1 : qn);
+        yyjson_mut_arr_add_strcpy(doc, row, qn);
         yyjson_mut_arr_add_int(doc, row, tr->visited[i].hop);
         if (risk_labels) {
             yyjson_mut_arr_add_str(doc, row, cbm_risk_label(cbm_hop_to_risk(tr->visited[i].hop)));
@@ -6024,14 +5900,14 @@ static yyjson_mut_val *bfs_to_tree_json(yyjson_mut_doc *doc, cbm_traverse_result
                 yyjson_mut_arr_add_str(doc, row, "");
             }
         }
-        yyjson_mut_arr_add_val(cur_rows, row);
+        yyjson_mut_arr_add_val(rows, row);
     }
-    yyjson_mut_obj_add_val(doc, leg, "groups", groups);
+    yyjson_mut_obj_add_val(doc, leg, "rows", rows);
     return leg;
 }
 
-/* В tree-формате строки группируются по префиксу QN. Суффикс выводится через
- * общий кодировщик ячеек: канонические сигнатуры могут содержать пробелы. */
+/* В плоском текстовом формате сортировка по QN сохраняет детерминированный
+ * порядок строк независимо от внутреннего обхода графа. */
 static int tree_hop_cmp_qn(const void *pa, const void *pb) {
     const cbm_node_hop_t *a = (const cbm_node_hop_t *)pa;
     const cbm_node_hop_t *b = (const cbm_node_hop_t *)pb;
@@ -6044,7 +5920,7 @@ static int tree_hop_cmp_qn(const void *pa, const void *pb) {
     return a->hop - b->hop;
 }
 
-static void bfs_to_tree_table(cbm_sb_t *sb, const char *key, cbm_traverse_result_t *tr,
+static void bfs_to_flat_table(cbm_sb_t *sb, const char *key, cbm_traverse_result_t *tr,
                               bool include_tests) {
     int visible = 0;
     for (int i = 0; i < tr->visited_count; i++) {
@@ -6054,31 +5930,19 @@ static void bfs_to_tree_table(cbm_sb_t *sb, const char *key, cbm_traverse_result
         visible++;
     }
     char buf[CBM_SZ_256];
-    snprintf(buf, sizeof(buf),
-             "%s: %d  (rows: qn_suffix hop; qn = group prefix + \".\" + qn_suffix)\n", key,
-             visible);
+    snprintf(buf, sizeof(buf), "%s: %d  (cols: qn hop)\n", key, visible);
     cbm_sb_append(sb, buf);
     if (tr->visited_count > 1) {
         qsort(tr->visited, (size_t)tr->visited_count, sizeof(cbm_node_hop_t), tree_hop_cmp_qn);
     }
-    char cur_group[CBM_SZ_1K] = "";
     for (int i = 0; i < tr->visited_count; i++) {
         if (!include_tests && is_test_file(tr->visited[i].node.file_path)) {
             continue;
         }
         const char *qn =
             tr->visited[i].node.qualified_name ? tr->visited[i].node.qualified_name : "";
-        size_t plen = sg_qn_prefix_len(qn);
-        if (plen >= sizeof(cur_group)) {
-            plen = 0;
-        }
-        if (strncmp(cur_group, qn, plen) != 0 || cur_group[plen] != '\0') {
-            snprintf(cur_group, sizeof(cur_group), "%.*s", (int)plen, qn);
-            cbm_sb_append(sb, cur_group);
-            cbm_sb_append(sb, ":\n");
-        }
         cbm_tree_row_begin(sb);
-        cbm_tree_cell_str(sb, plen ? qn + plen + 1 : qn, true);
+        cbm_tree_cell_str(sb, qn, true);
         cbm_tree_cell_int(sb, tr->visited[i].hop, false);
         cbm_tree_row_end(sb);
     }
@@ -6303,8 +6167,8 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         return result;
     }
 
-    /* Response encoding: tree tables by default; format:"json" emits the
-     * same grouped model as structured JSON. */
+    /* Response encoding: плоские таблицы по умолчанию; format:"json" выдаёт
+     * те же строки как структурированные массивы. */
     char *trace_format = cbm_mcp_get_string_arg(args, "format");
     bool trace_legacy_json = trace_format && strcmp(trace_format, "json") == 0;
     free(trace_format);
@@ -6439,7 +6303,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             if (flat_trace) {
                 bfs_to_toon_table(&sb, "callees", &view_out, risk_labels, include_tests, data_flow);
             } else {
-                bfs_to_tree_table(&sb, "callees", &view_out, include_tests);
+                bfs_to_flat_table(&sb, "callees", &view_out, include_tests);
             }
         }
         if (do_inbound) {
@@ -6447,7 +6311,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             if (flat_trace) {
                 bfs_to_toon_table(&sb, "callers", &view_in, risk_labels, include_tests, data_flow);
             } else {
-                bfs_to_tree_table(&sb, "callers", &view_in, include_tests);
+                bfs_to_flat_table(&sb, "callers", &view_in, include_tests);
             }
         }
         if (more_rows) {
@@ -6479,13 +6343,13 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_obj_add_int(doc, root, "callees_total", out_total);
             yyjson_mut_obj_add_val(
                 doc, root, "callees",
-                bfs_to_tree_json(doc, &view_out, risk_labels, include_tests, data_flow));
+                bfs_to_flat_json(doc, &view_out, risk_labels, include_tests, data_flow));
         }
         if (do_inbound) {
             yyjson_mut_obj_add_int(doc, root, "callers_total", in_total);
             yyjson_mut_obj_add_val(
                 doc, root, "callers",
-                bfs_to_tree_json(doc, &view_in, risk_labels, include_tests, data_flow));
+                bfs_to_flat_json(doc, &view_in, risk_labels, include_tests, data_flow));
         }
         if (more_rows) {
             yyjson_mut_obj_add_bool(doc, root, "truncated", true);
