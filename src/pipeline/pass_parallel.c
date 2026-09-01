@@ -1219,12 +1219,7 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
         edges++;
     }
     free(file_qn);
-    if (def->parent_class && strcmp(def->label, "Method") == 0) {
-        const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(ctx->gbuf, def->parent_class);
-        if (parent && def_node) {
-            cbm_gbuf_insert_edge(ctx->gbuf, parent->id, def_node->id, "DEFINES_METHOD", "{}");
-        }
-    }
+    cbm_pipeline_link_defines_method(ctx, def);
     return edges;
 }
 
@@ -1343,6 +1338,18 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
         create_channel_edges(ctx, result, rel);
         cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
+    }
+
+    /* Повторная точная связка устраняет зависимость от порядка кэша: владелец
+     * и метод к этому моменту гарантированно материализованы во всех файлах. */
+    for (int i = 0; i < file_count; i++) {
+        CBMFileResult *result = result_cache[i];
+        if (!result) {
+            continue;
+        }
+        for (int d = 0; d < result->defs.count; d++) {
+            cbm_pipeline_link_defines_method(ctx, &result->defs.items[d]);
+        }
     }
 
     cbm_pipeline_namespace_map_free(namespace_map);

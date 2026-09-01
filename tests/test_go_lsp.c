@@ -765,11 +765,10 @@ TEST(golsp_interface_method_field_chain) {
     PASS();
 }
 
-/* Parser-backed calls already carry their full call-expression spans. The Go
- * semantic resolver must preserve the same occurrence identity; otherwise two
- * same-leaf calls in one caller both join whichever Render record appears
- * first in resolved_calls. Use concrete and ambiguous-interface dispatch so
- * the targets are distinct under Go's existing flat concrete-method QN model. */
+/* Вызовы из синтаксического анализатора уже несут точные диапазоны выражений.
+ * Семантический resolver Go обязан сохранить ту же идентичность вхождения, иначе
+ * два вызова одного `Render` соединятся с первой записью в `resolved_calls`.
+ * Конкретный и интерфейсный вызовы дополнительно доказывают разные QN владельцев. */
 TEST(golsp_ordinary_same_leaf_calls_join_by_exact_site) {
     const char *source = "package main\n\n"
                          "type Renderer interface { Render(label string) }\n\n"
@@ -840,13 +839,23 @@ TEST(golsp_ordinary_same_leaf_calls_join_by_exact_site) {
         }
         if (rc->site_start_byte == b_start && rc->site_end_byte == b_end && rc->strategy &&
             strcmp(rc->strategy, "lsp_interface_dispatch") == 0 &&
-            strstr(rc->callee_qn, ".Renderer.Render")) {
+            strcmp(rc->callee_qn, "Renderer.Render") == 0) {
             b_semantic = rc;
         }
     }
 
     ASSERT_EQ(render_semantics, 2);
     ASSERT_EQ(zero_span_hijackers, 0);
+    if (!a_semantic || !b_semantic) {
+        printf("  ordinary Render diagnostics (%d records):\n", r->resolved_calls.count);
+        for (int i = 0; i < r->resolved_calls.count; i++) {
+            const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+            printf("    %s -> %s [%s reason=%s site=%u:%u]\n",
+                   rc->caller_qn ? rc->caller_qn : "(null)",
+                   rc->callee_qn ? rc->callee_qn : "(null)", rc->strategy ? rc->strategy : "(null)",
+                   rc->reason ? rc->reason : "(null)", rc->site_start_byte, rc->site_end_byte);
+        }
+    }
     ASSERT_NOT_NULL(a_semantic);
     ASSERT_NOT_NULL(b_semantic);
     ASSERT_TRUE(a_semantic != b_semantic);
@@ -933,13 +942,23 @@ TEST(golsp_fast_crossfile_same_leaf_calls_preserve_exact_sites) {
             strcmp(rc->reason, "method_not_found") == 0 && rc->caller_qn &&
             strstr(rc->caller_qn, "run") && rc->callee_qn && strstr(rc->callee_qn, ".Render")) {
             unresolved_render_semantics++;
-            if (strstr(rc->callee_qn, ".A.Render"))
+            if (strcmp(rc->callee_qn, "A.Render") == 0)
                 a_unresolved_qn = rc->callee_qn;
-            if (strstr(rc->callee_qn, ".B.Render"))
+            if (strcmp(rc->callee_qn, "B.Render") == 0)
                 b_unresolved_qn = rc->callee_qn;
         }
     }
     ASSERT_EQ(unresolved_render_semantics, 2);
+    if (!a_unresolved_qn || !b_unresolved_qn) {
+        printf("  unresolved Render diagnostics (%d records):\n", r->resolved_calls.count);
+        for (int i = 0; i < r->resolved_calls.count; i++) {
+            const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+            printf("    %s -> %s [%s reason=%s site=%u:%u]\n",
+                   rc->caller_qn ? rc->caller_qn : "(null)",
+                   rc->callee_qn ? rc->callee_qn : "(null)", rc->strategy ? rc->strategy : "(null)",
+                   rc->reason ? rc->reason : "(null)", rc->site_start_byte, rc->site_end_byte);
+        }
+    }
     ASSERT_NOT_NULL(a_unresolved_qn);
     ASSERT_NOT_NULL(b_unresolved_qn);
 

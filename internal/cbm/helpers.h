@@ -37,9 +37,10 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang);
 // Returns a null node if none found.
 TSNode cbm_find_enclosing_func(TSNode node, CBMLanguage lang);
 
-// Возвращает локальный QN внешней функции либо module_qn, если функции нет.
-const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
-                                  const char *rel_path, const char *module_qn);
+// Возвращает локальный QN внешней функции либо `module_qn`, если функции нет.
+// Использует весь контекст, чтобы receiver Go, `impl` Rust и out-of-line C++
+// разрешались тем же алгоритмом, что и определения.
+const char *cbm_enclosing_func_qn(CBMExtractCtx *ctx, TSNode node);
 
 // Cached version: uses ctx->ef_cache to avoid repeated parent-chain walks.
 const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
@@ -129,12 +130,28 @@ const char *cbm_cpp_callable_identity(CBMArena *a, const char *callable_name, TS
 // gap #3 (and #438 for the C-declarator case).
 TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang);
 
-// C++/CUDA out-of-line method definition (`void Foo::bar() {...}`): return the
-// immediate enclosing class name ("Foo") from the qualified declarator, or NULL
-// for a plain free function. Defined in extract_defs.c. Shared so the unified
-// (call-scope) extractor computes the SAME class-qualified enclosing QN as the
-// def extractor — drift dropped the class qualifier from in-body calls (#554/#621).
-char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *source);
+// Возвращает полный QN владельца out-of-line метода C++/CUDA либо `NULL` для
+// свободной функции. `lexical_scope_qn` содержит уже вычисленный namespace.
+const char *cbm_cpp_out_of_line_owner_qn(CBMExtractCtx *ctx, TSNode node,
+                                         const char *lexical_scope_qn);
+
+// Возвращает базовое имя типа receiver Go без указателя и generic-аргументов.
+char *cbm_go_receiver_type_name(CBMArena *a, TSNode receiver, const char *source);
+
+// Возвращает QN типа-владельца receiver-метода Go либо `NULL` для свободной функции.
+const char *cbm_go_receiver_owner_qn(CBMExtractCtx *ctx, TSNode func_node);
+
+// Возвращает QN текущего Rust-модуля с учётом встроенных предков `mod`.
+const char *cbm_rust_lexical_module_qn(CBMArena *a, TSNode node, const char *source,
+                                       const char *module_qn);
+
+// Разрешает путь Rust-типа относительно `crate`, `self`, `super` или текущего модуля.
+const char *cbm_rust_type_path_qn(CBMArena *a, const char *type_path, const char *module_qn,
+                                  const char *lexical_module_qn);
+
+// Возвращает канонический QN типа-владельца Rust `impl` с учётом импортов.
+const char *cbm_rust_impl_owner_qn(CBMExtractCtx *ctx, TSNode impl_node,
+                                   const char *lexical_module_qn);
 
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);

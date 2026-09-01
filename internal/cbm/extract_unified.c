@@ -847,19 +847,23 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         return NULL;
     }
 
-    /* C++/CUDA out-of-line method `void Foo::bar() {...}`: the def extractor
-     * records this as Method "proj.file.Foo.bar". The call-scope QN must match
-     * (be class-qualified) so an in-body call sources to the method, not a bare
-     * "proj.file.bar" that no node carries (#554/#621). The out-of-line def is at
-     * file scope, so enclosing_class_qn is NULL — derive the class from the
-     * qualified declarator instead. */
+    /* Out-of-line метод C++/CUDA должен сохранить уже вычисленный лексический
+     * namespace, а затем добавить область из квалифицированного declarator. */
     const bool is_cpp = ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA;
     const char *base_qn = NULL;
     if (is_cpp && strcmp(ts_node_type(node), "function_definition") == 0) {
-        char *scope_name = cbm_cpp_out_of_line_parent_class(ctx->arena, node, ctx->source);
-        if (scope_name && scope_name[0]) {
-            const char *class_qn = cbm_fqn_compute(ctx->arena, ctx->rel_path, scope_name);
-            base_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, name);
+        const char *owner_qn = cbm_cpp_out_of_line_owner_qn(ctx, node, state->enclosing_class_qn);
+        if (owner_qn) {
+            base_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", owner_qn, name);
+        }
+    }
+
+    /* Receiver Go задаёт владельца метода вне лексического тела класса. Этот QN
+     * обязан совпадать с определением и LSP `caller_qn`. */
+    if (!base_qn && ctx->language == CBM_LANG_GO) {
+        const char *owner_qn = cbm_go_receiver_owner_qn(ctx, node);
+        if (owner_qn) {
+            base_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", owner_qn, name);
         }
     }
 
@@ -908,6 +912,14 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
     if (ctx->language == CBM_LANG_NIX) {
         return cbm_nix_binding_scope_qn(ctx, node, state ? state->enclosing_class_qn : NULL);
     }
+    /* Rust `impl` — не новый вложенный класс, а реализация уже объявленного типа.
+     * Владелец разрешается через `crate`/`self`/`super`/`use` тем же контрактом,
+     * что и определения. */
+    if (ctx->language == CBM_LANG_RUST && strcmp(ts_node_type(node), "impl_item") == 0) {
+        const char *lexical =
+            cbm_rust_lexical_module_qn(ctx->arena, node, ctx->source, ctx->module_qn);
+        return cbm_rust_impl_owner_qn(ctx, node, lexical);
+    }
     TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
     /* Newer tree-sitter-kotlin: class/object name is a type_identifier child. */
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_KOTLIN) {
@@ -919,17 +931,6 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
      * method itself is mis-extracted as a top-level Function (not a Method). */
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_OBJC) {
         name_node = cbm_find_child_by_kind(node, "identifier");
-    }
-    /* Rust: impl_item has no `name` field; the implementing type is in the `type`
-     * field (`impl Calc {...}` / `impl Trait for Calc {...}` both -> Calc). The
-     * dedicated impl handler in push_boundary_scopes is dead code (impl_item is in
-     * rust_class_types, so the class branch runs first and lands here), so resolve
-     * the type here. Without a class scope, an impl method's QN drops the type
-     * (proj.file.method) and no longer matches the class-qualified def-side Method
-     * node, so in-body calls fall back to the Module. */
-    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_RUST &&
-        strcmp(ts_node_type(node), "impl_item") == 0) {
-        name_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
     }
     if (ts_node_is_null(name_node)) {
         return NULL;
@@ -2048,15 +2049,6 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
         const char *cqn = compute_class_qn(ctx, node, state);
         if (cqn) {
             push_scope(state, SCOPE_CLASS, depth, cqn);
-        }
-    } else if (ctx->language == CBM_LANG_RUST && strcmp(ts_node_type(node), "impl_item") == 0) {
-        TSNode type_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
-        if (!ts_node_is_null(type_node)) {
-            char *type_name = cbm_node_text(ctx->arena, type_node, ctx->source);
-            if (type_name && type_name[0]) {
-                const char *tqn = cbm_fqn_compute(ctx->arena, ctx->rel_path, type_name);
-                push_lexical_scope(state, SCOPE_CLASS, depth, tqn, node, CBM_LEXICAL_SCOPE_CLASS);
-            }
         }
     } else if (ctx->language == CBM_LANG_DART && strcmp(ts_node_type(node), "function_body") == 0) {
         /* Dart models a function as `function_signature` + `function_body` SIBLINGS

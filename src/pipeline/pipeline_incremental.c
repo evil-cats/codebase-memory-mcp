@@ -895,9 +895,9 @@ static void free_mode_skipped(cbm_file_hash_t *ms, int count) {
  * Fix: snapshot the inbound cross-file edges into changed files BEFORE the
  * purge, keyed by endpoint qualified_name (stable across re-parse), then
  * re-link them AFTER re-resolution + post-passes. Notes:
- *   - Only edges whose target is in a changed file and whose source is NOT
- *     are snapshotted; edges out of a changed file are regenerated when that
- *     file is re-resolved.
+ *   - Обычно сохраняются рёбра с целью в изменившемся файле и источником вне него.
+ *     Исключение — `DEFINES_METHOD` от изменившегося владельца к неизменившемуся
+ *     методу: метаданные метода не переизвлекаются и иначе не восстановят ребро.
  *   - Edge types recomputed wholesale by post-passes (SIMILAR_TO,
  *     SEMANTICALLY_RELATED) are skipped — re-linking a stale snapshot could
  *     add edges a full reindex would not produce.
@@ -955,11 +955,12 @@ static void incr_capture_inbound_edge(const cbm_gbuf_edge_t *edge, void *userdat
         !tgt->file_path) {
         return;
     }
-    /* Keep only edges that the purge would orphan permanently: target is in a
-     * changed file (its node is deleted + re-created), source is NOT (its file
-     * is never re-parsed, so the resolver won't regenerate the edge). */
-    if (!cbm_ht_get(cap->changed_paths, tgt->file_path) ||
-        cbm_ht_get(cap->changed_paths, src->file_path)) {
+    bool source_changed = cbm_ht_get(cap->changed_paths, src->file_path) != NULL;
+    bool target_changed = cbm_ht_get(cap->changed_paths, tgt->file_path) != NULL;
+    bool inbound_to_changed = target_changed && !source_changed;
+    bool owner_to_unchanged_method =
+        source_changed && !target_changed && strcmp(edge->type, "DEFINES_METHOD") == 0;
+    if (!inbound_to_changed && !owner_to_unchanged_method) {
         return;
     }
     if (cap->count >= cap->cap) {

@@ -65,11 +65,9 @@ int cbm_delta_stage_clone(const char *final_db_path, char **out_stage_path) {
     return 0;
 }
 
-/* Snapshot inbound cross-file edges into the given files from OUTSIDE them,
- * keyed by endpoint qualified names — the same semantics as the gbuf-based
- * capture, expressed as one indexed query per chunk. Edge types a full
- * reindex recomputes wholesale are excluded for the same reasons recorded
- * there (restoring a stale copy could produce edges a full build would not). */
+/* Сохраняет входящие межфайловые рёбра и специальный обратный случай
+ * `DEFINES_METHOD`: владелец меняется, а метод остаётся вне замыкания. Последний
+ * не может быть восстановлен из метаданных изменившегося файла владельца. */
 static bool delta_edge_type_is_recomputed(const char *type) {
     return type && (strcmp(type, "SIMILAR_TO") == 0 || strcmp(type, "SEMANTICALLY_RELATED") == 0 ||
                     strcmp(type, "FILE_CHANGES_WITH") == 0 || strcmp(type, "DATA_FLOWS") == 0);
@@ -98,17 +96,25 @@ int cbm_delta_snapshot_inbound(cbm_store_t *store, const char *project, const ch
         delta_placeholders(ph, chunk);
         char sql[CBM_SZ_4K];
         int n = snprintf(sql, sizeof(sql),
-                         /* CROSS JOIN pins nodes-first: the planner otherwise walks
-                          * EVERY project edge through the url_path index prefix
-                          * (measured 14.6s vs 4ms at kernel scale). */
+                         /* Каждый `SELECT` начинает с изменившейся вершины: так планировщик не
+                          * обходит все рёбра проекта даже при большом индексе. */
                          "SELECT src.qualified_name, tgt.qualified_name, e.type, e.properties"
                          " FROM nodes tgt"
                          " CROSS JOIN edges e ON e.target_id = tgt.id"
                          " CROSS JOIN nodes src ON e.source_id = src.id"
                          " WHERE tgt.project = ?1 AND tgt.file_path IN (%s)"
                          " AND src.file_path NOT IN (%s)"
-                         " AND src.file_path <> '' AND src.file_path IS NOT NULL",
-                         ph, ph);
+                         " AND src.file_path <> '' AND src.file_path IS NOT NULL"
+                         " UNION ALL"
+                         " SELECT src.qualified_name, tgt.qualified_name, e.type, e.properties"
+                         " FROM nodes src"
+                         " CROSS JOIN edges e ON e.source_id = src.id"
+                         " CROSS JOIN nodes tgt ON e.target_id = tgt.id"
+                         " WHERE src.project = ?1 AND src.file_path IN (%s)"
+                         " AND tgt.file_path NOT IN (%s)"
+                         " AND tgt.file_path <> '' AND tgt.file_path IS NOT NULL"
+                         " AND e.type = 'DEFINES_METHOD'",
+                         ph, ph, ph, ph);
         if (n < 0 || (size_t)n >= sizeof(sql)) {
             cbm_delta_free_snapshot(items, count);
             return CBM_NOT_FOUND;
@@ -122,6 +128,10 @@ int cbm_delta_snapshot_inbound(cbm_store_t *store, const char *project, const ch
         for (int i = 0; i < chunk; i++) {
             sqlite3_bind_text(stmt, 2 + i, paths[off + i], CBM_NOT_FOUND, SQLITE_TRANSIENT);
             sqlite3_bind_text(stmt, 2 + chunk + i, paths[off + i], CBM_NOT_FOUND, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2 + 2 * chunk + i, paths[off + i], CBM_NOT_FOUND,
+                              SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2 + 3 * chunk + i, paths[off + i], CBM_NOT_FOUND,
+                              SQLITE_TRANSIENT);
         }
         int step_rc;
         while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {

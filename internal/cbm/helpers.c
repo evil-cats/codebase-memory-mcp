@@ -483,7 +483,246 @@ bool cbm_is_namespace_scope_kind(CBMLanguage lang, const char *kind) {
     if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
         return strcmp(kind, "internal_module") == 0;
     }
+    if (lang == CBM_LANG_RUST) {
+        return strcmp(kind, "mod_item") == 0;
+    }
     return false;
+}
+
+/* Находит квалифицирующую часть declarator у out-of-line определения C++.
+ * Возвращается весь scope перед именем метода, а не только последний сегмент. */
+static char *cpp_out_of_line_scope_text(CBMArena *a, TSNode node, const char *source) {
+    TSNode qid = {0};
+    TSNode decl = ts_node_child_by_field_name(node, TS_FIELD("declarator"));
+    for (int depth = 0; depth < CBM_DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(decl); depth++) {
+        const char *kind = ts_node_type(decl);
+        if (strcmp(kind, "qualified_identifier") == 0 || strcmp(kind, "scoped_identifier") == 0) {
+            qid = decl;
+            break;
+        }
+        TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
+        if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0) {
+            inner = ts_node_named_child(decl, 0);
+        }
+        if (ts_node_is_null(inner)) {
+            break;
+        }
+        decl = inner;
+    }
+    if (ts_node_is_null(qid)) {
+        return NULL;
+    }
+    TSNode scope = ts_node_child_by_field_name(qid, TS_FIELD("scope"));
+    if (ts_node_is_null(scope)) {
+        return NULL;
+    }
+    char *text = cbm_node_text(a, scope, source);
+    return text && text[0] ? text : NULL;
+}
+
+/* Возвращает QN владельца из всей квалифицирующей части declarator. Лексический
+ * namespace уже имеет проектный формат и потому добавляется без пересборки;
+ * без него сохраняется принятое компактное представление namespace. */
+const char *cbm_cpp_out_of_line_owner_qn(CBMExtractCtx *ctx, TSNode node,
+                                         const char *lexical_scope_qn) {
+    if (!ctx) {
+        return NULL;
+    }
+    char *scope = cpp_out_of_line_scope_text(ctx->arena, node, ctx->source);
+    if (!scope || !scope[0]) {
+        return NULL;
+    }
+    if (lexical_scope_qn && lexical_scope_qn[0]) {
+        for (char *p = scope; *p; p++) {
+            if (p[0] == ':' && p[1] == ':') {
+                p[0] = '.';
+                memmove(p + 1, p + 2, strlen(p + 2) + 1);
+            }
+        }
+        return cbm_arena_sprintf(ctx->arena, "%s.%s", lexical_scope_qn, scope);
+    }
+    /* У полного `ns::C::m` последний разделитель отделяет класс от namespace.
+     * Предыдущие `::` сохраняют компактное представление namespace, принятое
+     * class extractor (`ns::inner.C`), вместо второго dotted-формата. */
+    char *last_scope = NULL;
+    for (char *p = scope; p[0] && p[1]; p++) {
+        if (p[0] == ':' && p[1] == ':') {
+            last_scope = p;
+        }
+    }
+    if (last_scope) {
+        last_scope[0] = '.';
+        memmove(last_scope + 1, last_scope + 2, strlen(last_scope + 2) + 1);
+    }
+    return cbm_fqn_compute(ctx->arena, ctx->rel_path, scope);
+}
+
+/* Receiver Go может быть именованным или безымянным, указателем либо generic.
+ * Во всех формах QN владельца использует только базовый `type_identifier`. */
+char *cbm_go_receiver_type_name(CBMArena *a, TSNode receiver, const char *source) {
+    uint32_t count = ts_node_child_count(receiver);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode parameter = ts_node_child(receiver, i);
+        if (strcmp(ts_node_type(parameter), "parameter_declaration") != 0) {
+            continue;
+        }
+        TSNode type = ts_node_child_by_field_name(parameter, TS_FIELD("type"));
+        for (int depth = 0; depth < CBM_DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(type); depth++) {
+            const char *kind = ts_node_type(type);
+            if (strcmp(kind, "type_identifier") == 0) {
+                return cbm_node_text(a, type, source);
+            }
+            if (strcmp(kind, "pointer_type") != 0 && strcmp(kind, "generic_type") != 0) {
+                break;
+            }
+            TSNode inner = ts_node_child_by_field_name(type, TS_FIELD("type"));
+            if (ts_node_is_null(inner)) {
+                inner = ts_node_named_child(type, 0);
+            }
+            type = inner;
+        }
+    }
+    return NULL;
+}
+
+const char *cbm_go_receiver_owner_qn(CBMExtractCtx *ctx, TSNode func_node) {
+    if (!ctx || ctx->language != CBM_LANG_GO) {
+        return NULL;
+    }
+    TSNode receiver = ts_node_child_by_field_name(func_node, TS_FIELD("receiver"));
+    if (ts_node_is_null(receiver)) {
+        return NULL;
+    }
+    char *type_name = cbm_go_receiver_type_name(ctx->arena, receiver, ctx->source);
+    return type_name && type_name[0]
+               ? cbm_fqn_compute_source_lang(ctx->arena, ctx->rel_path, type_name, ctx->language)
+               : NULL;
+}
+
+/* Собирает встроенные предки `mod` от внешнего к внутреннему. Внешний `module_qn`
+ * уже кодирует путь файла и служит устойчивой основой QN. */
+const char *cbm_rust_lexical_module_qn(CBMArena *a, TSNode node, const char *source,
+                                       const char *module_qn) {
+    const char *names[CBM_SZ_32];
+    int count = 0;
+    for (TSNode cur = ts_node_parent(node); !ts_node_is_null(cur); cur = ts_node_parent(cur)) {
+        if (strcmp(ts_node_type(cur), "mod_item") != 0 || count >= CBM_SZ_32) {
+            continue;
+        }
+        TSNode name = ts_node_child_by_field_name(cur, TS_FIELD("name"));
+        if (!ts_node_is_null(name)) {
+            char *text = cbm_node_text(a, name, source);
+            if (text && text[0]) {
+                names[count++] = text;
+            }
+        }
+    }
+    const char *qn = module_qn;
+    for (int i = count - 1; i >= 0; i--) {
+        qn = qn && qn[0] ? cbm_arena_sprintf(a, "%s.%s", qn, names[i]) : names[i];
+    }
+    return qn;
+}
+
+/* Копирует базовую часть Rust-типа без generic-аргументов и внешних пробелов. */
+static char *rust_base_type_path(CBMArena *a, const char *type_path) {
+    if (!type_path) {
+        return NULL;
+    }
+    while (isspace((unsigned char)*type_path)) {
+        type_path++;
+    }
+    const char *end = type_path + strlen(type_path);
+    const char *generic = strchr(type_path, '<');
+    if (generic && generic < end) {
+        end = generic;
+    }
+    while (end > type_path && isspace((unsigned char)end[-1])) {
+        end--;
+    }
+    return end > type_path ? cbm_arena_strndup(a, type_path, (size_t)(end - type_path)) : NULL;
+}
+
+/* Удаляет один сегмент из QN текущего Rust-модуля. */
+static const char *rust_parent_module_qn(CBMArena *a, const char *module_qn) {
+    if (!module_qn) {
+        return NULL;
+    }
+    const char *dot = strrchr(module_qn, '.');
+    return dot ? cbm_arena_strndup(a, module_qn, (size_t)(dot - module_qn)) : module_qn;
+}
+
+const char *cbm_rust_type_path_qn(CBMArena *a, const char *type_path, const char *module_qn,
+                                  const char *lexical_module_qn) {
+    char *path = rust_base_type_path(a, type_path);
+    if (!path || !path[0]) {
+        return NULL;
+    }
+    /* Карта импортов или LSP может уже содержать канонический dotted QN. Исходный
+     * путь Rust-типа точки не использует, поэтому такой вход не префиксуем. */
+    if (!strstr(path, "::") && strchr(path, '.')) {
+        return path;
+    }
+
+    const char *current = lexical_module_qn && lexical_module_qn[0] ? lexical_module_qn : module_qn;
+    const char *rest = path;
+    const char *base = current;
+    if (strncmp(rest, "crate::", SLEN("crate::")) == 0) {
+        const char *dot = module_qn ? strchr(module_qn, '.') : NULL;
+        base = dot ? cbm_arena_strndup(a, module_qn, (size_t)(dot - module_qn)) : module_qn;
+        rest += SLEN("crate::");
+    } else if (strncmp(rest, "self::", SLEN("self::")) == 0) {
+        rest += SLEN("self::");
+    } else {
+        while (strncmp(rest, "super::", SLEN("super::")) == 0) {
+            base = rust_parent_module_qn(a, base);
+            rest += SLEN("super::");
+        }
+    }
+
+    char *dotted = cbm_arena_strdup(a, rest);
+    for (char *p = dotted; p && *p; p++) {
+        if (p[0] == ':' && p[1] == ':') {
+            p[0] = '.';
+            memmove(p + 1, p + 2, strlen(p + 2) + 1);
+        }
+    }
+    if (!dotted || !dotted[0]) {
+        return base;
+    }
+    return base && base[0] ? cbm_arena_sprintf(a, "%s.%s", base, dotted) : dotted;
+}
+
+const char *cbm_rust_impl_owner_qn(CBMExtractCtx *ctx, TSNode impl_node,
+                                   const char *lexical_module_qn) {
+    if (!ctx || ctx->language != CBM_LANG_RUST) {
+        return NULL;
+    }
+    TSNode type = ts_node_child_by_field_name(impl_node, TS_FIELD("type"));
+    if (ts_node_is_null(type)) {
+        return NULL;
+    }
+    char *type_path = rust_base_type_path(ctx->arena, cbm_node_text(ctx->arena, type, ctx->source));
+    if (!type_path || !type_path[0]) {
+        return NULL;
+    }
+
+    const char *resolved_path = type_path;
+    if (!strstr(type_path, "::")) {
+        for (int i = 0; i < ctx->result->imports.count; i++) {
+            const CBMImport *import = &ctx->result->imports.items[i];
+            if (import->local_name && import->module_path &&
+                strcmp(import->local_name, type_path) == 0) {
+                resolved_path = import->module_path;
+                break;
+            }
+        }
+    }
+    const char *lexical = lexical_module_qn;
+    if (!lexical) {
+        lexical = cbm_rust_lexical_module_qn(ctx->arena, impl_node, ctx->source, ctx->module_qn);
+    }
+    return cbm_rust_type_path_qn(ctx->arena, resolved_path, ctx->module_qn, lexical);
 }
 
 /* Free the calling thread's node-type bitset cache (the calloc'd `bits` arrays
@@ -1651,31 +1890,29 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
     return NULL;
 }
 
-const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
-                                  const char *rel_path, const char *module_qn) {
+const char *cbm_enclosing_func_qn(CBMExtractCtx *ctx, TSNode node) {
+    if (!ctx) {
+        return NULL;
+    }
+    CBMArena *a = ctx->arena;
+    CBMLanguage lang = ctx->language;
+    const char *source = ctx->source;
     TSNode func_node = cbm_find_enclosing_func(node, lang);
     if (ts_node_is_null(func_node)) {
-        return module_qn;
+        return ctx->module_qn;
     }
     const char *name = func_node_name(a, func_node, source, lang);
     if (!name || !name[0]) {
-        return module_qn;
+        return ctx->module_qn;
     }
 
     const char *base_qn = NULL;
+    const char *scope_qn = NULL;
 
-    // Check if the function is inside a class — compute classQN.funcName.
-    // For nested classes the class QN must carry the FULL nesting chain
-    // (Outer.Inner, not just Inner) so it matches the class/method node QN the
-    // def walk produces via compute_class_qn (extract_defs.c). Qualifying with
-    // only the innermost class under-qualified the enclosing QN, so a call
-    // inside a nested-class method sourced to the file node instead of its
-    // method node and failed to join the LSP-resolved call by caller QN.
+    /* Собираем полную лексическую область внешних классов, namespace и `mod`. Она
+     * нужен как свободным функциям, так и C++ out-of-line/Rust impl веткам. */
     const CBMLangSpec *spec = cbm_lang_spec(lang);
     if (spec && spec->class_node_types) {
-        // Build the dotted class chain from the outermost enclosing class down
-        // to the innermost. Walk parents collecting class names innermost-first,
-        // then prepend each as we ascend so the result reads Outer.Inner.
         const char *class_chain = NULL;
         for (TSNode cur = ts_node_parent(func_node); !ts_node_is_null(cur);
              cur = ts_node_parent(cur)) {
@@ -1694,20 +1931,47 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
             class_chain = class_chain ? cbm_arena_sprintf(a, "%s.%s", cname, class_chain) : cname;
         }
         if (class_chain) {
-            const char *class_qn = cbm_fqn_compute(a, rel_path, class_chain);
-            base_qn = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
+            scope_qn = cbm_fqn_compute_source_lang(a, ctx->rel_path, class_chain, lang);
+        }
+    }
+
+    /* Receiver-метод Go не вложен в объявление типа, поэтому владелец
+     * извлекается из receiver тем же алгоритмом, что и QN определения. */
+    if (lang == CBM_LANG_GO) {
+        const char *owner_qn = cbm_go_receiver_owner_qn(ctx, func_node);
+        if (owner_qn) {
+            base_qn = cbm_arena_sprintf(a, "%s.%s", owner_qn, name);
+        }
+    }
+
+    /* Метод Rust находится в `impl_item`. Квалифицированный тип и импорт должны
+     * давать тот же `parent_class`, который создал извлекатель определений. */
+    if (!base_qn && lang == CBM_LANG_RUST) {
+        for (TSNode cur = ts_node_parent(func_node); !ts_node_is_null(cur);
+             cur = ts_node_parent(cur)) {
+            if (strcmp(ts_node_type(cur), "impl_item") != 0) {
+                continue;
+            }
+            const char *lexical = cbm_rust_lexical_module_qn(a, cur, source, ctx->module_qn);
+            const char *owner_qn = cbm_rust_impl_owner_qn(ctx, cur, lexical);
+            if (owner_qn) {
+                base_qn = cbm_arena_sprintf(a, "%s.%s", owner_qn, name);
+            }
+            break;
         }
     }
 
     if (!base_qn && (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA)) {
-        char *scope_name = cbm_cpp_out_of_line_parent_class(a, func_node, source);
-        if (scope_name && scope_name[0]) {
-            const char *class_qn = cbm_fqn_compute(a, rel_path, scope_name);
-            base_qn = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
+        const char *owner_qn = cbm_cpp_out_of_line_owner_qn(ctx, func_node, scope_qn);
+        if (owner_qn) {
+            base_qn = cbm_arena_sprintf(a, "%s.%s", owner_qn, name);
         }
     }
+    if (!base_qn && scope_qn) {
+        base_qn = cbm_arena_sprintf(a, "%s.%s", scope_qn, name);
+    }
     if (!base_qn) {
-        base_qn = cbm_fqn_compute(a, rel_path, name);
+        base_qn = cbm_fqn_compute_source_lang(a, ctx->rel_path, name, lang);
     }
     if (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) {
         TSNode wrapper = func_node;
@@ -1735,8 +1999,7 @@ const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node) {
     }
 
     // Cache miss: compute via parent walk
-    const char *qn = cbm_enclosing_func_qn(ctx->arena, node, ctx->language, ctx->source,
-                                           ctx->rel_path, ctx->module_qn);
+    const char *qn = cbm_enclosing_func_qn(ctx, node);
 
     // Cache the result: find the enclosing function's byte range
     TSNode func_node = cbm_find_enclosing_func(node, ctx->language);

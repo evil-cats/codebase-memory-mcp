@@ -494,50 +494,6 @@ static TSNode resolve_func_name_fp(TSNode node, CBMLanguage lang, const char *ki
 // or NULL when the declarator is unqualified (a plain free function). Without
 // this, an out-of-line definition — whose class body lives declaration-only in a
 // header — would be recorded as a free Function with no link to its class.
-char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *source) {
-    // Descend the declarator chain to its qualified_identifier, if any.
-    TSNode qid = {0};
-    TSNode decl = ts_node_child_by_field_name(node, TS_FIELD("declarator"));
-    for (int depth = 0; depth < DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(decl); depth++) {
-        const char *dk = ts_node_type(decl);
-        if (strcmp(dk, "qualified_identifier") == 0 || strcmp(dk, "scoped_identifier") == 0) {
-            qid = decl;
-            break;
-        }
-        TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
-        if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0) {
-            inner = ts_node_named_child(decl, 0);
-        }
-        if (ts_node_is_null(inner)) {
-            break;
-        }
-        decl = inner;
-    }
-    if (ts_node_is_null(qid)) {
-        return NULL;
-    }
-    // The qualified_identifier's `scope` is the parent. For a nested scope
-    // (`ns::Foo`) descend through its `name` field to the innermost segment so
-    // the direct parent ("Foo") is returned, not the outer namespace.
-    TSNode scope = ts_node_child_by_field_name(qid, TS_FIELD("scope"));
-    if (ts_node_is_null(scope)) {
-        return NULL;
-    }
-    for (int depth = 0; depth < DECLARATOR_DEPTH_LIMIT; depth++) {
-        const char *sk = ts_node_type(scope);
-        if (strcmp(sk, "qualified_identifier") != 0 && strcmp(sk, "scoped_identifier") != 0) {
-            break;
-        }
-        TSNode name = ts_node_child_by_field_name(scope, TS_FIELD("name"));
-        if (ts_node_is_null(name)) {
-            break;
-        }
-        scope = name;
-    }
-    char *text = cbm_node_text(a, scope, source);
-    return (text && text[0]) ? text : NULL;
-}
-
 // R: resolve function_definition name from parent binary_operator lhs.
 static TSNode resolve_r_func_name(TSNode node) {
     TSNode parent = ts_node_parent(node);
@@ -3467,44 +3423,6 @@ static void set_def_complexity(CBMDefinition *def, TSNode body, const CBMLangSpe
     def->max_access_depth = cx.max_access_depth;
 }
 
-/* Extract the bare type name from a Go method receiver node.
- * The receiver is a parameter_list, e.g. "(s *OrderService)" or "(s Order)".
- * Walks to the parameter_declaration's `type` field, unwrapping pointer_type
- * and generic_type, and returns the type_identifier text (e.g. "OrderService").
- * Returns NULL if no type_identifier is found. */
-static char *go_receiver_type_name(CBMArena *a, TSNode recv, const char *source) {
-    uint32_t nc = ts_node_child_count(recv);
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode child = ts_node_child(recv, i);
-        if (strcmp(ts_node_type(child), "parameter_declaration") != 0) {
-            continue;
-        }
-        TSNode tn = ts_node_child_by_field_name(child, TS_FIELD("type"));
-        if (ts_node_is_null(tn)) {
-            continue;
-        }
-        /* Unwrap pointer_type / generic_type down to the type_identifier. */
-        for (int guard = 0; guard < 4 && !ts_node_is_null(tn); guard++) {
-            const char *tk = ts_node_type(tn);
-            if (strcmp(tk, "type_identifier") == 0) {
-                return cbm_node_text(a, tn, source);
-            }
-            if (strcmp(tk, "pointer_type") == 0 || strcmp(tk, "generic_type") == 0) {
-                /* pointer_type: child is the pointee type; generic_type has a
-                 * `type` field for the base type_identifier. */
-                TSNode inner = ts_node_child_by_field_name(tn, TS_FIELD("type"));
-                if (ts_node_is_null(inner)) {
-                    inner = ts_node_named_child(tn, 0);
-                }
-                tn = inner;
-                continue;
-            }
-            break;
-        }
-    }
-    return NULL;
-}
-
 /* C++/CUDA: true when name is a GoogleTest test-definition macro whose
  * invocations parse as function definitions with bare-identifier parameters.
  * Multiple such macros in one file all share the extracted name (e.g. "TEST"),
@@ -3614,7 +3532,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
      * filename stem is NOT baked into the QN (Go func in myapp/db/conn.go ->
      * proj.myapp.db.Func, not proj.myapp.db.conn.Func). Other langs unchanged. */
     def.qualified_name = cbm_fqn_compute_source_lang(a, ctx->rel_path, qn_name, ctx->language);
-    /* A free function declared inside a namespace (C++/C#/PHP) is qualified by
+    /* A free function declared inside a namespace/module is qualified by
      * the namespace scope the def walk carries (enclosing_class_qn was extended
      * by is_namespace_scope_kind), so `ns::serialize` is `proj.file.ns.serialize`
      * — without this it collapses to the file scope and namespace-aware
@@ -3633,7 +3551,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     if (ctx->enclosing_class_qn &&
         (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA ||
          ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX ||
-         ctx->language == CBM_LANG_NIX)) {
+         ctx->language == CBM_LANG_RUST || ctx->language == CBM_LANG_NIX)) {
         def.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, qn_name);
     }
     def.label = "Function";
@@ -3679,16 +3597,11 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     if (!ts_node_is_null(recv)) {
         def.receiver = cbm_node_text(a, recv, ctx->source);
         def.label = "Method";
-        /* Derive parent_class from the receiver type so DEFINES_METHOD edges
-         * (and downstream Go IMPLEMENTS/OVERRIDE) link the method to its owning
-         * struct/type node.  The parent QN must match the type's node QN, which
-         * is computed the same way (cbm_fqn_compute on the type name). */
-        char *recv_type = go_receiver_type_name(a, recv, ctx->source);
-        if (recv_type && recv_type[0]) {
-            /* Must match the Go type node QN (directory-based module) so the
-             * DEFINES_METHOD edge links the method to its owning type. */
-            def.parent_class =
-                cbm_fqn_compute_source_lang(a, ctx->rel_path, recv_type, ctx->language);
+        /* Владелец и QN метода строятся одним receiver-контрактом. Иначе два
+         * типа с одноимённым методом схлопываются в пакетный `pkg.Parse`. */
+        def.parent_class = cbm_go_receiver_owner_qn(ctx, node);
+        if (def.parent_class) {
+            def.qualified_name = cbm_arena_sprintf(a, "%s.%s", def.parent_class, name);
         }
     }
 
@@ -3699,9 +3612,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // class node QN computed the same way) so DEFINES_METHOD edges resolve.
     if ((ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) &&
         strcmp(ts_node_type(node), "function_definition") == 0) {
-        char *scope_name = cbm_cpp_out_of_line_parent_class(a, node, ctx->source);
-        if (scope_name && scope_name[0]) {
-            const char *class_qn = cbm_fqn_compute(a, ctx->rel_path, scope_name);
+        const char *class_qn = cbm_cpp_out_of_line_owner_qn(ctx, node, ctx->enclosing_class_qn);
+        if (class_qn) {
             def.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
             def.label = "Method";
             def.parent_class = class_qn;
@@ -4901,7 +4813,20 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         }
     }
 
-    const char *type_qn = cbm_fqn_compute(a, ctx->rel_path, type_name);
+    const char *lexical_module_qn =
+        cbm_rust_lexical_module_qn(a, node, ctx->source, ctx->module_qn);
+    const char *type_qn = cbm_rust_impl_owner_qn(ctx, node, lexical_module_qn);
+    if (!type_qn) {
+        return;
+    }
+
+    /* В записи `impl_trait` хранится короткое имя типа; структурная связь
+     * использует полный `type_qn`, поэтому квалифицированный путь не теряется. */
+    const char *struct_name = type_name;
+    const char *last_scope = strrchr(type_name, ':');
+    if (last_scope && last_scope[1]) {
+        struct_name = last_scope + 1;
+    }
 
     // Check for "impl Trait for Struct" pattern
     const char *impl_trait = NULL;
@@ -4920,7 +4845,7 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         if (trait_name && trait_name[0]) {
             CBMImplTrait it = {0};
             it.trait_name = trait_name;
-            it.struct_name = type_name;
+            it.struct_name = struct_name;
             it.struct_qn = type_qn;
             cbm_impltrait_push(&ctx->result->impl_traits, a, it);
             impl_trait = trait_name;

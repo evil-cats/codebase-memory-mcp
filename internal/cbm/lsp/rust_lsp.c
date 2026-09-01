@@ -5250,7 +5250,18 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
         if (tt)
             effective_recv = rust_resolve_path_expr(ctx, tt);
     } else {
-        effective_recv = rust_resolve_path_expr(ctx, type_text);
+        /* Владелец `impl` должен совпасть с `parent_class` определения: учитываем
+         * встроенный `mod`, `crate`/`self`/`super` и локальное имя из `use`. */
+        const char *owner_path = type_text;
+        if (!strstr(type_text, "::")) {
+            const char *imported = rust_resolve_use(ctx, type_text);
+            if (imported) {
+                owner_path = imported;
+            }
+        }
+        const char *lexical =
+            cbm_rust_lexical_module_qn(ctx->arena, impl_node, ctx->source, ctx->module_qn);
+        effective_recv = cbm_rust_type_path_qn(ctx->arena, owner_path, ctx->module_qn, lexical);
     }
     if (!effective_recv)
         return;

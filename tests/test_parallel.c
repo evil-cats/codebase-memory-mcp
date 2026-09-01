@@ -89,6 +89,43 @@ static int setup_parallel_repo(void) {
     fprintf(f, "package util\n\nfunc Help() {}\n");
     fclose(f);
 
+    /* Межфайловые Go receiver-методы: `methods.go` намеренно сортируется раньше
+     * `model.go`, чтобы последовательный путь не мог полагаться на порядок файлов. */
+    snprintf(path, sizeof(path), "%s/pkg/model.go", g_par_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "package pkg\n\ntype Widget struct{}\n");
+    fclose(f);
+    snprintf(path, sizeof(path), "%s/pkg/methods.go", g_par_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "package pkg\n\nfunc (w *Widget) Parse() {}\n");
+    fclose(f);
+
+    /* Rust `impl` находится вне файла типа и проверяет оба поддерживаемых пути. */
+    snprintf(path, sizeof(path), "%s/rust", g_par_tmpdir);
+    cbm_mkdir(path);
+    snprintf(path, sizeof(path), "%s/rust/model.rs", g_par_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "pub struct Remote;\n");
+    fclose(f);
+    snprintf(path, sizeof(path), "%s/rust/imported_impl.rs", g_par_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "use crate::model::Remote;\nimpl Remote { pub fn parse_imported(&self) {} }\n");
+    fclose(f);
+    snprintf(path, sizeof(path), "%s/rust/remote_impl.rs", g_par_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "impl crate::model::Remote { pub fn parse_remote(&self) {} }\n");
+    fclose(f);
+
     /* Java interface/implements/extends trio: the parallel resolve path must
      * make the same Interface-label edge split (IMPLEMENTS vs INHERITS) as
      * the sequential semantic pass, and both must emit OVERRIDE for methods
@@ -440,6 +477,40 @@ static int assert_edge_type_parity(const char *type) {
     return 0;
 }
 
+/* Требует ровно одно ребро между узлами с полными QN. */
+static bool parallel_exact_edge_exists(cbm_gbuf_t *gbuf, const char *source_qn,
+                                       const char *target_qn, const char *edge_type) {
+    const cbm_gbuf_node_t *source = cbm_gbuf_find_by_qn(gbuf, source_qn);
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(gbuf, target_qn);
+    if (!source || !target) {
+        return false;
+    }
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(gbuf, source->id, edge_type, &edges, &edge_count) != 0) {
+        return false;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i]->target_id == target->id) {
+            matches++;
+        }
+    }
+    return matches == 1;
+}
+
+/* Проверяет канонические Go/Rust QN и отсутствие прежних ложных узлов. */
+static bool parallel_owner_method_edges_exist(cbm_gbuf_t *gbuf) {
+    return parallel_exact_edge_exists(gbuf, "pkg.Widget", "pkg.Widget.Parse", "DEFINES_METHOD") &&
+           parallel_exact_edge_exists(gbuf, "rust.model.Remote",
+                                      "rust.model.Remote.parse_imported", "DEFINES_METHOD") &&
+           parallel_exact_edge_exists(gbuf, "rust.model.Remote", "rust.model.Remote.parse_remote",
+                                      "DEFINES_METHOD") &&
+           cbm_gbuf_find_by_qn(gbuf, "pkg.Parse") == NULL &&
+           cbm_gbuf_find_by_qn(gbuf, "rust.imported_impl.Remote") == NULL &&
+           cbm_gbuf_find_by_qn(gbuf, "rust.remote_impl.crate::model::Remote") == NULL;
+}
+
 TEST(parallel_calls_parity) {
     int rc = assert_edge_type_parity("CALLS");
     if (rc == -1)
@@ -461,6 +532,37 @@ TEST(parallel_defines_method_parity) {
     if (rc == -1)
         FAIL("setup failed");
     ASSERT_EQ(rc, 0);
+    PASS();
+}
+
+/* Последовательный и параллельный пути создают одинаковые точные связи владельцев. */
+TEST(parallel_owner_qualified_defines_method_parity) {
+    if (ensure_parity_setup() != 0)
+        FAIL("setup failed");
+    ASSERT_TRUE(parallel_owner_method_edges_exist(g_seq_gbuf));
+    ASSERT_TRUE(parallel_owner_method_edges_exist(g_par_gbuf));
+    PASS();
+}
+
+/* Обратный порядок входных файлов не меняет межфайловые `DEFINES_METHOD`. */
+TEST(parallel_owner_qualified_defines_method_order_independent) {
+    if (ensure_parity_setup() != 0)
+        FAIL("setup failed");
+
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    ASSERT_EQ(cbm_discover(g_par_tmpdir, &opts, &files, &file_count), 0);
+    for (int left = 0, right = file_count - 1; left < right; left++, right--) {
+        cbm_file_info_t tmp = files[left];
+        files[left] = files[right];
+        files[right] = tmp;
+    }
+    cbm_gbuf_t *reversed = run_sequential("par-order-test", g_par_tmpdir, files, file_count);
+    cbm_discover_free(files, file_count);
+    ASSERT_NOT_NULL(reversed);
+    ASSERT_TRUE(parallel_owner_method_edges_exist(reversed));
+    cbm_gbuf_free(reversed);
     PASS();
 }
 
@@ -3941,6 +4043,8 @@ SUITE(parallel) {
     RUN_TEST(parallel_calls_parity);
     RUN_TEST(parallel_defines_parity);
     RUN_TEST(parallel_defines_method_parity);
+    RUN_TEST(parallel_owner_qualified_defines_method_parity);
+    RUN_TEST(parallel_owner_qualified_defines_method_order_independent);
     RUN_TEST(parallel_imports_parity);
     RUN_TEST(parallel_usage_parity);
     RUN_TEST(parallel_inherits_parity);

@@ -516,6 +516,10 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
                          CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                          int worker_count);
 
+/* Связывает метод с владельцем только по полным QN. Безопасно вызывать
+ * повторно после материализации всех файлов: графовый буфер дедуплицирует ребро. */
+void cbm_pipeline_link_defines_method(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def);
+
 /* Phase 3B: Serial registry build from cached extraction results.
  * Creates DEFINES, DEFINES_METHOD, and IMPORTS edges in ctx->gbuf.
  * Registers callable symbols (Function/Method/Class) in ctx->registry. */

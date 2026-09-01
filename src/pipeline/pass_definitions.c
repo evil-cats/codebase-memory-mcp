@@ -317,6 +317,20 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     }
 }
 
+/* Связывает метод с владельцем только по полным QN; повторный вызов безопасен
+ * благодаря дедупликации графового буфера. */
+void cbm_pipeline_link_defines_method(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def) {
+    if (!ctx || !def || !def->qualified_name || !def->parent_class || !def->label ||
+        strcmp(def->label, "Method") != 0) {
+        return;
+    }
+    const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(ctx->gbuf, def->parent_class);
+    const cbm_gbuf_node_t *method = cbm_gbuf_find_by_qn(ctx->gbuf, def->qualified_name);
+    if (parent && method) {
+        cbm_gbuf_insert_edge(ctx->gbuf, parent->id, method->id, "DEFINES_METHOD", "{}");
+    }
+}
+
 /* Process one definition: create node, register, DEFINES + DEFINES_METHOD edges. */
 static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel) {
     if (!def->qualified_name || !def->name) {
@@ -347,12 +361,7 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
         cbm_gbuf_insert_edge(ctx->gbuf, file_node->id, node_id, "DEFINES", "{}");
     }
     free(file_qn);
-    if (def->parent_class && def->label && strcmp(def->label, "Method") == 0) {
-        const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(ctx->gbuf, def->parent_class);
-        if (parent && node_id > 0) {
-            cbm_gbuf_insert_edge(ctx->gbuf, parent->id, node_id, "DEFINES_METHOD", "{}");
-        }
-    }
+    cbm_pipeline_link_defines_method(ctx, def);
 }
 
 /* Create Channel nodes + EMITS / LISTENS_ON edges for one file's channels.
@@ -814,6 +823,21 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             create_channel_edges_for_file(ctx, result, rel);
             cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
             cbm_free_result(result);
+        }
+    }
+
+    /* Владелец метода может быть объявлен в более позднем файле. После фазы 1
+     * все узлы уже существуют, поэтому повторяем точную QN-связку без зависимости
+     * от порядка файлов. */
+    if (local_cache) {
+        for (int i = 0; i < file_count; i++) {
+            CBMFileResult *result = local_cache[i];
+            if (!result) {
+                continue;
+            }
+            for (int d = 0; d < result->defs.count; d++) {
+                cbm_pipeline_link_defines_method(ctx, &result->defs.items[d]);
+            }
         }
     }
 

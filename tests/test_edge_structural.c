@@ -156,6 +156,11 @@ typedef struct {
     const char *content;
 } ES_LangFile;
 
+typedef struct {
+    const char *source_qn;
+    const char *target_qn;
+} ES_ExpectedEdge;
+
 static void es_lc_to_fwd_slashes(char *p) {
     for (; *p; p++) {
         if (*p == '\\') {
@@ -330,6 +335,140 @@ static int es_exact_edge_by_name(const ES_LangFile *files, int nfiles, const cha
     cbm_store_free_nodes(targets, target_count);
     es_lang_cleanup(&lp, store);
     return matches;
+}
+
+/* Индексирует fixture один раз и требует по одному точному ребру для каждой
+ * пары QN. Дополнительный список доказывает отсутствие устаревших ложных QN. */
+static int es_exact_edges_by_qn(const ES_LangFile *files, int nfiles, const char *edge_type,
+                                const ES_ExpectedEdge *expected, int expected_count,
+                                const char *const *absent_qns, int absent_count) {
+    ES_LangProj lp;
+    cbm_store_t *store = es_lang_index_files(&lp, files, nfiles);
+    int ok = store != NULL;
+
+    for (int i = 0; ok && i < expected_count; i++) {
+        cbm_node_t source = {0};
+        cbm_node_t target = {0};
+        int source_rc = cbm_store_find_node_by_qn(store, lp.project, expected[i].source_qn, &source);
+        int target_rc = cbm_store_find_node_by_qn(store, lp.project, expected[i].target_qn, &target);
+        if (source_rc != CBM_STORE_OK || target_rc != CBM_STORE_OK) {
+            ok = 0;
+        } else {
+            cbm_edge_t *edges = NULL;
+            int edge_count = 0;
+            int matches = 0;
+            if (cbm_store_find_edges_by_source_type(store, source.id, edge_type, &edges,
+                                                    &edge_count) != CBM_STORE_OK) {
+                ok = 0;
+            } else {
+                for (int e = 0; e < edge_count; e++) {
+                    if (edges[e].target_id == target.id) {
+                        matches++;
+                    }
+                }
+                ok = matches == 1;
+            }
+            cbm_store_free_edges(edges, edge_count);
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+
+    for (int i = 0; ok && i < absent_count; i++) {
+        cbm_node_t stale = {0};
+        int rc = cbm_store_find_node_by_qn(store, lp.project, absent_qns[i], &stale);
+        if (rc == CBM_STORE_OK) {
+            ok = 0;
+            cbm_node_free_fields(&stale);
+        } else if (rc != CBM_STORE_NOT_FOUND) {
+            ok = 0;
+        }
+    }
+
+    if (!ok) {
+        es_dump_edge_histogram(store, lp.project);
+    }
+    es_lang_cleanup(&lp, store);
+    return ok;
+}
+
+/* Объявление C++ и out-of-line определение в одном лексическом namespace должны
+ * связываться по полному QN владельца, а не по сокращённому имени класса. */
+TEST(es_defines_method_cpp_out_of_line_namespace) {
+    static const ES_LangFile files[] = {
+        {"src/handlers/adcamp/AdCampRequest.h",
+         "namespace sniper::dsp::handlers {\n"
+         "class AdcampRequest {\n"
+         "public:\n"
+         "    bool parse() const;\n"
+         "};\n"
+         "}\n"},
+        {"src/handlers/adcamp/AdCampRequest.cpp",
+         "#include \"AdCampRequest.h\"\n"
+         "namespace sniper::dsp::handlers {\n"
+         "bool AdcampRequest::parse() const { return true; }\n"
+         "}\n"}};
+    static const ES_ExpectedEdge expected[] = {{
+        "src.handlers.adcamp.AdCampRequest.sniper::dsp::handlers.AdcampRequest",
+        "src.handlers.adcamp.AdCampRequest.sniper::dsp::handlers.AdcampRequest.parse() const",
+    }};
+    static const char *const absent[] = {
+        "src.handlers.adcamp.AdCampRequest.AdcampRequest.parse() const",
+    };
+    ASSERT_TRUE(es_exact_edges_by_qn(files, 2, "DEFINES_METHOD", expected, 1, absent, 1));
+    PASS();
+}
+
+/* Методы Go находятся в другом файле пакета и имеют одинаковое имя у разных
+ * типов; каждое точное ребро должно вести к отдельному owner-qualified QN. */
+TEST(es_defines_method_go_crossfile_receiver_qn) {
+    static const ES_LangFile files[] = {
+        {"pkg/model.go",
+         "package sample\n\n"
+         "type Widget struct{}\n"
+         "type Gadget struct{}\n"
+         "type Box[T any] struct { value T }\n"},
+        {"pkg/methods.go",
+         "package sample\n\n"
+         "func (w *Widget) Parse() {}\n"
+         "func (g Gadget) Parse() {}\n"
+         "func (b Box[T]) Value() T { return b.value }\n"}};
+    static const ES_ExpectedEdge expected[] = {
+        {"pkg.Widget", "pkg.Widget.Parse"},
+        {"pkg.Gadget", "pkg.Gadget.Parse"},
+        {"pkg.Box", "pkg.Box.Value"},
+    };
+    static const char *const absent[] = {"pkg.Parse", "pkg.Value"};
+    ASSERT_TRUE(es_exact_edges_by_qn(files, 2, "DEFINES_METHOD", expected, 3, absent, 2));
+    PASS();
+}
+
+/* Rust impl через import и crate-путь должен разрешаться к типу из model.rs,
+ * независимо от имени файла с реализацией. */
+TEST(es_defines_method_rust_crossfile_impl_owner) {
+    static const ES_LangFile files[] = {
+        {"rust/lib.rs", "pub mod model;\nmod imported_impl;\nmod remote_impl;\n"},
+        {"rust/model.rs", "pub struct Remote;\n"},
+        {"rust/imported_impl.rs",
+         "use crate::model::Remote;\n"
+         "impl Remote {\n"
+         "    pub fn parse_imported(&self) {}\n"
+         "}\n"},
+        {"rust/remote_impl.rs",
+         "impl crate::model::Remote {\n"
+         "    pub fn parse_remote(&self) {}\n"
+         "}\n"},
+    };
+    static const ES_ExpectedEdge expected[] = {
+        {"rust.model.Remote", "rust.model.Remote.parse_imported"},
+        {"rust.model.Remote", "rust.model.Remote.parse_remote"},
+    };
+    static const char *const absent[] = {
+        "rust.imported_impl.Remote",
+        "rust.remote_impl.crate::model::Remote",
+    };
+    ASSERT_TRUE(es_exact_edges_by_qn(files, 4, "DEFINES_METHOD", expected, 2, absent, 2));
+    PASS();
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -963,4 +1102,9 @@ SUITE(edge_structural) {
     /* Expected GREEN: Python + TypeScript test file conventions. */
     RUN_TEST(es_tests_crossfile_python);
     RUN_TEST(es_tests_crossfile_typescript);
+
+    /* ── FAMILY 10: DEFINES_METHOD с каноническим owner QN ───── */
+    RUN_TEST(es_defines_method_cpp_out_of_line_namespace);
+    RUN_TEST(es_defines_method_go_crossfile_receiver_qn);
+    RUN_TEST(es_defines_method_rust_crossfile_impl_owner);
 }

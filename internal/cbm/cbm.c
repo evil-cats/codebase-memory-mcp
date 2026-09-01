@@ -1291,8 +1291,15 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
 
     // Run extractors: defs + imports use separate walks (unique recursion patterns),
     // then a single unified cursor walk handles the remaining 7 extractors.
-    cbm_extract_definitions(&ctx);
-    cbm_extract_imports(&ctx);
+    // Владельцы Rust `impl` могут называться через `use`, поэтому карта импортов
+    // нужна до создания QN метода. Для остальных языков сохраняется прежний порядок.
+    if (language == CBM_LANG_RUST) {
+        cbm_extract_imports(&ctx);
+        cbm_extract_definitions(&ctx);
+    } else {
+        cbm_extract_definitions(&ctx);
+        cbm_extract_imports(&ctx);
+    }
     cbm_extract_unified(&ctx);
 
     // Channel detection (Socket.IO / EventEmitter) — JS/TS only.

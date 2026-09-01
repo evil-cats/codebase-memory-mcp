@@ -875,6 +875,64 @@ static bool cross_file_call_exists(cbm_store_t *s, const char *project, const ch
     return found;
 }
 
+/* Проверяет ровно одно ребро между узлами с полными QN. Такой контракт не даёт
+ * одноимённому методу другого типа случайно удовлетворить регрессию. */
+static bool exact_qn_edge_exists(cbm_store_t *s, const char *project, const char *source_qn,
+                                 const char *target_qn, const char *edge_type) {
+    cbm_node_t source = {0};
+    cbm_node_t target = {0};
+    if (cbm_store_find_node_by_qn(s, project, source_qn, &source) != CBM_STORE_OK ||
+        cbm_store_find_node_by_qn(s, project, target_qn, &target) != CBM_STORE_OK) {
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+        return false;
+    }
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    int matches = 0;
+    if (cbm_store_find_edges_by_source_type(s, source.id, edge_type, &edges, &edge_count) ==
+        CBM_STORE_OK) {
+        for (int i = 0; i < edge_count; i++) {
+            if (edges[i].target_id == target.id) {
+                matches++;
+            }
+        }
+    }
+    cbm_store_free_edges(edges, edge_count);
+    cbm_node_free_fields(&source);
+    cbm_node_free_fields(&target);
+    return matches == 1;
+}
+
+/* Проверяет точные межфайловые связи Go/Rust и отсутствие прежних ложных QN. */
+static bool owner_method_edges_exist(cbm_store_t *s, const char *project) {
+    if (!exact_qn_edge_exists(s, project, "pkg.Widget", "pkg.Widget.Parse",
+                              "DEFINES_METHOD") ||
+        !exact_qn_edge_exists(s, project, "rust.model.Remote",
+                              "rust.model.Remote.parse_imported", "DEFINES_METHOD") ||
+        !exact_qn_edge_exists(s, project, "rust.model.Remote", "rust.model.Remote.parse_remote",
+                              "DEFINES_METHOD")) {
+        return false;
+    }
+    static const char *const stale_qns[] = {
+        "pkg.Parse",
+        "rust.imported_impl.Remote",
+        "rust.remote_impl.crate::model::Remote",
+    };
+    for (size_t i = 0; i < sizeof(stale_qns) / sizeof(stale_qns[0]); i++) {
+        cbm_node_t stale = {0};
+        int rc = cbm_store_find_node_by_qn(s, project, stale_qns[i], &stale);
+        if (rc == CBM_STORE_OK) {
+            cbm_node_free_fields(&stale);
+            return false;
+        }
+        if (rc != CBM_STORE_NOT_FOUND) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* True iff the exact named CALLS edge exists and its serialized strategy
  * contains `strategy_fragment`. Parallel synthetic-carrier regressions use
  * this on a separate ordinary-call control: it proves the cross-file LSP ran
@@ -1023,6 +1081,78 @@ TEST(pipeline_incremental_preserves_cross_file_calls) {
     ASSERT_TRUE(cross_file_call_exists(s2, project2, "Serve", "Help"));
     cbm_store_close(s2);
     cbm_pipeline_free(p2);
+
+    teardown_test_repo();
+    PASS();
+}
+
+/* Изменение только файла владельца не переизвлекает метод, а изменение только
+ * файла метода не переизвлекает владельца. В обоих случаях точное межфайловое
+ * `DEFINES_METHOD` должно совпасть с результатом полного индекса. */
+TEST(pipeline_incremental_preserves_cross_file_defines_method) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    ASSERT_EQ(th_write_file(TH_PATH(g_tmpdir, "pkg/model.go"),
+                            "package pkg\n\ntype Widget struct{}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(g_tmpdir, "pkg/methods.go"),
+                            "package pkg\n\nfunc (w *Widget) Parse() {}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(g_tmpdir, "rust/model.rs"), "pub struct Remote;\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(g_tmpdir, "rust/imported_impl.rs"),
+                            "use crate::model::Remote;\n"
+                            "impl Remote { pub fn parse_imported(&self) {} }\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(g_tmpdir, "rust/remote_impl.rs"),
+                            "impl crate::model::Remote {\n"
+                            "    pub fn parse_remote(&self) {}\n"
+                            "}\n"),
+              0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_incr_defines_method.db", g_tmpdir);
+
+    cbm_pipeline_t *full = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(full);
+    ASSERT_EQ(cbm_pipeline_run(full), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(full));
+    cbm_pipeline_free(full);
+
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_TRUE(owner_method_edges_exist(store, project));
+    cbm_store_close(store);
+
+    /* Меняются только файлы владельцев; узлы методов остаются в старых файлах. */
+    ASSERT_EQ(th_append_file(TH_PATH(g_tmpdir, "pkg/model.go"), "\n// owner changed\n"), 0);
+    ASSERT_EQ(th_append_file(TH_PATH(g_tmpdir, "rust/model.rs"), "\n// owner changed\n"), 0);
+    cbm_pipeline_t *owner_update = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(owner_update);
+    ASSERT_EQ(cbm_pipeline_run(owner_update), 0);
+    cbm_pipeline_free(owner_update);
+    store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_TRUE(owner_method_edges_exist(store, project));
+    cbm_store_close(store);
+
+    /* Теперь меняются только файлы методов; узлы владельцев остаются неизменными. */
+    ASSERT_EQ(th_append_file(TH_PATH(g_tmpdir, "pkg/methods.go"), "\n// method changed\n"), 0);
+    ASSERT_EQ(th_append_file(TH_PATH(g_tmpdir, "rust/imported_impl.rs"),
+                             "\n// method changed\n"),
+              0);
+    ASSERT_EQ(th_append_file(TH_PATH(g_tmpdir, "rust/remote_impl.rs"),
+                             "\n// method changed\n"),
+              0);
+    cbm_pipeline_t *method_update = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(method_update);
+    ASSERT_EQ(cbm_pipeline_run(method_update), 0);
+    cbm_pipeline_free(method_update);
+    store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_TRUE(owner_method_edges_exist(store, project));
+    cbm_store_close(store);
 
     teardown_test_repo();
     PASS();
@@ -12163,6 +12293,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_nix_scoped_binding_calls_resolve);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
+    RUN_TEST(pipeline_incremental_preserves_cross_file_defines_method);
     RUN_TEST(pipeline_legacy_qn_format_forces_full_reindex);
     RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
     RUN_TEST(pipeline_objectscript_export_incremental_matches_full_relationships);

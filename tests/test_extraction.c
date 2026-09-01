@@ -3316,6 +3316,69 @@ static const CBMDefinition *find_def_by_name(CBMFileResult *r, const char *name)
     return NULL;
 }
 
+/* Возвращает определение только при точном совпадении полного QN. Эта проверка
+ * различает одноимённые методы разных владельцев и не маскирует их схлопывание. */
+static const CBMDefinition *find_def_by_qn(CBMFileResult *r, const char *qn) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].qualified_name &&
+            strcmp(r->defs.items[i].qualified_name, qn) == 0) {
+            return &r->defs.items[i];
+        }
+    }
+    return NULL;
+}
+
+/* Считает определения с заданными `label` и `name`, не объединяя их по QN. */
+static int count_defs_by_label_name(CBMFileResult *r, const char *label, const char *name) {
+    int count = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *def = &r->defs.items[i];
+        if (def->label && def->name && strcmp(def->label, label) == 0 &&
+            strcmp(def->name, name) == 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* Доказывает, что конкретный вызов принадлежит ровно ожидаемому методу. */
+static int has_call_with_enclosing_qn(CBMFileResult *r, const char *callee, const char *qn) {
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (call->callee_name && call->enclosing_func_qn &&
+            strcmp(call->callee_name, callee) == 0 && strcmp(call->enclosing_func_qn, qn) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Доказывает согласованность QN семантической записи с QN определения метода. */
+static int has_usage_with_enclosing_qn(CBMFileResult *r, const char *name, const char *qn) {
+    for (int i = 0; i < r->usages.count; i++) {
+        const CBMUsage *usage = &r->usages.items[i];
+        if (usage->ref_name && usage->enclosing_func_qn && strcmp(usage->ref_name, name) == 0 &&
+            strcmp(usage->enclosing_func_qn, qn) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Находит LSP-запись вызова с точным QN вызывающего метода. Уверенность цели
+ * намеренно не проверяется: локальное разрешение функций внутри `mod` — другой контракт. */
+static int has_lsp_call_with_caller_qn(CBMFileResult *r, const char *callee_fragment,
+                                       const char *caller_qn) {
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *call = &r->resolved_calls.items[i];
+        if (call->caller_qn && call->callee_qn && strcmp(call->caller_qn, caller_qn) == 0 &&
+            strstr(call->callee_qn, callee_fragment) != NULL) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int decorators_contain(const CBMDefinition *d, const char *needle) {
     if (!d || !d->decorators) {
         return 0;
@@ -3561,15 +3624,217 @@ TEST(extract_go_no_filename_in_module_qn) {
     ASSERT_NOT_NULL(conn);
     ASSERT_STR_EQ(conn->qualified_name, "myapp.db.Conn");
 
-    /* Узел метода Go сохраняет плоский QN (модуль и имя), а тип получателя
-     * хранится отдельно в parent_class. */
+    /* QN метода включает тип получателя, но по-прежнему не включает имя файла. */
     const CBMDefinition *query = find_def_by_name(r, "Query");
     ASSERT_NOT_NULL(query);
-    ASSERT_STR_EQ(query->qualified_name, "myapp.db.Query");
+    ASSERT_STR_EQ(query->qualified_name, "myapp.db.Conn.Query");
     ASSERT_EQ(strstr(query->qualified_name, ".conn."), NULL);
-    /* parent_class метода должен совпадать с QN узла типа для DEFINES_METHOD. */
+    /* `parent_class` метода должен совпадать с QN узла типа для `DEFINES_METHOD`. */
     ASSERT_NOT_NULL(query->parent_class);
     ASSERT_STR_EQ(query->parent_class, "myapp.db.Conn");
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Out-of-line определение внутри namespace должно сохранять тот же QN владельца,
+ * что и объявление класса; вызовы и usages внутри метода обязаны ссылаться на
+ * получившийся канонический QN метода. */
+TEST(cpp_out_of_line_method_preserves_lexical_namespace) {
+    CBMFileResult *r = extract("namespace sniper::dsp::handlers {\n"
+                               "bool enabled = true;\n"
+                               "int helper() { return 1; }\n"
+                               "class AdcampRequest {\n"
+                               "public:\n"
+                               "    bool parse() const;\n"
+                               "};\n"
+                               "bool AdcampRequest::parse() const {\n"
+                               "    return enabled && helper() != 0;\n"
+                               "}\n"
+                               "}\n",
+                               CBM_LANG_CPP, "proj",
+                               "src/handlers/adcamp/AdCampRequest.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+
+    const char *class_qn =
+        "src.handlers.adcamp.AdCampRequest.sniper::dsp::handlers.AdcampRequest";
+    const char *method_qn =
+        "src.handlers.adcamp.AdCampRequest.sniper::dsp::handlers.AdcampRequest.parse() const";
+    const CBMDefinition *owner = find_def_by_qn(r, class_qn);
+    const CBMDefinition *method = find_def_by_qn(r, method_qn);
+    ASSERT_NOT_NULL(owner);
+    ASSERT_NOT_NULL(method);
+    ASSERT_NOT_NULL(method->parent_class);
+    ASSERT_STR_EQ(method->parent_class, owner->qualified_name);
+    ASSERT_TRUE(has_call_with_enclosing_qn(r, "helper", method_qn));
+    ASSERT_TRUE(has_usage_with_enclosing_qn(r, "enabled", method_qn));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Два receiver-типа с методом Parse должны создавать разные QN; value,
+ * pointer и generic receiver используют QN своего базового типа без имени файла. */
+TEST(go_receiver_method_qn_includes_owner) {
+    CBMFileResult *r = extract("package sample\n\n"
+                               "var widgetEnabled = true\n"
+                               "var gadgetEnabled = true\n"
+                               "func helperWidget() {}\n"
+                               "func helperGadget() {}\n"
+                               "type Widget struct{}\n"
+                               "type Gadget struct{}\n"
+                               "type Box[T any] struct { value T }\n"
+                               "func (w *Widget) Parse() {\n"
+                               "    if widgetEnabled { helperWidget() }\n"
+                               "}\n"
+                               "func (g Gadget) Parse() {\n"
+                               "    if gadgetEnabled { helperGadget() }\n"
+                               "}\n"
+                               "func (*Widget) PointerOnly() {}\n"
+                               "func (Gadget) ValueOnly() {}\n"
+                               "func (b Box[T]) Value() T { return b.value }\n",
+                               CBM_LANG_GO, "proj", "pkg/methods.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(count_defs_by_label_name(r, "Method", "Parse"), 2);
+
+    const CBMDefinition *widget = find_def_by_qn(r, "pkg.Widget.Parse");
+    const CBMDefinition *gadget = find_def_by_qn(r, "pkg.Gadget.Parse");
+    const CBMDefinition *pointer_only = find_def_by_qn(r, "pkg.Widget.PointerOnly");
+    const CBMDefinition *value_only = find_def_by_qn(r, "pkg.Gadget.ValueOnly");
+    const CBMDefinition *value = find_def_by_qn(r, "pkg.Box.Value");
+    ASSERT_NOT_NULL(widget);
+    ASSERT_NOT_NULL(gadget);
+    ASSERT_NOT_NULL(pointer_only);
+    ASSERT_NOT_NULL(value_only);
+    ASSERT_NOT_NULL(value);
+    ASSERT_STR_EQ(widget->parent_class, "pkg.Widget");
+    ASSERT_STR_EQ(gadget->parent_class, "pkg.Gadget");
+    ASSERT_STR_EQ(value->parent_class, "pkg.Box");
+    ASSERT_TRUE(has_call_with_enclosing_qn(r, "helperWidget", widget->qualified_name));
+    ASSERT_TRUE(has_call_with_enclosing_qn(r, "helperGadget", gadget->qualified_name));
+    ASSERT_TRUE(has_usage_with_enclosing_qn(r, "widgetEnabled", widget->qualified_name));
+    ASSERT_TRUE(has_usage_with_enclosing_qn(r, "gadgetEnabled", gadget->qualified_name));
+    ASSERT_TRUE(has_lsp_call_with_caller_qn(r, "helperWidget", widget->qualified_name));
+    ASSERT_TRUE(has_lsp_call_with_caller_qn(r, "helperGadget", gadget->qualified_name));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Встроенные Rust-модули входят в QN типов, методов и свободных функций, чтобы
+ * одинаковые имена в соседних mod не схлопывались в один узел. */
+TEST(rust_inline_modules_qualify_types_and_methods) {
+    CBMFileResult *r = extract("pub mod first {\n"
+                               "    pub static ENABLED: bool = true;\n"
+                               "    pub struct Nested;\n"
+                               "    pub fn helper() {}\n"
+                               "    pub fn same() {}\n"
+                               "    impl Nested {\n"
+                               "        pub fn parse(&self) {\n"
+                               "            if ENABLED { helper(); }\n"
+                               "        }\n"
+                               "    }\n"
+                               "}\n"
+                               "pub mod second {\n"
+                               "    pub static ENABLED: bool = true;\n"
+                               "    pub struct Nested;\n"
+                               "    pub fn helper() {}\n"
+                               "    pub fn same() {}\n"
+                               "    impl Nested {\n"
+                               "        pub fn parse(&self) {\n"
+                               "            if ENABLED { helper(); }\n"
+                               "        }\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_RUST, "proj", "rust/inline.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(count_defs_by_label_name(r, "Struct", "Nested"), 2);
+    ASSERT_EQ(count_defs_by_label_name(r, "Method", "parse"), 2);
+
+    const CBMDefinition *first_type = find_def_by_qn(r, "rust.inline.first.Nested");
+    const CBMDefinition *second_type = find_def_by_qn(r, "rust.inline.second.Nested");
+    const CBMDefinition *first_method = find_def_by_qn(r, "rust.inline.first.Nested.parse");
+    const CBMDefinition *second_method = find_def_by_qn(r, "rust.inline.second.Nested.parse");
+    ASSERT_NOT_NULL(first_type);
+    ASSERT_NOT_NULL(second_type);
+    ASSERT_NOT_NULL(first_method);
+    ASSERT_NOT_NULL(second_method);
+    ASSERT_STR_EQ(first_method->parent_class, first_type->qualified_name);
+    ASSERT_STR_EQ(second_method->parent_class, second_type->qualified_name);
+    ASSERT_TRUE(has_def_qn(r, "rust.inline.first.same"));
+    ASSERT_TRUE(has_def_qn(r, "rust.inline.second.same"));
+    ASSERT_TRUE(has_call_with_enclosing_qn(r, "helper", first_method->qualified_name));
+    ASSERT_TRUE(has_call_with_enclosing_qn(r, "helper", second_method->qualified_name));
+    ASSERT_TRUE(has_usage_with_enclosing_qn(r, "ENABLED", first_method->qualified_name));
+    ASSERT_TRUE(has_usage_with_enclosing_qn(r, "ENABLED", second_method->qualified_name));
+    ASSERT_TRUE(has_lsp_call_with_caller_qn(r, "helper", first_method->qualified_name));
+    ASSERT_TRUE(has_lsp_call_with_caller_qn(r, "helper", second_method->qualified_name));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Квалифицированный impl в текущем файле должен разрешаться к QN фактического
+ * типа, а не хранить исходную строку model::Qualified как непрозрачный сегмент. */
+TEST(rust_qualified_impl_uses_declared_type_qn) {
+    CBMFileResult *r = extract("fn helper() {}\n"
+                               "pub mod model {\n"
+                               "    pub struct Qualified;\n"
+                               "}\n"
+                               "impl model::Qualified {\n"
+                               "    pub fn parse_qualified(&self) { helper(); }\n"
+                               "}\n",
+                               CBM_LANG_RUST, "proj", "rust/qualified.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+
+    const CBMDefinition *owner = find_def_by_qn(r, "rust.qualified.model.Qualified");
+    const CBMDefinition *method =
+        find_def_by_qn(r, "rust.qualified.model.Qualified.parse_qualified");
+    ASSERT_NOT_NULL(owner);
+    ASSERT_NOT_NULL(method);
+    ASSERT_STR_EQ(method->parent_class, owner->qualified_name);
+    ASSERT_TRUE(has_lsp_call_with_caller_qn(r, "helper", method->qualified_name));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Пути `self` и `super` разрешаются относительно встроенного Rust-модуля, а не
+ * относительно имени файла реализации. */
+TEST(rust_self_and_super_impl_use_declared_type_qn) {
+    CBMFileResult *r = extract("pub struct Root;\n"
+                               "pub mod nested {\n"
+                               "    pub struct Local;\n"
+                               "    impl self::Local {\n"
+                               "        pub fn local(&self) {}\n"
+                               "    }\n"
+                               "    impl super::Root {\n"
+                               "        pub fn root(&self) {}\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_RUST, "proj", "rust/paths.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+
+    const CBMDefinition *local_owner = find_def_by_qn(r, "rust.paths.nested.Local");
+    const CBMDefinition *root_owner = find_def_by_qn(r, "rust.paths.Root");
+    const CBMDefinition *local_method = find_def_by_qn(r, "rust.paths.nested.Local.local");
+    const CBMDefinition *root_method = find_def_by_qn(r, "rust.paths.Root.root");
+    ASSERT_NOT_NULL(local_owner);
+    ASSERT_NOT_NULL(root_owner);
+    ASSERT_NOT_NULL(local_method);
+    ASSERT_NOT_NULL(root_method);
+    ASSERT_STR_EQ(local_method->parent_class, local_owner->qualified_name);
+    ASSERT_STR_EQ(root_method->parent_class, root_owner->qualified_name);
 
     cbm_free_result(r);
     PASS();
@@ -5697,6 +5962,7 @@ SUITE(extraction) {
     RUN_TEST(cpp_gtest_same_name_collision_issue1266);
     RUN_TEST(cpp_gtest_f_unique_name_issue1266);
     RUN_TEST(cpp_out_of_line_method_issue428);
+    RUN_TEST(cpp_out_of_line_method_preserves_lexical_namespace);
     RUN_TEST(cobol_paragraph);
     RUN_TEST(verilog_module);
     RUN_TEST(cuda_kernel);
@@ -5822,6 +6088,10 @@ SUITE(extraction) {
     RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);
     RUN_TEST(extract_java_no_double_class_qn);
     RUN_TEST(extract_go_no_filename_in_module_qn);
+    RUN_TEST(go_receiver_method_qn_includes_owner);
+    RUN_TEST(rust_inline_modules_qualify_types_and_methods);
+    RUN_TEST(rust_qualified_impl_uses_declared_type_qn);
+    RUN_TEST(rust_self_and_super_impl_use_declared_type_qn);
     RUN_TEST(extract_large_ts_has_functions_issue213);
 
     /* Per-function complexity metrics (Tier A) */
