@@ -659,27 +659,29 @@ static const tool_def_t TOOLS[] = {
 
     {"detect_changes", "Detect changes",
      "Resolve Git changes against the current worktree. scope=\"symbols\" returns the complete, "
-     "sorted set of current Function/Method nodes whose indexed line ranges intersect the "
-     "zero-context diff; it performs no graph traversal. scope=\"impact\" (default) uses exactly "
-     "those changed symbols as the seeds for ONE multi-source blast-radius traversal and keeps "
-     "the existing changed_files/impacted response. scope=\"files\" preserves the existing "
-     "changed-file response and performs no graph traversal. Optional fields add label, file, "
-     "and/or current lines to changed_symbols. direction, depth, and limit do not affect symbols; "
-     "limit applies only to impacted rows and never truncates changed_symbols.",
+     "sorted set of current Function, Method, Class, Struct, or Interface nodes whose indexed "
+     "line ranges intersect the zero-context diff; it performs no graph traversal. "
+     "scope=\"impact\" (default) uses exactly the changed Function/Method nodes as the seeds for "
+     "ONE multi-source blast-radius traversal and keeps the existing changed_files/impacted "
+     "response. scope=\"files\" preserves the existing changed-file response and performs no graph "
+     "traversal. Optional fields add label, file, and/or current lines to changed_symbols. "
+     "direction, depth, and limit do not affect symbols; limit applies only to impacted rows and "
+     "never truncates changed_symbols.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"scope\":{\"type\":"
      "\"string\",\"enum\":[\"files\",\"symbols\",\"impact\"],\"default\":\"impact\","
-     "\"description\":\"files: changed files only. symbols: exact changed Function/Method nodes "
-     "only, with no traversal. impact: changed files plus traversal seeded only by those exact "
-     "changed symbols.\"},"
+     "\"description\":\"files: changed files only. symbols: exact changed "
+     "Function/Method/Class/Struct/Interface nodes only, with no traversal. impact: changed files "
+     "plus traversal seeded only by exact changed Function/Method nodes.\"},"
      "\"fields\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[\"label\","
      "\"file\",\"lines\"]},\"uniqueItems\":true,\"maxItems\":3,\"description\":\"Optional "
      "per-symbol fields. Without fields, changed_symbols is an array of qualified-name strings.\"},"
      "\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\",\"both\"],\"default\":"
      "\"inbound\",\"description\":\"inbound (default) = the blast radius: transitive CALLERS of "
-     "the "
-     "changed symbols. outbound = what the changed code depends on. both = union.\"},"
-     "\"depth\":{\"type\":\"integer\",\"default\":2,\"description\":\"Max traversal hops from the "
-     "changed symbols.\"},\"limit\":{\"type\":\"integer\",\"default\":200,\"maximum\":5000,"
+     "the changed Function/Method seeds. outbound = what the changed code depends on. both = "
+     "union.\"},"
+     "\"depth\":{\"type\":\"integer\",\"default\":2,\"description\":\"Max traversal hops from "
+     "the changed Function/Method seeds.\"},\"limit\":{\"type\":\"integer\",\"default\":200,"
+     "\"maximum\":5000,"
      "\"description\":\"Maximum impacted rows shown (nearest hops first). impacted_total is "
      "always exact and the impacted_modules rollup always complete regardless.\"},"
      "\"base_branch\":{\"type\":"
@@ -10576,10 +10578,26 @@ static bool detect_parse_patch(FILE *patch, detect_file_list_t *files) {
     return !ferror(patch);
 }
 
-/* Выбирает из актуального индекса только Function/Method с валидными строками,
- * чьи текущие диапазоны пересекают хотя бы один hunk либо новый файл целиком. */
+/* Вызываемые узлы допустимы в обоих режимах. Контейнеры типов добавляются только
+ * в отчёт `symbols`, а CALLS-анализ `impact` сохраняет прежние начальные узлы. */
+static bool detect_label_is_changed_symbol(const char *label, bool include_type_containers) {
+    if (!label) {
+        return false;
+    }
+    if (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0) {
+        return true;
+    }
+    return include_type_containers &&
+           (strcmp(label, "Class") == 0 || strcmp(label, "Struct") == 0 ||
+            strcmp(label, "Interface") == 0);
+}
+
+/* Выбирает текущие индексированные узлы с валидными строками, чьи собственные
+ * диапазоны пересекают hunk либо новый файл целиком. Графовые связи владельца
+ * не распространяют изменение между узлами. */
 static bool detect_collect_changed_symbols(cbm_store_t *store, const char *project,
                                            const detect_file_list_t *files,
+                                           bool include_type_containers,
                                            detect_symbol_list_t *symbols) {
     for (int i = 0; i < files->count; i++) {
         const detect_file_change_t *file = &files->items[i];
@@ -10595,15 +10613,16 @@ static bool detect_collect_changed_symbols(cbm_store_t *store, const char *proje
         }
         for (int j = 0; j < node_count; j++) {
             const cbm_node_t *node = &nodes[j];
-            bool callable = node->label && (strcmp(node->label, "Function") == 0 ||
-                                            strcmp(node->label, "Method") == 0);
+            bool selected_label =
+                detect_label_is_changed_symbol(node->label, include_type_containers);
             bool valid_range = node->start_line > 0 && node->end_line >= node->start_line;
             bool changed = file->whole_file;
             for (int k = 0; !changed && k < file->range_count; k++) {
                 changed = node->start_line <= file->ranges[k].end_line &&
                           file->ranges[k].start_line <= node->end_line;
             }
-            if (callable && valid_range && changed && !detect_symbol_list_add(symbols, node)) {
+            if (selected_label && valid_range && changed &&
+                !detect_symbol_list_add(symbols, node)) {
                 cbm_store_free_nodes(nodes, node_count);
                 return false;
             }
@@ -11187,7 +11206,8 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
                                 : "git diff failed while resolving changed symbol ranges",
                 true);
         }
-        if (!detect_collect_changed_symbols(store, project, &files, &changed_symbols)) {
+        if (!detect_collect_changed_symbols(store, project, &files, scope_symbols,
+                                            &changed_symbols)) {
             detect_file_list_free(&files);
             detect_symbol_list_free(&changed_symbols);
             free(direction);
@@ -11223,7 +11243,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
-    /* Impact использует один BFS от полного набора точных изменённых узлов. */
+    /* Impact использует один BFS только от точных изменённых вызываемых узлов. */
     cbm_traverse_result_t impact = {0};
     bool truncated = false;
     if (scope_impact && seed_count > 0) {
