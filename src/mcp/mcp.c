@@ -8583,6 +8583,8 @@ static void add_snippet_coverage_note(yyjson_mut_doc *doc, yyjson_mut_val *root_
     cbm_store_free_coverage(rows, count);
 }
 
+/* Формирует ответ `get_code_snippet`: координаты описывают полный диапазон
+ * символа, а лимит строк независимо ограничивает только поле `source`. */
 static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
                                     const char *match_method, bool include_neighbors,
                                     cbm_node_t *alternatives, int alt_count) {
@@ -8591,19 +8593,18 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     int start = node->start_line > 0 ? node->start_line : SKIP_ONE;
     /* Равные границы задают корректный однострочный символ; резервный диапазон
      * нужен только при отсутствующей или обратной конечной границе. */
-    int end = node->end_line >= start ? node->end_line : start + SNIPPET_DEFAULT_LINES;
-    /* Context-bomb guard: a structural node (Module/File) spans its whole file,
-     * so an unclipped read returned the ENTIRE source — a field-eval agent that
-     * fell back to a Module snippet pulled 400KB in one call. Cap the line span
-     * (far above any real function) and flag it; the exact range is still in
-     * start_line/end_line for a targeted re-read. */
+    int reported_end = node->end_line >= start ? node->end_line : start + SNIPPET_DEFAULT_LINES;
+    int source_end = reported_end;
+    /* Ограничение защищает от чтения целого файла через структурный узел
+     * `Module`/`File`. Полный диапазон символа остаётся в `start_line/end_line`,
+     * а `source_end` управляет только объёмом поля `source`. */
     bool snippet_clipped = false;
-    if (end - start + 1 > MCP_SNIPPET_MAX_LINES) {
-        end = start + MCP_SNIPPET_MAX_LINES - 1;
+    if (source_end - start + 1 > MCP_SNIPPET_MAX_LINES) {
+        source_end = start + MCP_SNIPPET_MAX_LINES - 1;
         snippet_clipped = true;
     }
     char *abs_path = NULL;
-    char *source = resolve_snippet_source(root_path, node->file_path, start, end, &abs_path);
+    char *source = resolve_snippet_source(root_path, node->file_path, start, source_end, &abs_path);
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
@@ -8622,7 +8623,7 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     }
     yyjson_mut_obj_add_str(doc, root_obj, "file_path", display_path);
     yyjson_mut_obj_add_int(doc, root_obj, "start_line", start);
-    yyjson_mut_obj_add_int(doc, root_obj, "end_line", end);
+    yyjson_mut_obj_add_int(doc, root_obj, "end_line", reported_end);
     if (snippet_clipped) {
         yyjson_mut_obj_add_bool(doc, root_obj, "source_clipped", true);
         yyjson_mut_obj_add_int(doc, root_obj, "clipped_at_lines", MCP_SNIPPET_MAX_LINES);

@@ -2089,11 +2089,10 @@ TEST(tool_get_architecture_cycles_detects_scc) {
     PASS();
 }
 
-/* Context-bomb guard: get_code_snippet on a whole-file node (a Module/File
- * span) used to read the ENTIRE file into one response — a field-eval agent
- * that fell back to a Module snippet pulled ~400KB in a single call. The read
- * must clip at MCP_SNIPPET_MAX_LINES and flag source_clipped, while the exact
- * start/end range stays in the response for a targeted re-read. */
+/* Защита от переполнения контекста: `get_code_snippet` для узла `Module`/`File`
+ * раньше читал целый файл, и ошибочный переход агента к `Module` возвращал около
+ * 400 КБ. Поле `source` должно ограничиваться `MCP_SNIPPET_MAX_LINES`, не заменяя
+ * точный диапазон символа диапазоном возвращённого текста. */
 TEST(tool_get_code_snippet_clips_whole_file_node) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_snipcap_XXXXXX");
@@ -2135,11 +2134,16 @@ TEST(tool_get_code_snippet_clips_whole_file_node) {
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"start_line\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "\"end_line\":2000"));
     ASSERT_NOT_NULL(strstr(inner, "\"source_clipped\":true"));
-    /* The whole 2000-line file (~100KB) must NOT be in the response. */
+    ASSERT_NOT_NULL(strstr(inner, "\"clipped_at_lines\":500"));
+    /* Полный файл из 2000 строк объёмом около 100 КБ не должен попасть в ответ. */
     ASSERT_TRUE(strlen(inner) < 60000);
-    /* The last line must be absent (clipped), the first present. */
+    /* `source` заканчивается на лимите, а диапазон ответа остаётся точным. */
     ASSERT_NOT_NULL(strstr(inner, "line_0000"));
+    ASSERT_NOT_NULL(strstr(inner, "line_0499"));
+    ASSERT_NULL(strstr(inner, "line_0500"));
     ASSERT_NULL(strstr(inner, "line_1999"));
     free(inner);
     free(resp);
