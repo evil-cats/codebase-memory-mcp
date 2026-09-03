@@ -11,6 +11,7 @@
 #include "platform.h"  /* cbm_now_ms */
 #include "sanitized.h" /* CBM_SANITIZED — spawn-retry budget */
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -28,6 +29,9 @@
 #ifdef __APPLE__
 #include <spawn.h>
 extern char **environ;
+#endif
+#ifdef __linux__
+#include <sys/syscall.h>
 #endif
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -947,6 +951,35 @@ static bool cbm_spawn_eagain_injected(void) {
     }
     return false;
 }
+
+static cbm_subprocess_fd_close_test_mode_t g_fd_close_test_mode = CBM_SUBPROCESS_FD_CLOSE_TEST_OFF;
+
+void cbm_subprocess_set_fd_close_test_mode_for_testing(cbm_subprocess_fd_close_test_mode_t mode) {
+    if (mode < CBM_SUBPROCESS_FD_CLOSE_TEST_OFF ||
+        mode > CBM_SUBPROCESS_FD_CLOSE_TEST_FORCE_RANGE_ERROR) {
+        mode = CBM_SUBPROCESS_FD_CLOSE_TEST_OFF;
+    }
+    g_fd_close_test_mode = mode;
+}
+
+/* Дочерний процесс сообщает выбранную ветку только тестовой сборке. `write()`
+ * сохраняет требуемую безопасность между `fork()` и `execvp()`. */
+static void cbm_posix_report_fd_close_strategy(const char *marker, size_t marker_size) {
+    if (g_fd_close_test_mode == CBM_SUBPROCESS_FD_CLOSE_TEST_OFF) {
+        return;
+    }
+    size_t offset = 0;
+    while (offset < marker_size) {
+        ssize_t written = write(STDERR_FILENO, marker + offset, marker_size - offset);
+        if (written > 0) {
+            offset += (size_t)written;
+        } else if (written < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+}
 #endif
 
 /* The bound is on a single WAIT, and 2560ms (10ms << 8) is the largest wait
@@ -1020,6 +1053,36 @@ static void cbm_posix_reset_child_signals(void) {
     (void)sigprocmask(SIG_SETMASK, &empty, NULL);
 }
 
+/* Закрывает все унаследованные `fd`, кроме уже подготовленных стандартных
+ * потоков. Linux обрабатывает весь диапазон в ядре; любая ошибка системного
+ * вызова возвращает прежний полный цикл и сохраняет защитный инвариант. */
+static void cbm_posix_close_inherited_fds(long max_fd) {
+#if defined(__linux__) && defined(SYS_close_range)
+    bool try_close_range = true;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_fd_close_test_mode == CBM_SUBPROCESS_FD_CLOSE_TEST_FORCE_RANGE_ERROR) {
+        errno = ENOSYS;
+        try_close_range = false;
+    }
+#endif
+    if (try_close_range &&
+        syscall(SYS_close_range, (unsigned int)(STDERR_FILENO + 1), UINT_MAX, 0) == 0) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+        static const char marker[] = CBM_SUBPROCESS_FD_CLOSE_RANGE_TEST_MARKER "\n";
+        cbm_posix_report_fd_close_strategy(marker, sizeof(marker) - 1);
+#endif
+        return;
+    }
+#endif
+    for (int fd = STDERR_FILENO + 1; fd < max_fd; fd++) {
+        (void)close(fd);
+    }
+#ifdef CBM_ENABLE_TEST_SEAMS
+    static const char marker[] = CBM_SUBPROCESS_FD_CLOSE_LOOP_TEST_MARKER "\n";
+    cbm_posix_report_fd_close_strategy(marker, sizeof(marker) - 1);
+#endif
+}
+
 /* fork+exec child setup. On Apple this runs ONLY for the exec-failure
  * fallback (see cbm_posix_spawn_apple), which preserves the documented
  * "bogus binary => child exits 127" contract across platforms. */
@@ -1041,9 +1104,7 @@ static void cbm_posix_child_exec(cbm_subprocess_t *process, int input, int outpu
     if (output > STDERR_FILENO) {
         (void)close(output);
     }
-    for (int fd = STDERR_FILENO + 1; fd < max_fd; fd++) {
-        (void)close(fd);
-    }
+    cbm_posix_close_inherited_fds(max_fd);
     /* A fixed literal tool name (for example "git" or "curl") uses the
      * caller's normal PATH without introducing a shell. An explicit path
      * still has execvp's exact-path semantics because it contains '/'. */

@@ -183,6 +183,23 @@ bool cbm_build_win_cmd_payload(char *buf, size_t cap, const char *cmd_executable
  * of hoping a loaded machine reproduces it. Test builds only. */
 void cbm_subprocess_force_spawn_eagain_for_testing(int attempts);
 int cbm_subprocess_pending_spawn_eagain_for_testing(void);
+
+#ifndef _WIN32
+/* Управляет наблюдением за способом закрытия `fd` в дочернем процессе. Режим
+ * `FORCE_RANGE_ERROR` имитирует `ENOSYS` и обязан перейти к числовому циклу.
+ * Маркеры пишутся в уже перенаправленный `stderr`; рабочая сборка этого API не
+ * содержит. */
+typedef enum {
+    CBM_SUBPROCESS_FD_CLOSE_TEST_OFF = 0,
+    CBM_SUBPROCESS_FD_CLOSE_TEST_REPORT,
+    CBM_SUBPROCESS_FD_CLOSE_TEST_FORCE_RANGE_ERROR,
+} cbm_subprocess_fd_close_test_mode_t;
+
+#define CBM_SUBPROCESS_FD_CLOSE_RANGE_TEST_MARKER "cbm-subprocess-fd-close=close_range"
+#define CBM_SUBPROCESS_FD_CLOSE_LOOP_TEST_MARKER "cbm-subprocess-fd-close=loop"
+
+void cbm_subprocess_set_fd_close_test_mode_for_testing(cbm_subprocess_fd_close_test_mode_t mode);
+#endif
 #endif
 
 #endif /* CBM_SUBPROCESS_H */

@@ -21,6 +21,9 @@
 #ifndef _WIN32
 #include <fcntl.h>
 #include <signal.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include <unistd.h>
 #endif
 
@@ -384,6 +387,79 @@ static bool wait_for_log_marker(const char *path, const char *marker, uint64_t d
     return false;
 }
 
+typedef struct {
+    bool prepared;
+    int run_rc;
+    cbm_proc_result_t result;
+    bool close_range_reported;
+    bool loop_reported;
+} subprocess_fd_close_probe_t;
+
+/* Создаёт контрольный `fd` без `FD_CLOEXEC`, запускает общий путь `subprocess` и
+ * собирает как результат наследования, так и тестовый маркер выбранной ветки.
+ * Все временные файлы и тестовый режим очищаются до возврата. */
+static subprocess_fd_close_probe_t run_fd_close_probe(cbm_subprocess_fd_close_test_mode_t mode) {
+    subprocess_fd_close_probe_t probe = {
+        .result = {.outcome = CBM_PROC_SPAWN_FAILED, .exit_code = -1},
+    };
+    char sentinel_path[] = "/tmp/cbm-subprocess-sentinel-XXXXXX";
+    char log_path[] = "/tmp/cbm-subprocess-fd-close-XXXXXX";
+    int sentinel = cbm_mkstemp(sentinel_path);
+    if (sentinel <= STDERR_FILENO) {
+        if (sentinel >= 0) {
+            (void)close(sentinel);
+            (void)unlink(sentinel_path);
+        }
+        return probe;
+    }
+    int log_fd = cbm_mkstemp(log_path);
+    if (log_fd < 0) {
+        (void)close(sentinel);
+        (void)unlink(sentinel_path);
+        return probe;
+    }
+    (void)close(log_fd);
+
+    int flags = fcntl(sentinel, F_GETFD);
+    if (flags < 0 || fcntl(sentinel, F_SETFD, flags & ~FD_CLOEXEC) != 0) {
+        (void)close(sentinel);
+        (void)unlink(sentinel_path);
+        (void)unlink(log_path);
+        return probe;
+    }
+
+    char fd_text[32];
+    int fd_text_size = snprintf(fd_text, sizeof(fd_text), "%d", sentinel);
+    if (fd_text_size <= 0 || (size_t)fd_text_size >= sizeof(fd_text)) {
+        (void)close(sentinel);
+        (void)unlink(sentinel_path);
+        (void)unlink(log_path);
+        return probe;
+    }
+
+    const char *script = "if [ -e /dev/fd/$1 ]; then exit 42; else exit 0; fi";
+    const char *argv[] = {"/bin/sh", "-c", script, "cbm-fd-probe", fd_text, NULL};
+    cbm_proc_opts_t opts = {
+        .bin = "/bin/sh",
+        .argv = argv,
+        .log_file = log_path,
+    };
+    probe.prepared = true;
+    cbm_subprocess_set_fd_close_test_mode_for_testing(mode);
+    probe.run_rc = cbm_subprocess_run(&opts, &probe.result);
+    cbm_subprocess_set_fd_close_test_mode_for_testing(CBM_SUBPROCESS_FD_CLOSE_TEST_OFF);
+    uint64_t read_once = cbm_now_ms();
+    probe.close_range_reported =
+        wait_for_log_marker(log_path, CBM_SUBPROCESS_FD_CLOSE_RANGE_TEST_MARKER, read_once);
+    probe.loop_reported =
+        wait_for_log_marker(log_path, CBM_SUBPROCESS_FD_CLOSE_LOOP_TEST_MARKER, read_once);
+
+    (void)close(sentinel);
+    (void)unlink(sentinel_path);
+    (void)unlink(log_path);
+    return probe;
+}
+
 #endif /* !_WIN32 */
 
 TEST(subprocess_spawn_returns_while_child_is_running) {
@@ -742,31 +818,52 @@ TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification) 
 #endif
 }
 
+/* Общая POSIX-регрессия сохраняет защитный контракт независимо от выбранного
+ * платформенного способа: внешний процесс не получает посторонний `fd`. */
 TEST(subprocess_posix_child_closes_unrelated_descriptors) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX descriptor-inheritance probe; Windows uses a handle allow-list");
 #else
-    char sentinel_path[] = "/tmp/cbm-subprocess-sentinel-XXXXXX";
-    int sentinel = cbm_mkstemp(sentinel_path);
-    ASSERT_TRUE(sentinel > STDERR_FILENO);
-    int flags = fcntl(sentinel, F_GETFD);
-    ASSERT_TRUE(flags >= 0);
-    ASSERT_EQ(fcntl(sentinel, F_SETFD, flags & ~FD_CLOEXEC), 0);
-    char fd_text[32];
-    snprintf(fd_text, sizeof(fd_text), "%d", sentinel);
-    const char *script = "if [ -e /dev/fd/$1 ]; then exit 42; else exit 0; fi";
-    const char *argv[] = {"/bin/sh", "-c", script, "cbm-fd-probe", fd_text, NULL};
-    cbm_proc_opts_t opts = {0};
-    opts.bin = "/bin/sh";
-    opts.argv = argv;
-    cbm_proc_result_t result;
-    int run_rc = cbm_subprocess_run(&opts, &result);
-    (void)close(sentinel);
-    (void)unlink(sentinel_path);
+    subprocess_fd_close_probe_t probe = run_fd_close_probe(CBM_SUBPROCESS_FD_CLOSE_TEST_OFF);
+    ASSERT_TRUE(probe.prepared);
+    ASSERT_EQ(probe.run_rc, 0);
+    ASSERT_EQ(probe.result.outcome, CBM_PROC_CLEAN);
+    ASSERT_EQ(probe.result.exit_code, 0);
+    PASS();
+#endif
+}
 
-    ASSERT_EQ(run_rc, 0);
-    ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
-    ASSERT_EQ(result.exit_code, 0);
+/* На Linux тест отличает `close_range` от функционально корректного, но
+ * медленного числового цикла по маркеру, записанному до `execvp()`. */
+TEST(subprocess_linux_child_uses_close_range_before_exec) {
+#if !defined(__linux__) || !defined(SYS_close_range)
+    SKIP_PLATFORM("Linux: SYS_close_range недоступен при компиляции");
+#else
+    subprocess_fd_close_probe_t probe = run_fd_close_probe(CBM_SUBPROCESS_FD_CLOSE_TEST_REPORT);
+    ASSERT_TRUE(probe.prepared);
+    ASSERT_EQ(probe.run_rc, 0);
+    ASSERT_EQ(probe.result.outcome, CBM_PROC_CLEAN);
+    ASSERT_EQ(probe.result.exit_code, 0);
+    ASSERT_TRUE(probe.close_range_reported);
+    ASSERT_FALSE(probe.loop_reported);
+    PASS();
+#endif
+}
+
+/* Принудительный `ENOSYS` обязан сохранить очистку контрольного `fd`, выполнить
+ * резервный цикл и всё же довести дочерний процесс до `execvp()`. */
+TEST(subprocess_linux_close_range_failure_falls_back) {
+#if !defined(__linux__) || !defined(SYS_close_range)
+    SKIP_PLATFORM("Linux: SYS_close_range недоступен при компиляции");
+#else
+    subprocess_fd_close_probe_t probe =
+        run_fd_close_probe(CBM_SUBPROCESS_FD_CLOSE_TEST_FORCE_RANGE_ERROR);
+    ASSERT_TRUE(probe.prepared);
+    ASSERT_EQ(probe.run_rc, 0);
+    ASSERT_EQ(probe.result.outcome, CBM_PROC_CLEAN);
+    ASSERT_EQ(probe.result.exit_code, 0);
+    ASSERT_FALSE(probe.close_range_reported);
+    ASSERT_TRUE(probe.loop_reported);
     PASS();
 #endif
 }
@@ -1044,6 +1141,8 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_poll_log_delivery_is_bounded_and_terminal_is_lossless);
     RUN_TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification);
     RUN_TEST(subprocess_posix_child_closes_unrelated_descriptors);
+    RUN_TEST(subprocess_linux_child_uses_close_range_before_exec);
+    RUN_TEST(subprocess_linux_close_range_failure_falls_back);
     RUN_TEST(subprocess_root_exit_drains_surviving_descendant);
     RUN_TEST(win_cmdline_index_worker_json);
     RUN_TEST(win_cmdline_roundtrip_battery);
