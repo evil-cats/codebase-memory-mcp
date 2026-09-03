@@ -5922,6 +5922,89 @@ static void teardown_lang_repo(void) {
     g_lang_tmpdir[0] = '\0';
 }
 
+/* Десять предварительных объявлений не конкурируют с единственным определением типа:
+ * узел, его диапазон и CALLS от конструктора должны указывать на Request.h. */
+TEST(pipeline_cpp_forward_declarations_use_definition_qn) {
+    const char *files[] = {"Request.h", "Use.cpp"};
+    const char *contents[] = {"namespace api {\n"
+                              "struct Request {\n"
+                              "    int id;\n"
+                              "};\n"
+                              "}\n",
+                              "#include \"Request.h\"\n"
+                              "\n"
+                              "namespace api {\n"
+                              "Request* make_request() {\n"
+                              "    return new Request();\n"
+                              "}\n"
+                              "}\n"};
+    if (setup_lang_repo(files, contents, 2) != 0) {
+        FAIL("tmpdir");
+    }
+    for (int i = 0; i < 10; i++) {
+        char name[32];
+        char path[512];
+        snprintf(name, sizeof(name), "forward_%02d.h", i);
+        snprintf(path, sizeof(path), "%s/%s", g_lang_tmpdir, name);
+        ASSERT_EQ(th_write_file(path, "namespace api {\nstruct Request;\n}\n"), 0);
+    }
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    const char *project = cbm_pipeline_project_name(pipeline);
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+
+    cbm_node_t *requests = NULL;
+    int request_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, project, "Request", &requests, &request_count),
+              CBM_STORE_OK);
+    int class_count = 0;
+    int64_t definition_id = 0;
+    for (int i = 0; i < request_count; i++) {
+        if (requests[i].label && strcmp(requests[i].label, "Class") == 0) {
+            class_count++;
+            definition_id = requests[i].id;
+            ASSERT_STR_EQ(requests[i].qualified_name, "Request.api.Request");
+            ASSERT_STR_EQ(requests[i].file_path, "Request.h");
+            ASSERT_EQ(requests[i].start_line, 2);
+            ASSERT_EQ(requests[i].end_line, 4);
+        }
+    }
+    ASSERT_EQ(class_count, 1);
+    ASSERT_GT(definition_id, 0);
+    cbm_store_free_nodes(requests, request_count);
+
+    cbm_node_t *makers = NULL;
+    int maker_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, project, "make_request", &makers, &maker_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(maker_count, 1);
+    ASSERT_STR_EQ(makers[0].file_path, "Use.cpp");
+    cbm_edge_t *calls = NULL;
+    int call_count = 0;
+    ASSERT_EQ(
+        cbm_store_find_edges_by_source_type(store, makers[0].id, "CALLS", &calls, &call_count),
+        CBM_STORE_OK);
+    int definition_calls = 0;
+    for (int i = 0; i < call_count; i++) {
+        if (calls[i].target_id == definition_id) {
+            definition_calls++;
+        }
+    }
+    ASSERT_EQ(definition_calls, 1);
+    cbm_store_free_edges(calls, call_count);
+    cbm_store_free_nodes(makers, maker_count);
+
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    teardown_lang_repo();
+    PASS();
+}
+
 TEST(pipeline_python_project) {
     /* Port of TestPipelinePythonProject */
     const char *files[] = {"main.py", "utils.py"};
@@ -12332,6 +12415,7 @@ SUITE(pipeline) {
     RUN_TEST(usages_kotlin_creates_edges);
     RUN_TEST(usages_kotlin_no_duplicate_calls);
     /* Language integration tests */
+    RUN_TEST(pipeline_cpp_forward_declarations_use_definition_qn);
     RUN_TEST(pipeline_python_project);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);

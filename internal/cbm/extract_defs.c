@@ -3940,9 +3940,30 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
     return true;
 }
 
+/* В C/C++/CUDA один и тот же *_specifier обозначает и определение с телом,
+ * и предварительное объявление либо ссылку на тег в типе. `type_definition` остаётся
+ * индексируемым отдельно: typedef-алиас не обязан содержать тело структуры. */
+static bool class_node_is_indexable_definition(TSNode node, CBMLanguage language) {
+    if (language != CBM_LANG_C && language != CBM_LANG_CPP && language != CBM_LANG_CUDA) {
+        return true;
+    }
+
+    const char *kind = ts_node_type(node);
+    bool requires_body =
+        strcmp(kind, "class_specifier") == 0 || strcmp(kind, "struct_specifier") == 0 ||
+        strcmp(kind, "union_specifier") == 0 || strcmp(kind, "enum_specifier") == 0;
+    return !requires_body || !ts_node_is_null(find_class_body(node, language));
+}
+
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
     const char *kind = ts_node_type(node);
+
+    /* Защита в точке создания определения обязательна: обходы верхнего уровня
+     * и вложенных членов не должны полагаться друг на друга как на фильтр. */
+    if (!class_node_is_indexable_definition(node, ctx->language)) {
+        return;
+    }
 
     if (extract_config_class_def(ctx, node, kind)) {
         return;
@@ -6699,7 +6720,8 @@ static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, wd_sta
         TSNode *kids = wd_collect_children(cur, nc);
         for (int i = (int)nc - SKIP_CHAR; i >= 0; i--) {
             TSNode child = kids ? kids[i] : ts_node_child(cur, (uint32_t)i);
-            if (cbm_kind_in_set(child, spec->class_node_types)) {
+            if (cbm_kind_in_set(child, spec->class_node_types) &&
+                class_node_is_indexable_definition(child, spec->language)) {
                 wd_push(s, child, enclosing_qn);
             } else {
                 const char *ck = ts_node_type(child);
@@ -7357,7 +7379,8 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             continue;
         }
 
-        if (cbm_kind_in_set(node, spec->class_node_types)) {
+        if (cbm_kind_in_set(node, spec->class_node_types) &&
+            class_node_is_indexable_definition(node, ctx->language)) {
             extract_class_def(ctx, node, spec);
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
             push_class_body_children(node, spec, &s, new_enclosing, ctx->arena);

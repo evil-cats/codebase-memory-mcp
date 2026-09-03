@@ -3341,6 +3341,123 @@ static int count_defs_by_label_name(CBMFileResult *r, const char *label, const c
     return count;
 }
 
+/* Спецификатор C++ без тела обозначает тип, но не создаёт новое определение.
+ * Тест отличает такие ссылки и предварительные объявления от типов с телом. */
+TEST(cpp_elaborated_type_member_does_not_emit_nested_class) {
+    CBMFileResult *r = extract("struct Existing {};\n"
+                               "class ExistingClass {};\n"
+                               "union ExistingUnion { int integer; };\n"
+                               "enum ExistingEnum { ExistingValue };\n"
+                               "struct Forward;\n"
+                               "class ForwardClass;\n"
+                               "union ForwardUnion;\n"
+                               "enum class ForwardEnum;\n"
+                               "typedef struct Opaque Opaque;\n"
+                               "class Holder {\n"
+                               "public:\n"
+                               "    struct Existing* pointer = nullptr;\n"
+                               "    struct Existing value;\n"
+                               "    class ExistingClass* class_pointer = nullptr;\n"
+                               "    union ExistingUnion union_value;\n"
+                               "    enum ExistingEnum enum_value;\n"
+                               "    struct Nested { int value; };\n"
+                               "    struct NestedForward;\n"
+                               "    class NestedClassForward;\n"
+                               "    union NestedUnionForward;\n"
+                               "    enum class NestedEnumForward;\n"
+                               "};\n",
+                               CBM_LANG_CPP, "t", "types.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+
+    ASSERT_NOT_NULL(find_def_by_qn(r, "types.Existing"));
+    ASSERT_NOT_NULL(find_def_by_qn(r, "types.ExistingClass"));
+    ASSERT_NOT_NULL(find_def_by_qn(r, "types.ExistingUnion"));
+    ASSERT_NOT_NULL(find_def_by_qn(r, "types.ExistingEnum"));
+    ASSERT_NOT_NULL(find_def_by_qn(r, "types.Holder"));
+    ASSERT_NOT_NULL(find_def_by_qn(r, "types.Holder.Nested"));
+    ASSERT_EQ(count_defs_by_label_name(r, "Class", "Existing"), 1);
+    ASSERT_EQ(count_defs_by_label_name(r, "Class", "ExistingClass"), 1);
+    ASSERT_EQ(count_defs_by_label_name(r, "Class", "ExistingUnion"), 1);
+    ASSERT_EQ(count_defs_by_label_name(r, "Enum", "ExistingEnum"), 1);
+
+    ASSERT_EQ(count_defs_by_label_name(r, "Class", "Forward"), 0);
+    ASSERT_EQ(count_defs_by_label_name(r, "Class", "ForwardClass"), 0);
+    ASSERT_EQ(count_defs_by_label_name(r, "Class", "ForwardUnion"), 0);
+    ASSERT_EQ(count_defs_by_label_name(r, "Enum", "ForwardEnum"), 0);
+    ASSERT_EQ(count_defs_by_label_name(r, "Class", "Opaque"), 0);
+    ASSERT_NULL(find_def_by_qn(r, "types.Holder.Existing"));
+    ASSERT_NULL(find_def_by_qn(r, "types.Holder.ExistingClass"));
+    ASSERT_NULL(find_def_by_qn(r, "types.Holder.ExistingUnion"));
+    ASSERT_NULL(find_def_by_qn(r, "types.Holder.ExistingEnum"));
+    ASSERT_NULL(find_def_by_qn(r, "types.Holder.NestedForward"));
+    ASSERT_NULL(find_def_by_qn(r, "types.Holder.NestedClassForward"));
+    ASSERT_NULL(find_def_by_qn(r, "types.Holder.NestedUnionForward"));
+    ASSERT_NULL(find_def_by_qn(r, "types.Holder.NestedEnumForward"));
+
+    const CBMDefinition *pointer = find_def_by_qn(r, "types.Holder.pointer");
+    const CBMDefinition *value = find_def_by_qn(r, "types.Holder.value");
+    ASSERT_NOT_NULL(pointer);
+    ASSERT_NOT_NULL(value);
+    ASSERT_STR_EQ(pointer->label, "Field");
+    ASSERT_STR_EQ(value->label, "Field");
+    ASSERT_STR_EQ(pointer->parent_class, "types.Holder");
+    ASSERT_STR_EQ(value->parent_class, "types.Holder");
+    ASSERT_STR_EQ(pointer->return_type, "struct Existing");
+    ASSERT_STR_EQ(value->return_type, "struct Existing");
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* C использует тот же синтаксический узел и не должен превращать использование
+ * тега либо предварительное объявление в Class, сохраняя определения и поля. */
+TEST(c_struct_tag_member_does_not_emit_nested_class) {
+    CBMFileResult *r = extract("struct existing {\n"
+                               "    int value;\n"
+                               "};\n"
+                               "struct forward;\n"
+                               "typedef struct opaque opaque_t;\n"
+                               "struct holder {\n"
+                               "    struct existing *pointer;\n"
+                               "    struct existing value;\n"
+                               "    struct nested {\n"
+                               "        int value;\n"
+                               "    } nested_value;\n"
+                               "};\n",
+                               CBM_LANG_C, "t", "types.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+
+    ASSERT_NOT_NULL(find_def_by_qn(r, "types.existing"));
+    ASSERT_NOT_NULL(find_def_by_qn(r, "types.holder"));
+    ASSERT_NOT_NULL(find_def_by_qn(r, "types.holder.nested"));
+    ASSERT_EQ(count_defs_by_label_name(r, "Class", "existing"), 1);
+    ASSERT_EQ(count_defs_by_label_name(r, "Class", "forward"), 0);
+    ASSERT_EQ(count_defs_by_label_name(r, "Class", "opaque"), 0);
+    ASSERT_NULL(find_def_by_qn(r, "types.holder.existing"));
+
+    const CBMDefinition *pointer = find_def_by_qn(r, "types.holder.pointer");
+    const CBMDefinition *value = find_def_by_qn(r, "types.holder.value");
+    const CBMDefinition *nested_value = find_def_by_qn(r, "types.holder.nested_value");
+    ASSERT_NOT_NULL(pointer);
+    ASSERT_NOT_NULL(value);
+    ASSERT_NOT_NULL(nested_value);
+    ASSERT_STR_EQ(pointer->label, "Field");
+    ASSERT_STR_EQ(value->label, "Field");
+    ASSERT_STR_EQ(nested_value->label, "Field");
+    ASSERT_STR_EQ(pointer->parent_class, "types.holder");
+    ASSERT_STR_EQ(value->parent_class, "types.holder");
+    ASSERT_STR_EQ(nested_value->parent_class, "types.holder");
+    ASSERT_STR_EQ(pointer->return_type, "struct existing");
+    ASSERT_STR_EQ(value->return_type, "struct existing");
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Доказывает, что конкретный вызов принадлежит ровно ожидаемому методу. */
 static int has_call_with_enclosing_qn(CBMFileResult *r, const char *callee, const char *qn) {
     for (int i = 0; i < r->calls.count; i++) {
@@ -5888,7 +6005,9 @@ SUITE(extraction) {
     RUN_TEST(zig_function);
     RUN_TEST(c_function);
     RUN_TEST(c_struct);
+    RUN_TEST(c_struct_tag_member_does_not_emit_nested_class);
     RUN_TEST(cpp_class);
+    RUN_TEST(cpp_elaborated_type_member_does_not_emit_nested_class);
     RUN_TEST(cpp_overload_qualified_names);
     RUN_TEST(cpp_overload_qualified_name_stability);
     RUN_TEST(cpp_overload_many_template_params_stay_stable);
