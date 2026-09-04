@@ -45,18 +45,15 @@ const char *cbm_enclosing_func_qn(CBMExtractCtx *ctx, TSNode node);
 // Cached version: uses ctx->ef_cache to avoid repeated parent-chain walks.
 const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
 
-// Max declarator-chain descent depth for C/C++/CUDA/GLSL function-name
-// resolution. Single source of truth — extract_defs.c's DECLARATOR_DEPTH_LIMIT
-// is derived from this so the three extractors cannot drift.
+// Общий защитный предел обхода declarator для C/C++/CUDA/GLSL. Он ограничивает
+// патологическую глубину AST, а не число поддерживаемых уровней владельца.
+// DECLARATOR_DEPTH_LIMIT в extract_defs.c выводится из этого значения.
 #define CBM_DECLARATOR_DEPTH_LIMIT 8
 
-// Resolve the function-name node for a C/C++/CUDA/GLSL `function_definition`.
-// Such nodes have no `name` field — the name is nested in the declarator chain
-// (pointer/function/parenthesized/array declarators wrap it; out-of-line method
-// definitions name it with a qualified_identifier). Descends the `declarator`
-// field to the innermost name node and returns it, or a null node if none is
-// found. Shared by the defs, calls, and unified extractors so all three agree on
-// enclosing-function attribution — drift between private copies caused #438.
+// Возвращает конечный узел имени из declarator функции C/C++/CUDA/GLSL либо
+// пустой TSNode. Обходит как обёртки declarator, так и всю правовложенную цепочку
+// qualified_identifier у out-of-line метода. Общий алгоритм удерживает QN
+// определений, вызовов и семантических записей согласованными (#438).
 TSNode cbm_resolve_c_declarator_name_node(TSNode func_node);
 
 // Convert a resolved function/method name node to its name string, normalizing a

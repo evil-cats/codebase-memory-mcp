@@ -489,35 +489,36 @@ bool cbm_is_namespace_scope_kind(CBMLanguage lang, const char *kind) {
     return false;
 }
 
-/* Находит квалифицирующую часть declarator у out-of-line определения C++.
- * Возвращается весь scope перед именем метода, а не только последний сегмент. */
+typedef struct {
+    TSNode name;
+    TSNode owner_scopes[CBM_DECLARATOR_DEPTH_LIMIT];
+    int owner_scope_count;
+} CBMCDeclaratorParts;
+
+/* Разбирает declarator в единый результат для имени и владельца. Общий обход не
+ * позволяет трём потребителям QN разойтись на вложенных qualified_identifier. */
+static bool resolve_c_declarator_parts(TSNode func_node, CBMCDeclaratorParts *parts);
+
+/* Возвращает всю относительную цепочку владельца out-of-line определения C++.
+ * Частичный результат при неизвестном узле или достижении предела запрещён. */
 static char *cpp_out_of_line_scope_text(CBMArena *a, TSNode node, const char *source) {
-    TSNode qid = {0};
-    TSNode decl = ts_node_child_by_field_name(node, TS_FIELD("declarator"));
-    for (int depth = 0; depth < CBM_DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(decl); depth++) {
-        const char *kind = ts_node_type(decl);
-        if (strcmp(kind, "qualified_identifier") == 0 || strcmp(kind, "scoped_identifier") == 0) {
-            qid = decl;
-            break;
-        }
-        TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
-        if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0) {
-            inner = ts_node_named_child(decl, 0);
-        }
-        if (ts_node_is_null(inner)) {
-            break;
-        }
-        decl = inner;
-    }
-    if (ts_node_is_null(qid)) {
+    CBMCDeclaratorParts parts;
+    if (!resolve_c_declarator_parts(node, &parts) || parts.owner_scope_count == 0) {
         return NULL;
     }
-    TSNode scope = ts_node_child_by_field_name(qid, TS_FIELD("scope"));
-    if (ts_node_is_null(scope)) {
-        return NULL;
+
+    char *text = NULL;
+    for (int i = 0; i < parts.owner_scope_count; i++) {
+        char *segment = cbm_node_text(a, parts.owner_scopes[i], source);
+        if (!segment || !segment[0]) {
+            return NULL;
+        }
+        text = text ? cbm_arena_sprintf(a, "%s::%s", text, segment) : segment;
+        if (!text) {
+            return NULL;
+        }
     }
-    char *text = cbm_node_text(a, scope, source);
-    return text && text[0] ? text : NULL;
+    return text;
 }
 
 /* Возвращает QN владельца из всей квалифицирующей части declarator. Лексический
@@ -1043,15 +1044,19 @@ TSNode cbm_find_enclosing_func(TSNode node, CBMLanguage lang) {
     return null_node;
 }
 
-// Check if a node type is a terminal C declarator name.
+/* Проверяет, является ли узел конечным именем declarator семейства C. */
 static bool is_c_terminal_name(const char *dk) {
     return strcmp(dk, "identifier") == 0 || strcmp(dk, "field_identifier") == 0 ||
            strcmp(dk, "operator_name") == 0 || strcmp(dk, "operator_cast") == 0 ||
            strcmp(dk, "destructor_name") == 0;
 }
 
-// Resolve name from a C++ qualified_identifier/scoped_identifier.
+/* Возвращает непосредственное конечное имя квалифицированного declarator. */
 static TSNode resolve_qualified_name(TSNode decl) {
+    TSNode name = ts_node_child_by_field_name(decl, TS_FIELD("name"));
+    if (!ts_node_is_null(name) && is_c_terminal_name(ts_node_type(name))) {
+        return name;
+    }
     static const char *name_kinds[] = {"operator_name", "operator_cast",    "destructor_name",
                                        "identifier",    "field_identifier", NULL};
     for (const char **k = name_kinds; *k; k++) {
@@ -1064,17 +1069,45 @@ static TSNode resolve_qualified_name(TSNode decl) {
     return null_node;
 }
 
-// Resolve function name from C/C++/CUDA/GLSL declarator chain. Shared canonical
-// implementation — see the header for the full rationale (#438).
-TSNode cbm_resolve_c_declarator_name_node(TSNode func_node) {
+/* Структурно проходит обёртки declarator и правовложенную квалифицированную
+ * цепочку. Успех означает, что найдено конечное имя, а owner_scopes содержит
+ * каждый предшествующий scope в исходном порядке. */
+static bool resolve_c_declarator_parts(TSNode func_node, CBMCDeclaratorParts *parts) {
+    if (!parts) {
+        return false;
+    }
+    memset(parts, 0, sizeof(*parts));
+
     TSNode decl = ts_node_child_by_field_name(func_node, TS_FIELD("declarator"));
     for (int depth = 0; depth < CBM_DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(decl); depth++) {
         const char *dk = ts_node_type(decl);
         if (is_c_terminal_name(dk)) {
-            return decl;
+            parts->name = decl;
+            return true;
         }
         if (strcmp(dk, "qualified_identifier") == 0 || strcmp(dk, "scoped_identifier") == 0) {
-            return resolve_qualified_name(decl);
+            TSNode scope = ts_node_child_by_field_name(decl, TS_FIELD("scope"));
+            if (ts_node_is_null(scope) || parts->owner_scope_count >= CBM_DECLARATOR_DEPTH_LIMIT) {
+                return false;
+            }
+            parts->owner_scopes[parts->owner_scope_count++] = scope;
+
+            TSNode name = ts_node_child_by_field_name(decl, TS_FIELD("name"));
+            if (!ts_node_is_null(name)) {
+                const char *name_kind = ts_node_type(name);
+                if (is_c_terminal_name(name_kind)) {
+                    parts->name = name;
+                    return true;
+                }
+                if (strcmp(name_kind, "qualified_identifier") == 0 ||
+                    strcmp(name_kind, "scoped_identifier") == 0) {
+                    decl = name;
+                    continue;
+                }
+            }
+
+            parts->name = resolve_qualified_name(decl);
+            return !ts_node_is_null(parts->name);
         }
         TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
         if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0) {
@@ -1084,6 +1117,16 @@ TSNode cbm_resolve_c_declarator_name_node(TSNode func_node) {
             break;
         }
         decl = inner;
+    }
+    return false;
+}
+
+/* Разрешает имя функции C/C++/CUDA/GLSL единым алгоритмом для определений,
+ * вызовов и семантических записей; подробный контракт находится в заголовке. */
+TSNode cbm_resolve_c_declarator_name_node(TSNode func_node) {
+    CBMCDeclaratorParts parts;
+    if (resolve_c_declarator_parts(func_node, &parts)) {
+        return parts.name;
     }
     TSNode null_node = {0};
     return null_node;

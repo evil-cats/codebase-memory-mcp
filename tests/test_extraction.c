@@ -3482,6 +3482,19 @@ static int has_usage_with_enclosing_qn(CBMFileResult *r, const char *name, const
     return 0;
 }
 
+/* Доказывает согласованность QN записи чтения или записи с QN метода. */
+static int has_rw_with_enclosing_qn(CBMFileResult *r, const char *name, const char *qn,
+                                    bool is_write) {
+    for (int i = 0; i < r->rw.count; i++) {
+        const CBMReadWrite *rw = &r->rw.items[i];
+        if (rw->var_name && rw->enclosing_func_qn && strcmp(rw->var_name, name) == 0 &&
+            strcmp(rw->enclosing_func_qn, qn) == 0 && rw->is_write == is_write) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Находит LSP-запись вызова с точным QN вызывающего метода. Уверенность цели
  * намеренно не проверяется: локальное разрешение функций внутри `mod` — другой контракт. */
 static int has_lsp_call_with_caller_qn(CBMFileResult *r, const char *callee_fragment,
@@ -3789,6 +3802,94 @@ TEST(cpp_out_of_line_method_preserves_lexical_namespace) {
     ASSERT_TRUE(has_usage_with_enclosing_qn(r, "enabled", method_qn));
 
     cbm_free_result(r);
+    PASS();
+}
+
+/* Вложенные out-of-line методы C++ и CUDA должны сохранять каждый уровень
+ * относительного владельца в QN определения, вызовов и семантических записей. */
+TEST(cpp_out_of_line_nested_class_preserves_all_owner_levels) {
+    static const char *source =
+        "namespace app {\n"
+        "bool enabled = true;\n"
+        "int helper() { return 1; }\n"
+        "struct Outer {\n"
+        "    struct Inner {\n"
+        "        Inner();\n"
+        "        void run();\n"
+        "        struct Deep {\n"
+        "            struct Deeper {\n"
+        "                void ping();\n"
+        "            };\n"
+        "        };\n"
+        "    };\n"
+        "};\n"
+        "Outer::Inner::Inner() {}\n"
+        "void Outer::Inner::run() { enabled = helper() != 0; }\n"
+        "void Outer::Inner::Deep::Deeper::ping() { enabled = helper() != 0; }\n"
+        "}\n";
+    static const struct {
+        CBMLanguage language;
+        const char *path;
+    } cases[] = {
+        {CBM_LANG_CPP, "nested.cpp"},
+        {CBM_LANG_CUDA, "nested.cu"},
+    };
+    static const char *const inner_qn = "nested.app.Outer.Inner";
+    static const char *const deeper_qn = "nested.app.Outer.Inner.Deep.Deeper";
+    static const char *const ctor_qn = "nested.app.Outer.Inner.Inner()";
+    static const char *const run_qn = "nested.app.Outer.Inner.run()";
+    static const char *const ping_qn = "nested.app.Outer.Inner.Deep.Deeper.ping()";
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = extract(source, cases[i].language, "proj", cases[i].path);
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->has_error);
+        ASSERT_FALSE(r->parse_incomplete);
+
+        const CBMDefinition *inner = find_def_by_qn(r, inner_qn);
+        const CBMDefinition *deeper = find_def_by_qn(r, deeper_qn);
+        const CBMDefinition *ctor = find_def_by_qn(r, ctor_qn);
+        const CBMDefinition *run = find_def_by_qn(r, run_qn);
+        const CBMDefinition *ping = find_def_by_qn(r, ping_qn);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(deeper);
+        ASSERT_NOT_NULL(ctor);
+        ASSERT_NOT_NULL(run);
+        ASSERT_NOT_NULL(ping);
+        ASSERT_STR_EQ(ctor->label, "Method");
+        ASSERT_STR_EQ(run->label, "Method");
+        ASSERT_STR_EQ(ping->label, "Method");
+        ASSERT_NOT_NULL(ctor->parent_class);
+        ASSERT_NOT_NULL(run->parent_class);
+        ASSERT_NOT_NULL(ping->parent_class);
+        ASSERT_STR_EQ(ctor->parent_class, inner->qualified_name);
+        ASSERT_STR_EQ(run->parent_class, inner->qualified_name);
+        ASSERT_STR_EQ(ping->parent_class, deeper->qualified_name);
+
+        int ctor_count = 0;
+        int run_count = 0;
+        int ping_count = 0;
+        for (int d = 0; d < r->defs.count; d++) {
+            const char *qn = r->defs.items[d].qualified_name;
+            ctor_count += qn && strcmp(qn, ctor_qn) == 0;
+            run_count += qn && strcmp(qn, run_qn) == 0;
+            ping_count += qn && strcmp(qn, ping_qn) == 0;
+        }
+        ASSERT_EQ(ctor_count, 1);
+        ASSERT_EQ(run_count, 1);
+        ASSERT_EQ(ping_count, 1);
+        ASSERT_TRUE(has_call_with_enclosing_qn(r, "helper", run_qn));
+        ASSERT_TRUE(has_call_with_enclosing_qn(r, "helper", ping_qn));
+        ASSERT_TRUE(has_rw_with_enclosing_qn(r, "enabled", run_qn, true));
+        ASSERT_TRUE(has_rw_with_enclosing_qn(r, "enabled", ping_qn, true));
+        ASSERT_NULL(find_def_by_qn(r, "nested.app.Outer.run()"));
+        ASSERT_NULL(find_def_by_qn(r, "nested.app.Inner.run()"));
+        ASSERT_NULL(find_def_by_qn(r, "nested.app.Outer.ping()"));
+        ASSERT_NULL(find_def_by_qn(r, "nested.app.Outer.Inner.Deep.ping()"));
+        ASSERT_NULL(find_def_by_qn(r, "nested.app.Deeper.ping()"));
+
+        cbm_free_result(r);
+    }
     PASS();
 }
 
@@ -6082,6 +6183,7 @@ SUITE(extraction) {
     RUN_TEST(cpp_gtest_f_unique_name_issue1266);
     RUN_TEST(cpp_out_of_line_method_issue428);
     RUN_TEST(cpp_out_of_line_method_preserves_lexical_namespace);
+    RUN_TEST(cpp_out_of_line_nested_class_preserves_all_owner_levels);
     RUN_TEST(cobol_paragraph);
     RUN_TEST(verilog_module);
     RUN_TEST(cuda_kernel);

@@ -419,6 +419,33 @@ TEST(es_defines_method_cpp_out_of_line_namespace) {
     PASS();
 }
 
+/* Объявление вложенного C++-класса и его out-of-line определение должны
+ * связываться ровно одним DEFINES_METHOD по полному QN владельца. */
+TEST(es_defines_method_cpp_out_of_line_nested_class) {
+    static const ES_LangFile files[] = {
+        {"src/nested/Nested.h",
+         "namespace app {\n"
+         "struct Outer {\n"
+         "    struct Inner { void release(); };\n"
+         "};\n"
+         "}\n"},
+        {"src/nested/Nested.cpp",
+         "#include \"Nested.h\"\n"
+         "namespace app {\n"
+         "void Outer::Inner::release() {}\n"
+         "}\n"}};
+    static const ES_ExpectedEdge expected[] = {{
+        "src.nested.Nested.app.Outer.Inner",
+        "src.nested.Nested.app.Outer.Inner.release()",
+    }};
+    static const char *const absent[] = {
+        "src.nested.Nested.app.Outer.release()",
+        "src.nested.Nested.app.Outer.Outer.Inner.release()",
+    };
+    ASSERT_TRUE(es_exact_edges_by_qn(files, 2, "DEFINES_METHOD", expected, 1, absent, 2));
+    PASS();
+}
+
 /* Методы Go находятся в другом файле пакета и имеют одинаковое имя у разных
  * типов; каждое точное ребро должно вести к отдельному owner-qualified QN. */
 TEST(es_defines_method_go_crossfile_receiver_qn) {
@@ -1105,6 +1132,7 @@ SUITE(edge_structural) {
 
     /* ── FAMILY 10: DEFINES_METHOD с каноническим owner QN ───── */
     RUN_TEST(es_defines_method_cpp_out_of_line_namespace);
+    RUN_TEST(es_defines_method_cpp_out_of_line_nested_class);
     RUN_TEST(es_defines_method_go_crossfile_receiver_qn);
     RUN_TEST(es_defines_method_rust_crossfile_impl_owner);
 }
