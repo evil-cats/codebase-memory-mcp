@@ -28,7 +28,10 @@ enum {
     MCP_BFS_LIMIT = 100,            /* default per-direction trace budget (limit param raises) */
     MCP_BFS_LIMIT_MAX = 5000,       /* hard ceiling for the limit param (context-bomb guard) */
     MCP_DEFAULT_IMPACT_LIMIT = 200, /* detect_changes per-symbol rows; rollup stays complete */
-    MCP_SNIPPET_MAX_LINES = 500,    /* get_code_snippet line cap (whole-file Module guard) */
+    MCP_SNIPPET_TOKEN_ESTIMATE_DIVISOR = 4,
+    MCP_SNIPPET_MAX_ESTIMATED_TOKENS = 9000,
+    MCP_SNIPPET_MAX_SOURCE_BYTES =
+        (MCP_SNIPPET_MAX_ESTIMATED_TOKENS + 1) * MCP_SNIPPET_TOKEN_ESTIMATE_DIVISOR - 1,
     MCP_N_DEFAULTS_2 = 2,
     MCP_URI_PREFIX = 7,      /* strlen("file://") */
     MCP_CONTENT_PREFIX = 15, /* strlen("Content-Length:") */
@@ -540,16 +543,15 @@ static const tool_def_t TOOLS[] = {
      "\"required\":[\"project\"]}"},
 
     {"get_code_snippet", "Get code snippet",
-     "Read source code for a function/class/symbol. IMPORTANT: First call search_graph to find the "
-     "exact qualified_name, then pass it here. This is a read tool, not a search tool. Accepts "
-     "full qualified_name (exact match) or short function name (returns suggestions if ambiguous). "
-     "If the response carries a 'coverage_note', the file was only partially indexed — constructs "
-     "in the noted line ranges may be missing from the graph (best-effort signal); prefer grep "
-     "there and treat the returned source as ground truth.",
+     "Read source code for a function/class/symbol. First call search_graph to find the exact "
+     "qualified_name, then pass it here. The response has one plain-text form: qn, "
+     "project-relative path, lines as start,end, one blank line, then verbatim source. If the "
+     "sanitized source size / 4 exceeds 9000, no code is returned; output_truncated: true marks "
+     "that case, and path/lines can be read in chunks with a file tool. Use trace_path for "
+     "callers/callees. Ambiguous, missing, or unreadable symbols are errors.",
      "{\"type\":\"object\",\"properties\":{\"qualified_name\":{\"type\":\"string\",\"description\":"
      "\"Full qualified_name from search_graph, or short function name\"},\"project\":{"
-     "\"type\":\"string\"},\"include_neighbors\":{"
-     "\"type\":\"boolean\",\"default\":false}},\"required\":[\"qualified_name\",\"project\"]}"},
+     "\"type\":\"string\"}},\"required\":[\"qualified_name\",\"project\"]}"},
 
     {"get_graph_schema", "Get graph schema",
      "Get the schema of the knowledge graph (node labels, edge types)",
@@ -6864,7 +6866,14 @@ static void free_node_contents(cbm_node_t *n) {
 
 /* ── Helper: read lines [start, end] from a file ─────────────── */
 
-static char *read_file_lines(const char *path, int start, int end) {
+/* Читает полный диапазон, но может оборвать внутреннее накопление после
+ * `max_bytes`. При превышении возвращает NULL и выставляет `out_exceeded`,
+ * поэтому частичный буфер никогда не становится результатом инструмента. */
+static char *read_file_lines_bounded(const char *path, int start, int end, size_t max_bytes,
+                                     bool *out_exceeded) {
+    if (out_exceeded) {
+        *out_exceeded = false;
+    }
     FILE *fp = cbm_fopen(path, "r");
     if (!fp) {
         return NULL;
@@ -6876,31 +6885,45 @@ static char *read_file_lines(const char *path, int start, int end) {
     buf[0] = '\0';
 
     char line[CBM_SZ_2K];
-    int lineno = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        lineno++;
-        if (lineno < start) {
-            continue;
-        }
-        if (lineno > end) {
-            break;
-        }
+    int lineno = 1;
+    while (lineno <= end && fgets(line, sizeof(line), fp)) {
         size_t ll = strlen(line);
-        while (len + ll + SKIP_ONE > cap) {
-            cap *= PAIR_LEN;
-            buf = safe_realloc(buf, cap);
+        bool line_complete = ll > 0 && line[ll - 1] == '\n';
+        if (lineno >= start) {
+            if (ll > max_bytes - len) {
+                if (out_exceeded) {
+                    *out_exceeded = true;
+                }
+                free(buf);
+                (void)fclose(fp);
+                return NULL;
+            }
+            while (len + ll + SKIP_ONE > cap) {
+                cap *= PAIR_LEN;
+                buf = safe_realloc(buf, cap);
+            }
+            memcpy(buf + len, line, ll);
+            len += ll;
+            buf[len] = '\0';
         }
-        memcpy(buf + len, line, ll);
-        len += ll;
-        buf[len] = '\0';
+        /* `fgets` дробит длинную физическую строку по размеру буфера. Номер
+         * меняется только после настоящего разделителя строк. */
+        if (line_complete) {
+            lineno++;
+        }
     }
 
+    bool read_failed = ferror(fp) != 0;
     (void)fclose(fp);
-    if (len == 0) {
+    if (read_failed || len == 0) {
         free(buf);
         return NULL;
     }
     return buf;
+}
+
+static char *read_file_lines(const char *path, int start, int end) {
+    return read_file_lines_bounded(path, start, end, (size_t)-1, NULL);
 }
 
 /* ── Helper: get project root_path from store ─────────────────── */
@@ -8373,9 +8396,34 @@ static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count
     return result;
 }
 
-/* Resolve an absolute path from root_path + file_path, verify containment,
- * and read source lines. Sets *out_abs_path (caller frees). Returns source
- * string (caller frees) or NULL if path is invalid/unreadable. */
+/* `get_code_snippet` не имеет альтернативного успешного формата: неоднозначный
+ * ввод становится MCP-ошибкой, но сохраняет координаты для точного повторного
+ * вызова после выбора нужного `qualified_name`. */
+static char *snippet_ambiguity_error(const char *input, cbm_node_t *nodes, int count) {
+    cbm_sb_t sb;
+    cbm_sb_init(&sb);
+    cbm_sb_append(&sb, "ambiguous symbol: ");
+    cbm_sb_append(&sb, input ? input : "");
+    cbm_sb_append_n(&sb, "\n", 1);
+
+    static const char *const cols[] = {"qn", "path"};
+    cbm_tree_table_header(&sb, "suggestions", count, cols, 2);
+    for (int i = 0; i < count; i++) {
+        cbm_tree_row_begin(&sb);
+        cbm_tree_cell_str(&sb, nodes[i].qualified_name, true);
+        cbm_tree_cell_str(&sb, nodes[i].file_path, false);
+        cbm_tree_row_end(&sb);
+    }
+
+    char *text = cbm_sb_finish(&sb);
+    char *result = cbm_mcp_text_result(text, true);
+    free(text);
+    return result;
+}
+
+/* Строит абсолютный путь только для безопасного чтения, проверяет containment
+ * и возвращает диапазон не крупнее model-facing бюджета. `out_too_large`
+ * отличает заведомо большой исходник от ошибки пути или чтения. */
 /* True only when abs_path, after realpath/_fullpath resolution (which collapses
  * `..` and resolves symlinks/junctions), stays within root_path. This is the
  * single containment guard every MCP file-read sink must pass before reading a
@@ -8453,20 +8501,25 @@ bool cbm_path_within_root(const char *root_path, const char *abs_path) {
 }
 
 static char *resolve_snippet_source(const char *root_path, const char *file_path, int start,
-                                    int end, char **out_abs_path) {
-    *out_abs_path = NULL;
+                                    int end, bool *out_too_large) {
+    *out_too_large = false;
     if (!root_path || !file_path) {
         return NULL;
     }
     size_t apsz = strlen(root_path) + strlen(file_path) + MCP_SEPARATOR;
     char *abs_path = malloc(apsz);
+    if (!abs_path) {
+        return NULL;
+    }
     snprintf(abs_path, apsz, "%s/%s", root_path, file_path);
 
-    *out_abs_path = abs_path;
+    char *source = NULL;
     if (cbm_path_within_root(root_path, abs_path)) {
-        return read_file_lines(abs_path, start, end);
+        source = read_file_lines_bounded(abs_path, start, end, MCP_SNIPPET_MAX_SOURCE_BYTES,
+                                         out_too_large);
     }
-    return NULL;
+    free(abs_path);
+    return source;
 }
 
 static bool utf8_is_cont(unsigned char c) {
@@ -8538,182 +8591,69 @@ static char *sanitize_utf8_lossy(const char *s) {
     return out;
 }
 
-/* Build an enriched snippet response for a resolved node. */
-/* Add a string array to a JSON object (no-op if count == 0). */
-static void add_string_array(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
-                             char **strings, int count) {
-    if (count <= 0) {
-        return;
-    }
-    yyjson_mut_val *arr = yyjson_mut_arr(doc);
-    for (int i = 0; i < count; i++) {
-        yyjson_mut_arr_add_str(doc, arr, strings[i]);
-    }
-    yyjson_mut_obj_add_val(doc, obj, key, arr);
+/* Формула намеренно совпадает с публичным контрактом, включая целочисленное
+ * деление: исходник размером до 36003 байт включительно ещё помещается. */
+static bool snippet_source_exceeds_budget(size_t size) {
+    return size / MCP_SNIPPET_TOKEN_ESTIMATE_DIVISOR > MCP_SNIPPET_MAX_ESTIMATED_TOKENS;
 }
 
-/* get_code_snippet coverage note (#963): if the resolved node's file is
- * flagged parse_partial, warn that the graph may under-report this file.
- * Correlated by construction — the result names its file. (An entirely-
- * skipped file cannot appear here: it has no nodes to resolve a snippet
- * from.) */
-static void add_snippet_coverage_note(yyjson_mut_doc *doc, yyjson_mut_val *root_obj,
-                                      cbm_store_t *store, const cbm_node_t *node) {
-    if (!node->file_path || !node->file_path[0] || !node->project) {
-        return;
-    }
-    cbm_coverage_row_t *rows = NULL;
-    int count = 0;
-    if (cbm_store_coverage_get_path(store, node->project, node->file_path, &rows, &count) !=
-        CBM_STORE_OK) {
-        return;
-    }
-    for (int i = 0; i < count; i++) {
-        if (rows[i].rel_path && strcmp(rows[i].rel_path, node->file_path) == 0 && rows[i].kind &&
-            strcmp(rows[i].kind, "parse_partial") == 0) {
-            char note[CBM_SZ_1K];
-            snprintf(note, sizeof(note),
-                     "This file was only PARTIALLY indexed — line range(s) %s could not be "
-                     "parsed, so constructs there may be missing from the graph (callers/callees "
-                     "and search results can under-report this file). The source above is ground "
-                     "truth. (best-effort signal)",
-                     rows[i].detail && rows[i].detail[0] ? rows[i].detail : "?");
-            yyjson_mut_obj_add_strcpy(doc, root_obj, "coverage_note", note);
-            break;
-        }
-    }
-    cbm_store_free_coverage(rows, count);
-}
-
-/* Формирует ответ `get_code_snippet`: координаты описывают полный диапазон
- * символа, а лимит строк независимо ограничивает только поле `source`. */
-static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
-                                    const char *match_method, bool include_neighbors,
-                                    cbm_node_t *alternatives, int alt_count) {
+/* Формирует единственный успешный ответ `get_code_snippet`. Исходник либо
+ * добавляется целиком последним полем, либо полностью опускается при превышении
+ * бюджета; частичный код из этой функции выйти не может. */
+static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node) {
     char *root_path = get_project_root(srv, node->project);
 
     int start = node->start_line > 0 ? node->start_line : SKIP_ONE;
     /* Равные границы задают корректный однострочный символ; резервный диапазон
      * нужен только при отсутствующей или обратной конечной границе. */
     int reported_end = node->end_line >= start ? node->end_line : start + SNIPPET_DEFAULT_LINES;
-    int source_end = reported_end;
-    /* Ограничение защищает от чтения целого файла через структурный узел
-     * `Module`/`File`. Полный диапазон символа остаётся в `start_line/end_line`,
-     * а `source_end` управляет только объёмом поля `source`. */
-    bool snippet_clipped = false;
-    if (source_end - start + 1 > MCP_SNIPPET_MAX_LINES) {
-        source_end = start + MCP_SNIPPET_MAX_LINES - 1;
-        snippet_clipped = true;
-    }
-    char *abs_path = NULL;
-    char *source = resolve_snippet_source(root_path, node->file_path, start, source_end, &abs_path);
-
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
-    yyjson_mut_doc_set_root(doc, root_obj);
-
-    yyjson_mut_obj_add_str(doc, root_obj, "name", node->name ? node->name : "");
-    yyjson_mut_obj_add_str(doc, root_obj, "qualified_name",
-                           node->qualified_name ? node->qualified_name : "");
-    yyjson_mut_obj_add_str(doc, root_obj, "label", node->label ? node->label : "");
-
-    const char *display_path = "";
-    if (abs_path) {
-        display_path = abs_path;
-    } else if (node->file_path) {
-        display_path = node->file_path;
-    }
-    yyjson_mut_obj_add_str(doc, root_obj, "file_path", display_path);
-    yyjson_mut_obj_add_int(doc, root_obj, "start_line", start);
-    yyjson_mut_obj_add_int(doc, root_obj, "end_line", reported_end);
-    if (snippet_clipped) {
-        yyjson_mut_obj_add_bool(doc, root_obj, "source_clipped", true);
-        yyjson_mut_obj_add_int(doc, root_obj, "clipped_at_lines", MCP_SNIPPET_MAX_LINES);
-    }
-
-    if (source) {
-        char *safe_source = sanitize_utf8_lossy(source);
-        if (safe_source) {
-            yyjson_mut_obj_add_strcpy(doc, root_obj, "source", safe_source);
-            free(safe_source);
-        } else {
-            yyjson_mut_obj_add_str(doc, root_obj, "source", "(source not available)");
-        }
-    } else {
-        yyjson_mut_obj_add_str(doc, root_obj, "source", "(source not available)");
-    }
-
-    /* match_method — omitted for exact matches */
-    if (match_method) {
-        yyjson_mut_obj_add_str(doc, root_obj, "match_method", match_method);
-    }
-
-    /* No property-blob enrichment: the verbatim source IS the payload here —
-     * signature/docstring are literally in it, and the similarity internals
-     * (fp/sp/bt) plus metric fields were 41% of the response for zero agent
-     * value. Metrics stay reachable via search_graph fields=[...]. */
-    yyjson_doc *props_doc = NULL;
-
-    /* Caller/callee counts — store already resolved by calling handler */
-    cbm_store_t *store = srv->store;
-    int in_deg = 0;
-    int out_deg = 0;
-    cbm_store_node_degree(store, node->id, &in_deg, &out_deg);
-    yyjson_mut_obj_add_int(doc, root_obj, "callers", in_deg);
-    yyjson_mut_obj_add_int(doc, root_obj, "callees", out_deg);
-
-    add_snippet_coverage_note(doc, root_obj, store, node);
-
-    char **nb_callers = NULL;
-    int nb_caller_count = 0;
-    char **nb_callees = NULL;
-    int nb_callee_count = 0;
-    if (include_neighbors) {
-        cbm_store_node_neighbor_names(store, node->id, MCP_DEFAULT_LIMIT, &nb_callers,
-                                      &nb_caller_count, &nb_callees, &nb_callee_count);
-        add_string_array(doc, root_obj, "caller_names", nb_callers, nb_caller_count);
-        add_string_array(doc, root_obj, "callee_names", nb_callees, nb_callee_count);
-    }
-
-    /* Alternatives (when auto-resolved from ambiguous) */
-    if (alternatives && alt_count > 0) {
-        yyjson_mut_val *arr = yyjson_mut_arr(doc);
-        for (int i = 0; i < alt_count; i++) {
-            yyjson_mut_val *a = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, a, "qualified_name",
-                                   alternatives[i].qualified_name ? alternatives[i].qualified_name
-                                                                  : "");
-            yyjson_mut_obj_add_str(doc, a, "file_path",
-                                   alternatives[i].file_path ? alternatives[i].file_path : "");
-            yyjson_mut_arr_append(arr, a);
-        }
-        yyjson_mut_obj_add_val(doc, root_obj, "alternatives", arr);
-    }
-
-    char *json = yy_doc_to_str(doc);
-    yyjson_mut_doc_free(doc);
-    yyjson_doc_free(props_doc); /* safe if NULL */
-    for (int i = 0; i < nb_caller_count; i++) {
-        free(nb_callers[i]);
-    }
-    for (int i = 0; i < nb_callee_count; i++) {
-        free(nb_callees[i]);
-    }
-    free(nb_callers);
-    free(nb_callees);
+    bool source_too_large = false;
+    char *source =
+        resolve_snippet_source(root_path, node->file_path, start, reported_end, &source_too_large);
     free(root_path);
-    free(abs_path);
+
+    if (!source && !source_too_large) {
+        return cbm_mcp_text_result("source not available for resolved symbol", true);
+    }
+
+    char *safe_source = NULL;
+    if (source) {
+        safe_source = sanitize_utf8_lossy(source);
+        if (!safe_source) {
+            free(source);
+            return cbm_mcp_text_result("source not available for resolved symbol", true);
+        }
+        source_too_large = snippet_source_exceeds_budget(strlen(safe_source));
+    }
     free(source);
 
-    char *result = cbm_mcp_text_result(json, false);
-    free(json);
+    cbm_sb_t sb;
+    cbm_sb_init(&sb);
+    cbm_sb_append(&sb, "qn: ");
+    cbm_sb_append(&sb, node->qualified_name ? node->qualified_name : "");
+    cbm_sb_append_n(&sb, "\npath: ", 7);
+    cbm_sb_append(&sb, node->file_path ? node->file_path : "");
+
+    char lines[CBM_SZ_64];
+    snprintf(lines, sizeof(lines), "\nlines: %d,%d\n", start, reported_end);
+    cbm_sb_append(&sb, lines);
+    if (source_too_large) {
+        cbm_sb_append(&sb, "output_truncated: true\n");
+    } else {
+        cbm_sb_append_n(&sb, "\n", 1);
+        cbm_sb_append(&sb, safe_source);
+    }
+
+    char *text = cbm_sb_finish(&sb);
+    free(safe_source);
+    char *result = cbm_mcp_text_result(text, false);
+    free(text);
     return result;
 }
 
 static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     char *qn = cbm_mcp_get_string_arg(args, "qualified_name");
     char *project = get_project_arg(args);
-    bool include_neighbors = cbm_mcp_get_bool_arg(args, "include_neighbors");
 
     if (!qn) {
         free(project);
@@ -8744,7 +8684,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     cbm_node_t node = {0};
     int rc = cbm_store_find_node_by_qn(store, effective_project, qn, &node);
     if (rc == CBM_STORE_OK) {
-        char *result = build_snippet_response(srv, &node, NULL, include_neighbors, NULL, 0);
+        char *result = build_snippet_response(srv, &node);
         free_node_contents(&node);
         free(qn);
         free(project);
@@ -8759,14 +8699,14 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     if (name_count == SKIP_ONE) {
         copy_node(&name_nodes[0], &node);
         cbm_store_free_nodes(name_nodes, name_count);
-        char *result = build_snippet_response(srv, &node, "name", include_neighbors, NULL, 0);
+        char *result = build_snippet_response(srv, &node);
         free_node_contents(&node);
         free(qn);
         free(project);
         return result;
     }
     if (name_count > SKIP_ONE) {
-        char *result = snippet_suggestions(qn, name_nodes, name_count);
+        char *result = snippet_ambiguity_error(qn, name_nodes, name_count);
         cbm_store_free_nodes(name_nodes, name_count);
         free(qn);
         free(project);
@@ -8783,7 +8723,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     if (suffix_count == SKIP_ONE) {
         copy_node(&suffix_nodes[0], &node);
         cbm_store_free_nodes(suffix_nodes, suffix_count);
-        char *result = build_snippet_response(srv, &node, "suffix", include_neighbors, NULL, 0);
+        char *result = build_snippet_response(srv, &node);
         free_node_contents(&node);
         free(qn);
         free(project);
@@ -8800,13 +8740,13 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         if (!snip_ambiguous) {
             copy_node(&suffix_nodes[ssel], &node);
             cbm_store_free_nodes(suffix_nodes, suffix_count);
-            char *result = build_snippet_response(srv, &node, "suffix", include_neighbors, NULL, 0);
+            char *result = build_snippet_response(srv, &node);
             free_node_contents(&node);
             free(qn);
             free(project);
             return result;
         }
-        char *result = snippet_suggestions(qn, suffix_nodes, suffix_count);
+        char *result = snippet_ambiguity_error(qn, suffix_nodes, suffix_count);
         cbm_store_free_nodes(suffix_nodes, suffix_count);
         free(qn);
         free(project);

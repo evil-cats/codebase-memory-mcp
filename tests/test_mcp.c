@@ -854,6 +854,56 @@ TEST(mcp_tools_list) {
     PASS();
 }
 
+/* Публичное описание должно направлять агента к единственному текстовому
+ * ответу и не рекламировать удалённые аргументы или графовые данные. */
+TEST(mcp_get_code_snippet_publishes_plain_text_contract) {
+    char *json = cbm_mcp_tools_list();
+    ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *tools = yyjson_obj_get(yyjson_doc_get_root(doc), "tools");
+    ASSERT_NOT_NULL(tools);
+
+    yyjson_val *snippet = NULL;
+    size_t index = 0;
+    size_t max = 0;
+    yyjson_val *tool = NULL;
+    yyjson_arr_foreach(tools, index, max, tool) {
+        yyjson_val *name = yyjson_obj_get(tool, "name");
+        if (name && strcmp(yyjson_get_str(name), "get_code_snippet") == 0) {
+            snippet = tool;
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(snippet);
+
+    const char *description = yyjson_get_str(yyjson_obj_get(snippet, "description"));
+    ASSERT_NOT_NULL(description);
+    ASSERT_NOT_NULL(strstr(description, "project-relative path"));
+    ASSERT_NOT_NULL(strstr(description, "output_truncated: true"));
+    ASSERT_NOT_NULL(strstr(description, "trace_path"));
+    ASSERT_NULL(strstr(description, "include_neighbors"));
+
+    yyjson_val *schema = yyjson_obj_get(snippet, "inputSchema");
+    yyjson_val *properties = schema ? yyjson_obj_get(schema, "properties") : NULL;
+    ASSERT_NOT_NULL(properties);
+    ASSERT_EQ(yyjson_obj_size(properties), 2U);
+    ASSERT_NOT_NULL(yyjson_obj_get(properties, "project"));
+    ASSERT_NOT_NULL(yyjson_obj_get(properties, "qualified_name"));
+    ASSERT_NULL(yyjson_obj_get(properties, "include_neighbors"));
+    ASSERT_NULL(yyjson_obj_get(properties, "format"));
+
+    yyjson_val *required = yyjson_obj_get(schema, "required");
+    ASSERT_NOT_NULL(required);
+    ASSERT_EQ(yyjson_arr_size(required), 2U);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(required, 0)), "qualified_name");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(required, 1)), "project");
+
+    yyjson_doc_free(doc);
+    free(json);
+    PASS();
+}
+
 /* Публичная схема различает расширенный отчёт `symbols` и вызываемые начальные
  * узлы `impact`, чтобы клиент не принимал контейнеры типов за начало обхода по
  * `CALLS`. */
@@ -2097,11 +2147,9 @@ TEST(tool_get_architecture_cycles_detects_scc) {
     PASS();
 }
 
-/* Защита от переполнения контекста: `get_code_snippet` для узла `Module`/`File`
- * раньше читал целый файл, и ошибочный переход агента к `Module` возвращал около
- * 400 КБ. Поле `source` должно ограничиваться `MCP_SNIPPET_MAX_LINES`, не заменяя
- * точный диапазон символа диапазоном возвращённого текста. */
-TEST(tool_get_code_snippet_clips_whole_file_node) {
+/* Большой структурный узел сохраняет полный диапазон, но не возвращает даже
+ * начальную часть исходника: модель должна дочитать файл по координатам. */
+TEST(tool_get_code_snippet_omits_oversized_source) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_snipcap_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
@@ -2142,16 +2190,11 @@ TEST(tool_get_code_snippet_clips_whole_file_node) {
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "\"start_line\":1"));
-    ASSERT_NOT_NULL(strstr(inner, "\"end_line\":2000"));
-    ASSERT_NOT_NULL(strstr(inner, "\"source_clipped\":true"));
-    ASSERT_NOT_NULL(strstr(inner, "\"clipped_at_lines\":500"));
-    /* Полный файл из 2000 строк объёмом около 100 КБ не должен попасть в ответ. */
-    ASSERT_TRUE(strlen(inner) < 60000);
-    /* `source` заканчивается на лимите, а диапазон ответа остаётся точным. */
-    ASSERT_NOT_NULL(strstr(inner, "line_0000"));
-    ASSERT_NOT_NULL(strstr(inner, "line_0499"));
-    ASSERT_NULL(strstr(inner, "line_0500"));
+    ASSERT_STR_EQ(inner, "qn: big\n"
+                         "path: big.py\n"
+                         "lines: 1,2000\n"
+                         "output_truncated: true\n");
+    ASSERT_NULL(strstr(inner, "line_0000"));
     ASSERT_NULL(strstr(inner, "line_1999"));
     free(inner);
     free(resp);
@@ -3405,10 +3448,11 @@ TEST(tool_cpp_overloads_are_separate_and_exactly_addressable) {
 
     raw = cbm_mcp_handle_tool(srv, "get_code_snippet",
                               "{\"project\":\"overload-proj\",\"qualified_name\":\"f\"}");
+    ASSERT_NOT_NULL(strstr(raw, "\"isError\":true"));
     inner = extract_text_content(raw);
     free(raw);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "\"status\":\"ambiguous\""));
+    ASSERT_NOT_NULL(strstr(inner, "ambiguous symbol: f"));
     ASSERT_NOT_NULL(strstr(inner, qn_int));
     ASSERT_NOT_NULL(strstr(inner, qn_string));
     free(inner);
@@ -8955,21 +8999,8 @@ static bool is_valid_json_response(const char *json) {
     return true;
 }
 
-static bool snippet_source_has_replacement(const char *json) {
-    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
-    if (!doc) {
-        return false;
-    }
-    yyjson_val *root = yyjson_doc_get_root(doc);
-    yyjson_val *source = yyjson_obj_get(root, "source");
-    const char *source_str = yyjson_get_str(source);
-    bool found = source_str && strstr(source_str, "\xEF\xBF\xBD");
-    yyjson_doc_free(doc);
-    return found;
-}
-
-/* ── TestSnippet_ExactQN ──────────────────────────────────────── */
-
+/* Точный `qualified_name` возвращает только компактные координаты и дословный
+ * исходник; равенство целой строке защищает ответ от скрытых JSON-полей. */
 TEST(snippet_exact_qn) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -8978,18 +9009,13 @@ TEST(snippet_exact_qn) {
     char *resp = call_snippet(srv, "{\"qualified_name\":\"cmd.server.main.HandleRequest\","
                                    "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"HandleRequest\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"source\""));
-    /* Exact match should NOT have match_method */
-    ASSERT_NULL(strstr(resp, "\"match_method\""));
-    /* No property-blob spill: the source IS the payload (signature and
-     * docstring are literally in it); metrics live behind search_graph
-     * fields=[...]. */
-    ASSERT_NULL(strstr(resp, "\"signature\""));
-    ASSERT_NULL(strstr(resp, "\"return_type\""));
-    /* Caller/callee counts: 0 callers, 2 callees */
-    ASSERT_NOT_NULL(strstr(resp, "\"callers\":0"));
-    ASSERT_NOT_NULL(strstr(resp, "\"callees\":2"));
+    ASSERT_STR_EQ(resp, "qn: cmd.server.main.HandleRequest\n"
+                        "path: main.go\n"
+                        "lines: 3,5\n"
+                        "\n"
+                        "func HandleRequest() error {\n"
+                        "\treturn nil\n"
+                        "}\n");
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -9004,13 +9030,13 @@ TEST(snippet_single_line_exact_range) {
     ASSERT_NOT_NULL(srv);
 
     char *resp = call_snippet(srv, "{\"qualified_name\":\"cmd.server.main.SingleLine\","
-                                   "\"project\":\"test-project\","
-                                   "\"include_neighbors\":false}");
+                                   "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"start_line\":15"));
-    ASSERT_NOT_NULL(strstr(resp, "\"end_line\":15"));
-    ASSERT_NOT_NULL(strstr(resp, "func SingleLine() {}"));
-    ASSERT_NULL(strstr(resp, "snippetNeighbor"));
+    ASSERT_STR_EQ(resp, "qn: cmd.server.main.SingleLine\n"
+                        "path: main.go\n"
+                        "lines: 15,15\n"
+                        "\n"
+                        "func SingleLine() {}\n");
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -9018,8 +9044,54 @@ TEST(snippet_single_line_exact_range) {
     PASS();
 }
 
-/* ── TestSnippet_QNSuffix ─────────────────────────────────────── */
+/* Физически длинная строка может читаться несколькими порциями `fgets`, но
+ * остаётся одной строкой диапазона и должна попасть в ответ целиком. */
+TEST(snippet_long_single_line_is_not_partially_read) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
 
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    FILE *fp = fopen(src_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    enum { LONG_LINE_BYTES = 4096 };
+    char long_line[LONG_LINE_BYTES + 1];
+    memset(long_line, 'x', LONG_LINE_BYTES);
+    long_line[LONG_LINE_BYTES] = '\n';
+    ASSERT_EQ(fwrite(long_line, 1, sizeof(long_line), fp), sizeof(long_line));
+    ASSERT_EQ(fclose(fp), 0);
+
+    cbm_node_t node = {0};
+    node.project = "test-project";
+    node.label = "Function";
+    node.name = "LongLine";
+    node.qualified_name = "cmd.server.main.LongLine";
+    node.file_path = "main.go";
+    node.start_line = 1;
+    node.end_line = 1;
+    ASSERT_GT(cbm_store_upsert_node(cbm_mcp_server_store(srv), &node), 0);
+
+    char *resp = call_snippet(srv, "{\"qualified_name\":\"cmd.server.main.LongLine\","
+                                   "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "lines: 1,1\n\n"));
+    char *source = strstr(resp, "\n\n");
+    ASSERT_NOT_NULL(source);
+    source += 2;
+    ASSERT_EQ(strlen(source), sizeof(long_line));
+    ASSERT_EQ(source[0], 'x');
+    ASSERT_EQ(source[LONG_LINE_BYTES - 1], 'x');
+    ASSERT_EQ(source[LONG_LINE_BYTES], '\n');
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* Однозначный суффикс выводит разрешённый полный `qualified_name`, не способ
+ * разрешения запроса. */
 TEST(snippet_qn_suffix) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -9028,9 +9100,9 @@ TEST(snippet_qn_suffix) {
     char *resp = call_snippet(srv, "{\"qualified_name\":\"main.HandleRequest\","
                                    "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"HandleRequest\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"suffix\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"source\""));
+    ASSERT_NOT_NULL(strstr(resp, "qn: cmd.server.main.HandleRequest\n"));
+    ASSERT_NOT_NULL(strstr(resp, "\n\nfunc HandleRequest() error {\n"));
+    ASSERT_NULL(strstr(resp, "match_method"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -9038,8 +9110,8 @@ TEST(snippet_qn_suffix) {
     PASS();
 }
 
-/* ── TestSnippet_UniqueShortName ──────────────────────────────── */
-
+/* Уникальное короткое имя сохраняет прежнее разрешение, но результат всегда
+ * сообщает полный `qualified_name`. */
 TEST(snippet_unique_short_name) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -9049,9 +9121,9 @@ TEST(snippet_unique_short_name) {
     char *resp = call_snippet(srv, "{\"qualified_name\":\"ProcessOrder\","
                                    "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"ProcessOrder\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"name\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"source\""));
+    ASSERT_NOT_NULL(strstr(resp, "qn: cmd.server.main.ProcessOrder\n"));
+    ASSERT_NOT_NULL(strstr(resp, "lines: 7,9\n\nfunc ProcessOrder(id int) {\n"));
+    ASSERT_NULL(strstr(resp, "match_method"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -9059,8 +9131,7 @@ TEST(snippet_unique_short_name) {
     PASS();
 }
 
-/* ── TestSnippet_NameTier ─────────────────────────────────────── */
-
+/* Другой уникальный `name` проходит тот же стабильный путь ответа. */
 TEST(snippet_name_tier) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -9070,8 +9141,8 @@ TEST(snippet_name_tier) {
     char *resp = call_snippet(srv, "{\"qualified_name\":\"HandleRequest\","
                                    "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"HandleRequest\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"match_method\":\"name\""));
+    ASSERT_NOT_NULL(strstr(resp, "qn: cmd.server.main.HandleRequest\n"));
+    ASSERT_NULL(strstr(resp, "match_method"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -9079,211 +9150,83 @@ TEST(snippet_name_tier) {
     PASS();
 }
 
-/* ── TestSnippet_AmbiguousShortName ───────────────────────────── */
-
+/* Неоднозначное короткое имя не притворяется успешным ответом с исходником:
+ * MCP-ошибка сохраняет полные варианты для следующего точного вызова. */
 TEST(snippet_ambiguous_short_name) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* "Run" matches 2 nodes — should return suggestions */
-    char *resp = call_snippet(srv, "{\"qualified_name\":\"Run\","
-                                   "\"project\":\"test-project\"}");
+    char *raw = cbm_mcp_handle_tool(srv, "get_code_snippet",
+                                    "{\"qualified_name\":\"Run\","
+                                    "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NOT_NULL(strstr(raw, "\"isError\":true"));
+    char *resp = extract_text_content(raw);
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"status\":\"ambiguous\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"message\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"suggestions\""));
-    /* Must NOT have "error" key */
-    ASSERT_NULL(strstr(resp, "\"error\""));
-    /* Must NOT have "source" */
-    ASSERT_NULL(strstr(resp, "\"source\""));
-    /* Should have at least 2 suggestions with qualified_name */
+    ASSERT_NOT_NULL(strstr(resp, "ambiguous symbol: Run"));
+    ASSERT_NOT_NULL(strstr(resp, "suggestions: 2"));
     ASSERT_NOT_NULL(strstr(resp, "cmd.server.Run"));
     ASSERT_NOT_NULL(strstr(resp, "cmd.worker.Run"));
     ASSERT_NULL(strstr(resp, "test-project.cmd"));
+    ASSERT_NULL(strstr(resp, "qn: "));
     free(resp);
+    free(raw);
 
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
     PASS();
 }
 
-/* ── TestSnippet_NotFound ─────────────────────────────────────── */
-
+/* Отсутствующий символ остаётся MCP-ошибкой и направляет вызывающего к точному
+ * поиску, не создавая видимость успешного ответа. */
 TEST(snippet_not_found) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    char *resp = call_snippet(srv, "{\"qualified_name\":\"CompletelyNonexistentFunctionXYZ123\","
-                                   "\"project\":\"test-project\"}");
+    char *raw = cbm_mcp_handle_tool(srv, "get_code_snippet",
+                                    "{\"qualified_name\":\"CompletelyNonexistentFunctionXYZ123\","
+                                    "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NOT_NULL(strstr(raw, "\"isError\":true"));
+    char *resp = extract_text_content(raw);
     ASSERT_NOT_NULL(resp);
-    /* Should return error or suggestions */
-    ASSERT_TRUE(strstr(resp, "not found") || strstr(resp, "suggestions"));
+    ASSERT_NOT_NULL(strstr(resp, "symbol not found"));
+    ASSERT_NOT_NULL(strstr(resp, "search_graph"));
     free(resp);
+    free(raw);
 
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
     PASS();
 }
 
-/* ── TestSnippet_FuzzySuggestions ─────────────────────────────── */
-
+/* Неполный фрагмент, который не является однозначным суффиксом, использует тот
+ * же error-path с подсказкой `search_graph`. */
 TEST(snippet_fuzzy_suggestions) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* "Handle" is not an exact QN or suffix — should get not-found guidance */
-    char *resp = call_snippet(srv, "{\"qualified_name\":\"Handle\","
-                                   "\"project\":\"test-project\"}");
+    char *raw = cbm_mcp_handle_tool(srv, "get_code_snippet",
+                                    "{\"qualified_name\":\"Handle\","
+                                    "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NOT_NULL(strstr(raw, "\"isError\":true"));
+    char *resp = extract_text_content(raw);
     ASSERT_NOT_NULL(resp);
-    /* Should guide user to search_graph */
     ASSERT_NOT_NULL(strstr(resp, "search_graph"));
     free(resp);
+    free(raw);
 
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
     PASS();
 }
 
-/* ── TestSnippet_EnrichedProperties ───────────────────────────── */
-
-TEST(snippet_enriched_properties) {
-    /* GUARD (inverted since the compact-output change): the snippet response
-     * carries the verbatim source plus location/degree/coverage metadata and
-     * NOTHING from the node's property blob — no signature/return_type/
-     * is_exported duplication, and never the fp/sp/bt similarity internals
-     * (41% of the legacy response). */
-    char tmp[256];
-    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
-    ASSERT_NOT_NULL(srv);
-
-    char *resp = call_snippet(srv, "{\"qualified_name\":\"cmd.server.main.HandleRequest\","
-                                   "\"project\":\"test-project\"}");
-    ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"source\""));
-    ASSERT_NULL(strstr(resp, "\"signature\""));
-    ASSERT_NULL(strstr(resp, "\"return_type\""));
-    ASSERT_NULL(strstr(resp, "\"is_exported\""));
-    ASSERT_NULL(strstr(resp, "\"fp\""));
-    ASSERT_NULL(strstr(resp, "\"bt\""));
-    free(resp);
-
-    cbm_mcp_server_free(srv);
-    cleanup_snippet_dir(tmp);
-    PASS();
-}
-
-/* ── TestSnippet_FuzzyLastSegment ─────────────────────────────── */
-
-TEST(snippet_fuzzy_last_segment) {
-    char tmp[256];
-    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
-    ASSERT_NOT_NULL(srv);
-
-    /* "auth.handlers.HandleRequest" — suffix match should find HandleRequest */
-    char *resp = call_snippet(srv, "{\"qualified_name\":\"auth.handlers.HandleRequest\","
-                                   "\"project\":\"test-project\"}");
-    ASSERT_NOT_NULL(resp);
-    /* Should either find it via suffix or guide to search_graph */
-    ASSERT_TRUE(strstr(resp, "HandleRequest") != NULL || strstr(resp, "search_graph") != NULL);
-    free(resp);
-
-    cbm_mcp_server_free(srv);
-    cleanup_snippet_dir(tmp);
-    PASS();
-}
-
-/* ── TestSnippet_AutoResolve_Default ──────────────────────────── */
-
-TEST(snippet_auto_resolve_default) {
-    char tmp[256];
-    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
-    ASSERT_NOT_NULL(srv);
-
-    /* "Run" is ambiguous (2 candidates). Without auto_resolve → suggestions */
-    char *resp = call_snippet(srv, "{\"qualified_name\":\"Run\","
-                                   "\"project\":\"test-project\"}");
-    ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"status\":\"ambiguous\""));
-    ASSERT_NULL(strstr(resp, "\"source\""));
-    free(resp);
-
-    cbm_mcp_server_free(srv);
-    cleanup_snippet_dir(tmp);
-    PASS();
-}
-
-/* ── TestSnippet_AutoResolve_Enabled ──────────────────────────── */
-
-TEST(snippet_auto_resolve_enabled) {
-    char tmp[256];
-    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
-    ASSERT_NOT_NULL(srv);
-
-    /* "Run" — suffix match should find candidates or guide to search */
-    char *resp = call_snippet(srv, "{\"qualified_name\":\"Run\","
-                                   "\"project\":\"test-project\"}");
-    ASSERT_NOT_NULL(resp);
-    /* "Run" matches multiple nodes via suffix → should get suggestions or source */
-    ASSERT_TRUE(strstr(resp, "Run") != NULL);
-    free(resp);
-
-    cbm_mcp_server_free(srv);
-    cleanup_snippet_dir(tmp);
-    PASS();
-}
-
-/* ── TestSnippet_IncludeNeighbors_Default ─────────────────────── */
-
-TEST(snippet_include_neighbors_default) {
-    char tmp[256];
-    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
-    ASSERT_NOT_NULL(srv);
-
-    char *resp = call_snippet(srv, "{\"qualified_name\":\"cmd.server.main.HandleRequest\","
-                                   "\"project\":\"test-project\"}");
-    ASSERT_NOT_NULL(resp);
-    /* Without include_neighbors → NO caller_names/callee_names */
-    ASSERT_NULL(strstr(resp, "\"caller_names\""));
-    ASSERT_NULL(strstr(resp, "\"callee_names\""));
-    /* But should still have counts */
-    ASSERT_NOT_NULL(strstr(resp, "\"callers\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"callees\""));
-    free(resp);
-
-    cbm_mcp_server_free(srv);
-    cleanup_snippet_dir(tmp);
-    PASS();
-}
-
-/* ── TestSnippet_IncludeNeighbors_Enabled ─────────────────────── */
-
-TEST(snippet_include_neighbors_enabled) {
-    char tmp[256];
-    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
-    ASSERT_NOT_NULL(srv);
-
-    char *resp = call_snippet(srv, "{\"qualified_name\":\"cmd.server.main.HandleRequest\","
-                                   "\"include_neighbors\":true,\"project\":\"test-project\"}");
-    ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"source\""));
-    /* HandleRequest has 0 callers → no caller_names array */
-    ASSERT_NULL(strstr(resp, "\"caller_names\""));
-    /* HandleRequest has 2 callees: ProcessOrder and Run */
-    ASSERT_NOT_NULL(strstr(resp, "\"callee_names\""));
-    ASSERT_NOT_NULL(strstr(resp, "ProcessOrder"));
-    ASSERT_NOT_NULL(strstr(resp, "Run"));
-    free(resp);
-
-    cbm_mcp_server_free(srv);
-    cleanup_snippet_dir(tmp);
-    PASS();
-}
-
-/* ── TestSnippet_SourceInvalidUtf8 ────────────────────────────── */
-
+/* Небольшой невалидный UTF-8 остаётся обычным полным ответом, а повреждённые
+ * байты заменяются до передачи текста модели. */
 TEST(snippet_source_invalid_utf8) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -9308,11 +9251,143 @@ TEST(snippet_source_invalid_utf8) {
     ASSERT_TRUE(is_valid_json_response(raw));
     char *resp = extract_text_content(raw);
     ASSERT_NOT_NULL(resp);
-    ASSERT_TRUE(is_valid_json_response(resp));
+    ASSERT_FALSE(is_valid_json_response(resp));
+    ASSERT_NOT_NULL(strstr(resp, "qn: cmd.server.main.HandleRequest\n"));
+    ASSERT_NOT_NULL(strstr(resp, "path: main.go\n"));
+    ASSERT_NOT_NULL(strstr(resp, "lines: 3,5\n\n"));
     ASSERT_NULL(strstr(resp, "\xC0\xD4"));
     ASSERT_NOT_NULL(strstr(resp, "HandleRequest"));
     ASSERT_NOT_NULL(strstr(resp, "return nil"));
-    ASSERT_TRUE(snippet_source_has_replacement(resp));
+    ASSERT_NOT_NULL(strstr(resp, "\xEF\xBF\xBD"));
+
+    free(resp);
+    free(raw);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* Ровно 36003 байта после санитизации ещё возвращаются полностью, а следующий
+ * байт переводит тот же символ в ответ без частичного исходника. */
+TEST(snippet_source_size_boundary) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    FILE *fp = fopen(src_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    enum { FOUR_BYTE_LINES = 9000, SOURCE_LINES = FOUR_BYTE_LINES + 1 };
+    for (int i = 0; i < FOUR_BYTE_LINES; i++) {
+        ASSERT_EQ(fwrite("abc\n", 1, 4, fp), 4);
+    }
+    ASSERT_EQ(fwrite("xyz", 1, 3, fp), 3);
+    ASSERT_EQ(fclose(fp), 0);
+
+    cbm_node_t node = {0};
+    node.project = "test-project";
+    node.label = "Function";
+    node.name = "Boundary";
+    node.qualified_name = "cmd.server.main.Boundary";
+    node.file_path = "main.go";
+    node.start_line = 1;
+    node.end_line = SOURCE_LINES;
+    ASSERT_GT(cbm_store_upsert_node(cbm_mcp_server_store(srv), &node), 0);
+
+    char *resp = call_snippet(srv, "{\"qualified_name\":\"cmd.server.main.Boundary\","
+                                   "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "output_truncated"));
+    ASSERT_NOT_NULL(strstr(resp, "lines: 1,9001\n\n"));
+    char *source = strstr(resp, "\n\n");
+    ASSERT_NOT_NULL(source);
+    source += 2;
+    ASSERT_EQ(strlen(source), 36003);
+    ASSERT_STR_EQ(source + strlen(source) - 3, "xyz");
+    free(resp);
+
+    fp = fopen(src_path, "ab");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_EQ(fwrite("q", 1, 1, fp), 1);
+    ASSERT_EQ(fclose(fp), 0);
+
+    resp = call_snippet(srv, "{\"qualified_name\":\"cmd.server.main.Boundary\","
+                             "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_STR_EQ(resp, "qn: cmd.server.main.Boundary\n"
+                        "path: main.go\n"
+                        "lines: 1,9001\n"
+                        "output_truncated: true\n");
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* Считать порог нужно после санитизации: невалидные однобайтовые фрагменты
+ * расширяются до трёхбайтового символа замены и могут превысить бюджет. */
+TEST(snippet_invalid_utf8_can_exceed_size_budget) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    FILE *fp = fopen(src_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    const unsigned char invalid_line[] = {0xC0, '\n'};
+    enum { INVALID_LINES = 9001 };
+    for (int i = 0; i < INVALID_LINES; i++) {
+        ASSERT_EQ(fwrite(invalid_line, 1, sizeof(invalid_line), fp), sizeof(invalid_line));
+    }
+    ASSERT_EQ(fclose(fp), 0);
+
+    cbm_node_t node = {0};
+    node.project = "test-project";
+    node.label = "Function";
+    node.name = "InvalidLarge";
+    node.qualified_name = "cmd.server.main.InvalidLarge";
+    node.file_path = "main.go";
+    node.start_line = 1;
+    node.end_line = INVALID_LINES;
+    ASSERT_GT(cbm_store_upsert_node(cbm_mcp_server_store(srv), &node), 0);
+
+    char *resp = call_snippet(srv, "{\"qualified_name\":\"cmd.server.main.InvalidLarge\","
+                                   "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_STR_EQ(resp, "qn: cmd.server.main.InvalidLarge\n"
+                        "path: main.go\n"
+                        "lines: 1,9001\n"
+                        "output_truncated: true\n");
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* Разрешённый узел без доступного файла должен завершаться MCP-ошибкой, а не
+ * успешным ответом с текстовой заглушкой вместо исходника. */
+TEST(snippet_source_unavailable_is_error) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    ASSERT_EQ(unlink(src_path), 0);
+
+    char *raw = cbm_mcp_handle_tool(srv, "get_code_snippet",
+                                    "{\"qualified_name\":\"cmd.server.main.HandleRequest\","
+                                    "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NOT_NULL(strstr(raw, "\"isError\":true"));
+    char *resp = extract_text_content(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "source not available"));
+    ASSERT_NULL(strstr(resp, "qn: "));
 
     free(resp);
     free(raw);
@@ -12282,6 +12357,7 @@ SUITE(mcp) {
     /* MCP protocol helpers */
     RUN_TEST(mcp_initialize_response);
     RUN_TEST(mcp_tools_list);
+    RUN_TEST(mcp_get_code_snippet_publishes_plain_text_contract);
     RUN_TEST(mcp_detect_changes_publishes_symbols_contract);
     RUN_TEST(mcp_tools_help_list_matches_registry);
     RUN_TEST(mcp_tools_list_latest_metadata);
@@ -12347,7 +12423,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_totals_respect_test_filter);
     RUN_TEST(tool_trace_totals_respect_test_filter_tests_root_subtree_issue1294);
     RUN_TEST(tool_get_architecture_cycles_detects_scc);
-    RUN_TEST(tool_get_code_snippet_clips_whole_file_node);
+    RUN_TEST(tool_get_code_snippet_omits_oversized_source);
     RUN_TEST(tool_search_graph_includes_node_properties);
     RUN_TEST(tool_search_graph_keeps_cpp_variadic_qn_intact);
     RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
@@ -12486,19 +12562,17 @@ SUITE(mcp) {
     /* Snippet resolution (port of snippet_test.go) */
     RUN_TEST(snippet_exact_qn);
     RUN_TEST(snippet_single_line_exact_range);
+    RUN_TEST(snippet_long_single_line_is_not_partially_read);
     RUN_TEST(snippet_qn_suffix);
     RUN_TEST(snippet_unique_short_name);
     RUN_TEST(snippet_name_tier);
     RUN_TEST(snippet_ambiguous_short_name);
     RUN_TEST(snippet_not_found);
     RUN_TEST(snippet_fuzzy_suggestions);
-    RUN_TEST(snippet_enriched_properties);
-    RUN_TEST(snippet_fuzzy_last_segment);
-    RUN_TEST(snippet_auto_resolve_default);
-    RUN_TEST(snippet_auto_resolve_enabled);
-    RUN_TEST(snippet_include_neighbors_default);
-    RUN_TEST(snippet_include_neighbors_enabled);
     RUN_TEST(snippet_source_invalid_utf8);
+    RUN_TEST(snippet_source_size_boundary);
+    RUN_TEST(snippet_invalid_utf8_can_exceed_size_budget);
+    RUN_TEST(snippet_source_unavailable_is_error);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
