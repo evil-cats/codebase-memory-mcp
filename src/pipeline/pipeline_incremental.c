@@ -1550,6 +1550,7 @@ static int closure_probe_surfaces(cbm_pipeline_t *p, const char *project,
         .cancelled = cbm_pipeline_cancelled_ptr(p),
         .pipeline = NULL, /* probe must not record file errors twice */
         .mode = cbm_pipeline_get_mode(p),
+        .userconfig = cbm_get_user_lang_config(),
         .path_aliases = aliases,
         .excluded_dirs = excluded_dirs,
         .excluded_count = excluded_count,
@@ -2123,6 +2124,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         .cancelled = cbm_pipeline_cancelled_ptr(p),
         .pipeline = p,
         .mode = cbm_pipeline_get_mode(p),
+        .userconfig = cbm_get_user_lang_config(),
         .path_aliases = path_aliases,
         .excluded_dirs = excluded_dirs,
         .excluded_count = excluded_count,
@@ -2674,6 +2676,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .cancelled = cbm_pipeline_cancelled_ptr(p),
         .pipeline = p, /* so passes can record per-file skips (Track B) */
         .mode = cbm_pipeline_get_mode(p),
+        .userconfig = cbm_get_user_lang_config(),
         .path_aliases = path_aliases,
         .excluded_dirs = excluded_dirs,
         .excluded_count = excluded_count,

@@ -1,8 +1,8 @@
 /*
- * test_userconfig.c — Tests for user-defined extension→language mappings.
+ * test_userconfig.c — Tests for project discovery and C++ preprocessing config.
  *
- * Tests cbm_userconfig_load(), cbm_userconfig_lookup(), and the
- * cbm_set_user_lang_config() / cbm_language_for_extension() integration.
+ * Проверяет extension mappings, project-only параметры C++/CUDA-препроцессора,
+ * владение массивами и интеграцию с cbm_language_for_extension().
  */
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
@@ -54,8 +54,52 @@ TEST(userconfig_project_basic) {
     PASS();
 }
 
+/* Проектная секция `cpp` сохраняет порядок defines и привязывает относительные
+ * include paths к repo root; нестроковые и синтаксически неверные элементы не
+ * должны удалять валидных соседей. */
+TEST(userconfig_project_cpp_preprocessor) {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "%s/uctest_cpp_project", cbm_tmpdir());
+    cbm_mkdir_p(dir, 0755);
+
+    char project_path[512];
+    snprintf(project_path, sizeof(project_path), "%s/.codebase-memory.json", dir);
+    ASSERT_EQ(write_json(project_path,
+                         "{\"cpp\":{"
+                         "\"defines\":[\"FIRST=1\",42,\"_SECOND\",\"-DBAD=1\",\"\"],"
+                         "\"include_paths\":[\"cpp_include\",false,\"\",\"/system/include\"]"
+                         "}}"),
+              0);
+
+    cbm_userconfig_t *cfg = cbm_userconfig_load(dir);
+    ASSERT_NOT_NULL(cfg);
+    const char **defines = cbm_userconfig_preprocessor_defines(cfg, CBM_LANG_CPP);
+    const char **include_paths = cbm_userconfig_preprocessor_include_paths(cfg, CBM_LANG_CPP);
+    ASSERT_NOT_NULL(defines);
+    ASSERT_NOT_NULL(include_paths);
+    ASSERT_EQ(cfg->cpp_define_count, 2);
+    ASSERT_STR_EQ(defines[0], "FIRST=1");
+    ASSERT_STR_EQ(defines[1], "_SECOND");
+    ASSERT_NULL(defines[2]);
+    ASSERT_EQ(cfg->cpp_include_path_count, 2);
+    char expected_relative[512];
+    snprintf(expected_relative, sizeof(expected_relative), "%s/cpp_include", dir);
+    ASSERT_STR_EQ(include_paths[0], expected_relative);
+    ASSERT_STR_EQ(include_paths[1], "/system/include");
+    ASSERT_NULL(include_paths[2]);
+    ASSERT_TRUE(cbm_userconfig_preprocessor_defines(cfg, CBM_LANG_CUDA) == defines);
+    ASSERT_NULL(cbm_userconfig_preprocessor_defines(cfg, CBM_LANG_C));
+    ASSERT_NULL(cbm_userconfig_preprocessor_include_paths(cfg, CBM_LANG_C));
+
+    cbm_userconfig_free(cfg);
+    remove(project_path);
+    PASS();
+}
+
 /* ── Tests: global config ────────────────────────────────────────── */
 
+/* Global config продолжает управлять расширениями, но не может навязать всем
+ * репозиториям единый C++ compilation context. */
 TEST(userconfig_global_via_env) {
     /* Point config dir to a temp dir via the platform-appropriate env var:
      * XDG_CONFIG_HOME on Linux/macOS, APPDATA on Windows. */
@@ -68,9 +112,10 @@ TEST(userconfig_global_via_env) {
 
     char global_path[768];
     snprintf(global_path, sizeof(global_path), "%s/config.json", app_dir);
-    ASSERT_EQ(
-        write_json(global_path, "{\"extra_extensions\":{\".twig\":\"html\"}}"),
-        0);
+    ASSERT_EQ(write_json(global_path, "{\"extra_extensions\":{\".twig\":\"html\"},"
+                                      "\"cpp\":{\"defines\":[\"GLOBAL_CPP=1\"],"
+                                      "\"include_paths\":[\"/global/include\"]}}"),
+              0);
 
 #ifdef _WIN32
     char old_appdata[512] = "";
@@ -92,6 +137,8 @@ TEST(userconfig_global_via_env) {
 
     ASSERT_NOT_NULL(cfg);
     ASSERT_EQ(cbm_userconfig_lookup(cfg, ".twig"), CBM_LANG_HTML);
+    ASSERT_NULL(cbm_userconfig_preprocessor_defines(cfg, CBM_LANG_CPP));
+    ASSERT_NULL(cbm_userconfig_preprocessor_include_paths(cfg, CBM_LANG_CPP));
 
     cbm_userconfig_free(cfg);
     remove(global_path);
@@ -174,6 +221,8 @@ TEST(userconfig_missing_files_ok) {
     cbm_userconfig_t *cfg = cbm_userconfig_load("/tmp/__nonexistent_repo_12345__");
     ASSERT_NOT_NULL(cfg); /* must not return NULL — just empty */
     ASSERT_EQ(cfg->count, 0);
+    ASSERT_NULL(cbm_userconfig_preprocessor_defines(cfg, CBM_LANG_CPP));
+    ASSERT_NULL(cbm_userconfig_preprocessor_include_paths(cfg, CBM_LANG_CPP));
     cbm_userconfig_free(cfg);
     PASS();
 }
@@ -224,6 +273,7 @@ TEST(userconfig_free_null) {
 
 SUITE(userconfig) {
     RUN_TEST(userconfig_project_basic);
+    RUN_TEST(userconfig_project_cpp_preprocessor);
     RUN_TEST(userconfig_global_via_env);
     RUN_TEST(userconfig_project_wins_over_global);
     RUN_TEST(userconfig_unknown_lang_skipped);

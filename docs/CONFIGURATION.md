@@ -7,7 +7,7 @@ This page documents the configuration files that `codebase-memory-mcp` reads or 
 | Purpose | Path | Format | Notes |
 |---|---|---|---|
 | Global custom extension mapping | `$XDG_CONFIG_HOME/codebase-memory-mcp/config.json` | JSON | Falls back to `~/.config/codebase-memory-mcp/config.json` when `XDG_CONFIG_HOME` is unset. |
-| Per-project custom extension mapping | `{repo_root}/.codebase-memory.json` | JSON | Overrides conflicting global `extra_extensions` entries. |
+| Проектные расширения и настройки C++-препроцессора | `{repo_root}/.codebase-memory.json` | JSON | Переопределяет глобальные `extra_extensions` и настраивает C++/CUDA-препроцессинг. |
 | CLI-managed runtime settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/_config.db` | SQLite | Written by `codebase-memory-mcp config set/reset`. |
 | UI settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/config.json` | JSON | Stores `ui_enabled` and `ui_port`. |
 | Daemon operation log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/cbm-daemon.log` | Structured log | Durable daemon lifecycle, watcher/indexing, UI, resource, and error events. |
@@ -62,7 +62,43 @@ Notes:
 - Missing files are ignored.
 - If the same extension appears in both files, the per-project file wins.
 
-## 2. CLI-Managed Runtime Settings
+## 2. Проектные настройки C++-препроцессора
+
+Проектный `.codebase-memory.json` может передавать параметры препроцессинга для
+C++ и CUDA:
+
+```json
+{
+  "cpp": {
+    "defines": [
+      "__GNUC__=16",
+      "FEATURE_FLAG=1"
+    ],
+    "include_paths": [
+      "/usr/include",
+      "build/generated/include"
+    ]
+  }
+}
+```
+
+Правила:
+
+- Элементы `defines` записываются как `NAME` или `NAME=VALUE`, без ведущего `-D`.
+- Абсолютные include paths используются без изменения.
+- Относительные include paths разрешаются от корня репозитория, а не от рабочего
+  каталога daemon-а.
+- Порядок элементов сохраняется.
+- Пустые, нестроковые и некорректные элементы пропускаются с warning.
+- Настройки применяются только к C++ и CUDA; C-препроцессинг не меняется.
+- Глобальный config намеренно не задаёт значения `cpp` по умолчанию;
+  контекст компиляции принадлежит проекту.
+- Каталоги include не индексируются как дополнительные проекты. Препроцессор
+  читает только заголовки, на которые ссылаются индексируемые C++/CUDA-файлы.
+- Изменение `.codebase-memory.json` меняет semantic input manifest, поэтому
+  следующий запуск не переиспользует поколение с прежними настройками.
+
+## 3. CLI-Managed Runtime Settings
 
 The `config` subcommand stores runtime settings in a small SQLite database:
 
@@ -87,7 +123,7 @@ Current keys:
 | `auto_index` | `false` | Automatically index new projects when an MCP session starts. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
 
-## 3. UI Settings
+## 4. UI Settings
 
 The optional built-in graph UI stores its settings in:
 
@@ -110,7 +146,7 @@ Notes:
 - `CBM_CACHE_DIR` changes both the UI config location and the runtime settings database location.
 - CBM resolves `CBM_CACHE_DIR` to one canonical per-account cache root. A process configured with a different root fails while any CBM session or command is active; close them before switching roots.
 
-## 4. Environment Variables
+## 5. Environment Variables
 
 These environment variables affect runtime behavior:
 
@@ -182,7 +218,7 @@ be indexed and later returned. And the credential list is a denylist, so it
 raises the cost of a mistake rather than closing the class — a directory it does
 not name is permitted.
 
-## 5. Agent and Editor Integration Files
+## 6. Agent and Editor Integration Files
 
 The `install` command can also write MCP entries and instruction blocks into agent/editor config files such as Claude Code, Codex, Gemini, VS Code, Cursor, Zed, and others.
 

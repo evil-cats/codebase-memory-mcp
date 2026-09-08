@@ -95,6 +95,10 @@ typedef struct {
                                * NULL-safe. */
     int mode;                 /* cbm_index_mode_t (0=full, 1=moderate, 2=fast, 3=advanced) */
 
+    /* Неизменяемый snapshot project config. Загружается до worker threads и
+     * живёт до завершения всех extraction passes. */
+    const cbm_userconfig_t *userconfig;
+
     /* Extraction result cache (sequential pipeline optimization).
      * When non-NULL, pass_definitions stores results here instead of freeing,
      * and pass_calls/usages/semantic reuse cached results instead of re-extracting.
@@ -682,7 +686,7 @@ int cbm_pipeline_build_fresh_semantic_manifest(const char *project, const char *
 
 /* Compatibility contract persisted in coverage metadata. Increment when a
  * graph/manifest semantic change makes prior exact-input indexes unsafe. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 3 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 4 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

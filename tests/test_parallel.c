@@ -16,6 +16,7 @@
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
+#include "discover/userconfig.h"
 #include "foundation/platform.h"
 #include "foundation/log.h"
 #include "cbm.h"
@@ -3972,6 +3973,101 @@ TEST(lsp_target_node_supports_long_local_qn_without_prefix_retry) {
     PASS();
 }
 
+/* Большие проекты проходят отдельный worker context. Этот тест требует, чтобы
+ * тот же project config дошёл до simplecpp без зависимости от sequential path. */
+TEST(parallel_project_cpp_preprocessor_config_recovers_class) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cbm_parallel_cpp_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    ASSERT_EQ(th_write_file(TH_PATH(tmpdir, "cpp_include/google/protobuf/port_def.inc"),
+                            "#define PROTOBUF_VERSION 3019004\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(tmpdir, "Au.pb.h"), "#include <google/protobuf/port_def.inc>\n"
+                                                        "#if PROTOBUF_VERSION < 3019000\n"
+                                                        "#error incompatible protobuf runtime\n"
+                                                        "#endif\n"
+                                                        "#ifndef CBM_PROJECT_PROTOBUF\n"
+                                                        "#error missing project define\n"
+                                                        "#endif\n"
+                                                        "class Au final {\n"
+                                                        " public:\n"
+                                                        "  inline Au() : value_(0) {}\n"
+                                                        "  inline void Swap(Au* other) {\n"
+                                                        "#ifdef CBM_SAFE_SWAP\n"
+                                                        "    if (other && other != this) {\n"
+                                                        "#else\n"
+                                                        "    if (other != this) {\n"
+                                                        "#endif\n"
+                                                        "      value_ = other->value_;\n"
+                                                        "    }\n"
+                                                        "  }\n"
+                                                        " private:\n"
+                                                        "  int value_;\n"
+                                                        "};\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(tmpdir, ".codebase-memory.json"),
+                            "{\"cpp\":{\"defines\":[\"CBM_PROJECT_PROTOBUF=1\","
+                            "\"CBM_SAFE_SWAP=1\"],\"include_paths\":[\"cpp_include\"]}}\n"),
+              0);
+
+    cbm_userconfig_t *userconfig = cbm_userconfig_load(tmpdir);
+    ASSERT_NOT_NULL(userconfig);
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    ASSERT_EQ(cbm_discover(tmpdir, &opts, &files, &file_count), 0);
+    ASSERT_GT(file_count, 0);
+
+    const char *project = "parallel-cpp-config";
+    cbm_gbuf_t *gbuf = cbm_gbuf_new(project, tmpdir);
+    cbm_registry_t *registry = cbm_registry_new();
+    CBMFileResult **results = calloc((size_t)file_count, sizeof(CBMFileResult *));
+    ASSERT_NOT_NULL(gbuf);
+    ASSERT_NOT_NULL(registry);
+    ASSERT_NOT_NULL(results);
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = project,
+        .repo_path = tmpdir,
+        .gbuf = gbuf,
+        .registry = registry,
+        .cancelled = &cancelled,
+        .userconfig = userconfig,
+    };
+    _Atomic int64_t shared_ids;
+    atomic_init(&shared_ids, cbm_gbuf_next_id(gbuf));
+    cbm_init();
+    ASSERT_EQ(cbm_parallel_extract(&ctx, files, file_count, results, &shared_ids, 2), 0);
+
+    int class_count = 0;
+    for (int i = 0; i < file_count; i++) {
+        if (!results[i]) {
+            continue;
+        }
+        for (int d = 0; d < results[i]->defs.count; d++) {
+            const CBMDefinition *def = &results[i]->defs.items[d];
+            if (def->label && def->name && strcmp(def->label, "Class") == 0 &&
+                strcmp(def->name, "Au") == 0) {
+                class_count++;
+                ASSERT_STR_EQ(def->file_path, "Au.pb.h");
+                ASSERT_EQ((int)def->start_line, 8);
+                ASSERT_EQ((int)def->end_line, 22);
+            }
+        }
+        cbm_free_result(results[i]);
+    }
+    ASSERT_EQ(class_count, 1);
+
+    free(results);
+    cbm_registry_free(registry);
+    cbm_gbuf_free(gbuf);
+    cbm_discover_free(files, file_count);
+    cbm_userconfig_free(userconfig);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 /* ── Suite Registration ──────────────────────────────────────────── */
 
 SUITE(parallel) {
@@ -4035,6 +4131,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_rust_proc_macros_are_decorates_and_usage_only);
     RUN_TEST(parallel_c_preprocessed_coordinate_collision_preserves_hidden_target);
     RUN_TEST(parallel_cpp_preprocessed_coordinate_collision_preserves_hidden_target);
+    RUN_TEST(parallel_project_cpp_preprocessor_config_recovers_class);
     RUN_TEST(parallel_cuda_preprocessed_coordinate_collision_preserves_hidden_target);
     RUN_TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges);
     RUN_TEST(parallel_cross_file_reread_preserves_unretained_edges);

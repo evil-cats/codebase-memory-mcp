@@ -6005,6 +6005,73 @@ TEST(pipeline_cpp_forward_declarations_use_definition_qn) {
     PASS();
 }
 
+/* Проектный C++ config обязан дойти до preprocessed recovery целиком: локальный
+ * include root задаёт protobuf version, а project define отключает второй
+ * `#error`. Raw AST намеренно теряет класс на разделённых `#ifdef`-ветвях. */
+TEST(pipeline_project_cpp_preprocessor_config_recovers_class) {
+    const char *files[] = {"cpp_include/google/protobuf/port_def.inc", "Au.pb.h",
+                           ".codebase-memory.json"};
+    const char *contents[] = {
+        "#define PROTOBUF_VERSION 3019004\n",
+        "#include <google/protobuf/port_def.inc>\n"
+        "#if PROTOBUF_VERSION < 3019000\n"
+        "#error incompatible protobuf runtime\n"
+        "#endif\n"
+        "#ifndef CBM_PROJECT_PROTOBUF\n"
+        "#error missing project define\n"
+        "#endif\n"
+        "class Au final {\n"
+        " public:\n"
+        "  inline Au() : value_(0) {}\n"
+        "  inline void Swap(Au* other) {\n"
+        "#ifdef CBM_SAFE_SWAP\n"
+        "    if (other && other != this) {\n"
+        "#else\n"
+        "    if (other != this) {\n"
+        "#endif\n"
+        "      value_ = other->value_;\n"
+        "    }\n"
+        "  }\n"
+        " private:\n"
+        "  int value_;\n"
+        "};\n",
+        "{\"cpp\":{\"defines\":[\"CBM_PROJECT_PROTOBUF=1\",\"CBM_SAFE_SWAP=1\"],"
+        "\"include_paths\":[\"cpp_include\"]}}\n"};
+    if (setup_lang_repo(files, contents, 3) != 0) {
+        FAIL("tmpdir");
+    }
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    const char *project = cbm_pipeline_project_name(pipeline);
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, project, "Au", &nodes, &node_count),
+              CBM_STORE_OK);
+    int class_count = 0;
+    for (int i = 0; i < node_count; i++) {
+        if (nodes[i].label && strcmp(nodes[i].label, "Class") == 0) {
+            class_count++;
+            ASSERT_STR_EQ(nodes[i].file_path, "Au.pb.h");
+            ASSERT_EQ(nodes[i].start_line, 8);
+            ASSERT_EQ(nodes[i].end_line, 22);
+        }
+    }
+    ASSERT_EQ(class_count, 1);
+
+    cbm_store_free_nodes(nodes, node_count);
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    teardown_lang_repo();
+    PASS();
+}
+
 TEST(pipeline_python_project) {
     /* Port of TestPipelinePythonProject */
     const char *files[] = {"main.py", "utils.py"};
@@ -12416,6 +12483,7 @@ SUITE(pipeline) {
     RUN_TEST(usages_kotlin_no_duplicate_calls);
     /* Language integration tests */
     RUN_TEST(pipeline_cpp_forward_declarations_use_definition_qn);
+    RUN_TEST(pipeline_project_cpp_preprocessor_config_recovers_class);
     RUN_TEST(pipeline_python_project);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);

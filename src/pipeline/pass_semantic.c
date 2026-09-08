@@ -474,7 +474,8 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
     }
 }
 
-/* Get extraction result from cache or re-extract. Sets *owned=true if caller must free. */
+/* Вернуть cached extraction result либо повторить извлечение с тем же project
+ * config. owned=true передаёт вызывающему обязанность освободить результат. */
 static CBMFileResult *sem_get_or_extract(cbm_pipeline_ctx_t *ctx, int file_idx,
                                          const cbm_file_info_t *fi, bool *owned) {
     *owned = false;
@@ -486,8 +487,12 @@ static CBMFileResult *sem_get_or_extract(cbm_pipeline_ctx_t *ctx, int file_idx,
     if (!source) {
         return NULL;
     }
-    CBMFileResult *r = cbm_extract_file(source, source_len, fi->language, ctx->project_name,
-                                        fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL);
+    const char **extra_defines = cbm_userconfig_preprocessor_defines(ctx->userconfig, fi->language);
+    const char **include_paths =
+        cbm_userconfig_preprocessor_include_paths(ctx->userconfig, fi->language);
+    CBMFileResult *r =
+        cbm_extract_file(source, source_len, fi->language, ctx->project_name, fi->rel_path,
+                         CBM_EXTRACT_BUDGET, extra_defines, include_paths);
     free(source);
     if (r) {
         *owned = true;

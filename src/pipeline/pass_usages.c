@@ -322,8 +322,12 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
                 errors++;
                 continue;
             }
+            const char **extra_defines =
+                cbm_userconfig_preprocessor_defines(ctx->userconfig, files[i].language);
+            const char **include_paths =
+                cbm_userconfig_preprocessor_include_paths(ctx->userconfig, files[i].language);
             result = cbm_extract_file(source, source_len, files[i].language, ctx->project_name, rel,
-                                      CBM_EXTRACT_BUDGET, NULL, NULL);
+                                      CBM_EXTRACT_BUDGET, extra_defines, include_paths);
             free(source);
             if (!result) {
                 errors++;

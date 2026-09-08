@@ -637,6 +637,7 @@ typedef struct {
     int file_count;
     const char *project_name;
     const char *repo_path;
+    const cbm_userconfig_t *userconfig; /* заимствованный неизменяемый project config */
 
     extract_worker_state_t *workers;
     int max_workers;
@@ -852,6 +853,10 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         }
 
         uint64_t file_t0 = extract_now_ns();
+        const char **extra_defines =
+            cbm_userconfig_preprocessor_defines(ec->userconfig, fi->language);
+        const char **include_paths =
+            cbm_userconfig_preprocessor_include_paths(ec->userconfig, fi->language);
 
         /* Export XML uses the same cache slot as every physical file, so its
          * generated classes are composed before entering the common registry
@@ -862,8 +867,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                                                            fi->rel_path, ec->macro_table,
                                                            ec->return_type_table)
                 : cbm_extract_file_ex(source, source_len, fi->language, ec->project_name,
-                                      fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL, ec->macro_table,
-                                      ec->return_type_table);
+                                      fi->rel_path, CBM_EXTRACT_BUDGET, extra_defines,
+                                      include_paths, ec->macro_table, ec->return_type_table);
 
         uint64_t file_elapsed_ms = (extract_now_ns() - file_t0) / PP_USEC_PER_MS;
 
@@ -1107,6 +1112,7 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         .file_count = file_count,
         .project_name = ctx->project_name,
         .repo_path = ctx->repo_path,
+        .userconfig = ctx->userconfig,
         .workers = workers,
         .max_workers = worker_count,
         .result_cache = result_cache,

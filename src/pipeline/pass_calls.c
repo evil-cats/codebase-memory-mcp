@@ -743,9 +743,12 @@ static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
     if (!src) {
         return NULL;
     }
+    const char **extra_defines = cbm_userconfig_preprocessor_defines(ctx->userconfig, fi->language);
+    const char **include_paths =
+        cbm_userconfig_preprocessor_include_paths(ctx->userconfig, fi->language);
     CBMFileResult *r = cbm_extract_file_ex(src, slen, fi->language, ctx->project_name, fi->rel_path,
-                                           CBM_EXTRACT_BUDGET, NULL, NULL, ctx->macro_table,
-                                           ctx->return_type_table);
+                                           CBM_EXTRACT_BUDGET, extra_defines, include_paths,
+                                           ctx->macro_table, ctx->return_type_table);
     free(src);
     if (r) {
         *owned = true;

@@ -722,6 +722,9 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         const char *path = files[i].path;
         const char *rel = files[i].rel_path;
         CBMLanguage lang = files[i].language;
+        const char **extra_defines = cbm_userconfig_preprocessor_defines(ctx->userconfig, lang);
+        const char **include_paths =
+            cbm_userconfig_preprocessor_include_paths(ctx->userconfig, lang);
 
         /* Crash-quarantine skip (Stage 3c): the supervisor's single-threaded
          * recovery re-run always lands on THIS sequential path (worker_count
@@ -775,9 +778,9 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             lang == CBM_LANG_OBJECTSCRIPT_EXPORT
                 ? cbm_pipeline_extract_objectscript_export(source, source_len, ctx->project_name,
                                                            rel, ctx->macro_table, NULL)
-                : cbm_extract_file_ex(
-                      source, source_len, lang, ctx->project_name, rel, CBM_EXTRACT_BUDGET, NULL,
-                      NULL /* no extra defines or include paths */, ctx->macro_table, NULL);
+                : cbm_extract_file_ex(source, source_len, lang, ctx->project_name, rel,
+                                      CBM_EXTRACT_BUDGET, extra_defines, include_paths,
+                                      ctx->macro_table, NULL);
         free(source);
 
         if (!result) {

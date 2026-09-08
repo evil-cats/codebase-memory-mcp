@@ -2177,7 +2177,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
      * and fast skip them entirely. Set before any extraction dispatch. */
     cbm_set_macro_extraction(p->mode == CBM_MODE_FULL);
 
-    /* Load user-defined extension overrides (fail-open: NULL on error) */
+    /* Загрузить единый snapshot пользовательской конфигурации до discovery и workers. */
     CBM_PROF_START(t_userconfig);
     p->userconfig = cbm_userconfig_load(p->repo_path);
     cbm_set_user_lang_config(p->userconfig);
@@ -2296,6 +2296,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
         .cancelled = p->cancelled,
         .pipeline = p, /* so passes can record per-file skips (Track B) */
         .mode = (int)p->mode,
+        .userconfig = p->userconfig,
         .path_aliases = path_aliases,
         .excluded_dirs = p->excluded_dirs,
         .excluded_count = p->excluded_count,
@@ -2334,7 +2335,7 @@ cleanup:
         p->ignored_count = requested_ignored_count;
         p->ignored_total = requested_ignored_total;
     }
-    /* Clear and free user extension config */
+    /* Сбросить process-global borrow до освобождения пользовательского config. */
     cbm_set_user_lang_config(NULL);
     cbm_userconfig_free(p->userconfig);
     p->userconfig = NULL;

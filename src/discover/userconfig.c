@@ -1,13 +1,11 @@
 /*
- * userconfig.c — User-defined extension→language mappings.
+ * userconfig.c — Загрузка пользовательских настроек проекта.
  *
- * Reads extra_extensions from:
- *   Global:  $XDG_CONFIG_HOME/codebase-memory-mcp/config.json
- *            (falls back to ~/.config/codebase-memory-mcp/config.json)
- *   Project: {repo_root}/.codebase-memory.json
- *
- * Project config wins over global. Unknown language values warn and are
- * skipped (fail-open). Missing files are silently ignored.
+ * Глобальный и проектный файлы объединяют `extra_extensions`, причём проектный
+ * имеет приоритет. Только проектный `.codebase-memory.json` владеет секцией
+ * `cpp`: она передаёт C++/CUDA extraction workers определения препроцессора и
+ * каталоги заголовков. Относительные пути разрешаются от корня репозитория.
+ * Некорректные значения пропускаются без отказа всего индексирования.
  */
 #include "discover/userconfig.h"
 #include "cbm.h" /* CBMLanguage, CBM_LANG_* */
@@ -16,12 +14,13 @@
 #include "foundation/compat_fs.h"
 #include "foundation/sha256.h"
 
-enum { MAX_CONFIG_SIZE = 65536 };
+enum { MAX_CONFIG_SIZE = 65536, MAX_CPP_CONFIG_VALUES = 1024 };
 #include "foundation/log.h"
 
 #include <yyjson/yyjson.h>
 
 #include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -248,13 +247,143 @@ static int parse_extra_extensions(yyjson_val *root, cbm_userext_t **entries, int
     return 0;
 }
 
-/*
- * Read a JSON file and parse extra_extensions from it.
- * Silently ignores missing files. Logs warnings for corrupt JSON.
- * Returns 0 on success (or absent file), -1 on alloc failure.
- */
+/* Проверить имя command-line определения без интерпретации его значения.
+ * Правая часть после первого `=` остаётся данными для simplecpp. */
+static bool cpp_define_is_valid(const char *value) {
+    if (!value || (!isalpha((unsigned char)value[0]) && value[0] != '_')) {
+        return false;
+    }
+    for (const char *p = value + 1; *p && *p != '='; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '_') {
+            return false;
+        }
+    }
+    return strchr(value, '\n') == NULL && strchr(value, '\r') == NULL;
+}
+
+/* Распознать POSIX, UNC и DOS absolute paths независимо от host-платформы:
+ * один config может переноситься вместе с cross-platform репозиторием. */
+static bool config_path_is_absolute(const char *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    if (path[0] == '/' || (path[0] == '\\' && path[1] == '\\')) {
+        return true;
+    }
+    return isalpha((unsigned char)path[0]) && path[1] == ':' && (path[2] == '/' || path[2] == '\\');
+}
+
+/* Relative include paths принадлежат проекту, поэтому их нельзя оставлять
+ * зависимыми от cwd долгоживущего daemon-а. Результат владеется вызывающим. */
+static char *resolve_cpp_include_path(const char *repo_path, const char *path) {
+    if (config_path_is_absolute(path) || !repo_path || !repo_path[0]) {
+        return strdup(path);
+    }
+    size_t root_len = strlen(repo_path);
+    size_t path_len = strlen(path);
+    bool has_separator =
+        root_len > 0 && (repo_path[root_len - 1] == '/' || repo_path[root_len - 1] == '\\');
+    if (path_len > SIZE_MAX - 2U || root_len > SIZE_MAX - path_len - 2U) {
+        return NULL;
+    }
+    size_t total = root_len + (has_separator ? 0U : 1U) + path_len + 1U;
+    char *resolved = malloc(total);
+    if (!resolved) {
+        return NULL;
+    }
+    snprintf(resolved, total, has_separator ? "%s%s" : "%s/%s", repo_path, path);
+    return resolved;
+}
+
+static void free_string_array(char **items, int count) {
+    if (!items) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(items[i]);
+    }
+    free(items);
+}
+
+/* Разобрать один список `cpp`, сохранив порядок валидных элементов и обязательный
+ * NULL-терминатор. Ошибка allocation прерывает загрузку, ошибки данных — нет. */
+static int parse_cpp_string_array(yyjson_val *cpp, const char *key, const char *repo_path,
+                                  const char *source_label, bool include_paths, char ***out_items,
+                                  int *out_count) {
+    yyjson_val *array = yyjson_obj_get(cpp, key);
+    if (!array) {
+        return 0;
+    }
+    if (!yyjson_is_arr(array)) {
+        cbm_log_warn("userconfig.bad_cpp_array", "file", source_label, "key", key);
+        return 0;
+    }
+    size_t candidate_count = yyjson_arr_size(array);
+    if (candidate_count > MAX_CPP_CONFIG_VALUES) {
+        cbm_log_warn("userconfig.cpp_array_too_large", "file", source_label, "key", key);
+        candidate_count = MAX_CPP_CONFIG_VALUES;
+    }
+    char **items = calloc(candidate_count + 1U, sizeof(char *));
+    if (!items) {
+        return CBM_NOT_FOUND;
+    }
+
+    yyjson_arr_iter iter;
+    yyjson_arr_iter_init(array, &iter);
+    yyjson_val *item;
+    int count = 0;
+    size_t visited = 0;
+    while (visited < candidate_count && (item = yyjson_arr_iter_next(&iter)) != NULL) {
+        visited++;
+        const char *value = yyjson_get_str(item);
+        if (!value || !value[0] || (!include_paths && !cpp_define_is_valid(value))) {
+            cbm_log_warn("userconfig.skip_cpp_value", "file", source_label, "key", key);
+            continue;
+        }
+        char *copy = include_paths ? resolve_cpp_include_path(repo_path, value) : strdup(value);
+        if (!copy) {
+            free_string_array(items, count);
+            return CBM_NOT_FOUND;
+        }
+        items[count++] = copy;
+    }
+    if (count == 0) {
+        free(items);
+        items = NULL;
+    }
+    *out_items = items;
+    *out_count = count;
+    return 0;
+}
+
+/* Секция `cpp` является проектным compilation context; глобальный config её не
+ * читает, чтобы один пользовательский default не менял все репозитории. */
+static int parse_project_cpp_config(yyjson_val *root, cbm_userconfig_t *cfg, const char *repo_path,
+                                    const char *source_label) {
+    yyjson_val *cpp = yyjson_obj_get(root, "cpp");
+    if (!cpp) {
+        return 0;
+    }
+    if (!yyjson_is_obj(cpp)) {
+        cbm_log_warn("userconfig.bad_cpp", "file", source_label);
+        return 0;
+    }
+    int rc = parse_cpp_string_array(cpp, "defines", repo_path, source_label, false,
+                                    &cfg->cpp_defines, &cfg->cpp_define_count);
+    if (rc != 0) {
+        return rc;
+    }
+    return parse_cpp_string_array(cpp, "include_paths", repo_path, source_label, true,
+                                  &cfg->cpp_include_paths, &cfg->cpp_include_path_count);
+}
+
+/* Прочитать один config и вычислить digest его фактического состояния. Global
+ * разбирает только extra_extensions, project дополнительно заполняет cpp
+ * snapshot. Отсутствующий или повреждённый файл пропускается; allocation
+ * failure возвращается вызывающему. */
 static int load_config_file(const char *path, cbm_userext_t **entries, int *count,
-                            char source_sha256[CBM_SHA256_HEX_LEN + 1]) {
+                            char source_sha256[CBM_SHA256_HEX_LEN + 1],
+                            cbm_userconfig_t *project_cfg, const char *repo_path) {
     userconfig_source_digest("missing-or-unreadable", NULL, 0, source_sha256);
     FILE *f = cbm_fopen(path, "rb");
     if (!f) {
@@ -308,12 +437,17 @@ static int load_config_file(const char *path, cbm_userext_t **entries, int *coun
 
     yyjson_val *root = yyjson_doc_get_root(doc);
     int rc = parse_extra_extensions(root, entries, count, path);
+    if (rc == 0 && project_cfg && yyjson_is_obj(root)) {
+        rc = parse_project_cpp_config(root, project_cfg, repo_path, path);
+    }
     yyjson_doc_free(doc);
     return rc;
 }
 
 /* ── Public API ──────────────────────────────────────────────────── */
 
+/* Загрузить единый snapshot до запуска extraction workers. Строки и массивы
+ * остаются стабильны до парного cbm_userconfig_free(). */
 cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
     cbm_userconfig_t *cfg = calloc(CBM_ALLOC_ONE, sizeof(cbm_userconfig_t));
     if (!cfg) {
@@ -330,7 +464,8 @@ cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
     char global_path[PATH_BUF_SZ];
     snprintf(global_path, sizeof(global_path), "%s/codebase-memory-mcp/config.json", cfg_fallback);
 
-    if (load_config_file(global_path, &entries, &count, cfg->global_source_sha256) != 0) {
+    if (load_config_file(global_path, &entries, &count, cfg->global_source_sha256, NULL, NULL) !=
+        0) {
         for (int i = 0; i < count; i++) {
             free(entries[i].ext);
         }
@@ -347,12 +482,15 @@ cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
         char project_path[PATH_BUF_SZ];
         snprintf(project_path, sizeof(project_path), "%s/.codebase-memory.json", repo_path);
 
-        if (load_config_file(project_path, &entries, &count, cfg->project_source_sha256) != 0) {
+        if (load_config_file(project_path, &entries, &count, cfg->project_source_sha256, cfg,
+                             repo_path) != 0) {
             /* Free already-allocated entries */
             for (int i = 0; i < count; i++) {
                 free(entries[i].ext);
             }
             free(entries);
+            free_string_array(cfg->cpp_defines, cfg->cpp_define_count);
+            free_string_array(cfg->cpp_include_paths, cfg->cpp_include_path_count);
             free(cfg);
             return NULL;
         }
@@ -407,6 +545,24 @@ CBMLanguage cbm_userconfig_lookup(const cbm_userconfig_t *cfg, const char *ext) 
     return CBM_LANG_COUNT;
 }
 
+const char **cbm_userconfig_preprocessor_defines(const cbm_userconfig_t *cfg,
+                                                 CBMLanguage language) {
+    if (!cfg || (language != CBM_LANG_CPP && language != CBM_LANG_CUDA) ||
+        cfg->cpp_define_count == 0) {
+        return NULL;
+    }
+    return (const char **)cfg->cpp_defines;
+}
+
+const char **cbm_userconfig_preprocessor_include_paths(const cbm_userconfig_t *cfg,
+                                                       CBMLanguage language) {
+    if (!cfg || (language != CBM_LANG_CPP && language != CBM_LANG_CUDA) ||
+        cfg->cpp_include_path_count == 0) {
+        return NULL;
+    }
+    return (const char **)cfg->cpp_include_paths;
+}
+
 void cbm_userconfig_free(cbm_userconfig_t *cfg) {
     if (!cfg) {
         return;
@@ -415,5 +571,7 @@ void cbm_userconfig_free(cbm_userconfig_t *cfg) {
         free(cfg->entries[i].ext);
     }
     free(cfg->entries);
+    free_string_array(cfg->cpp_defines, cfg->cpp_define_count);
+    free_string_array(cfg->cpp_include_paths, cfg->cpp_include_path_count);
     free(cfg);
 }
