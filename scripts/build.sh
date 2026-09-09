@@ -2,10 +2,10 @@
 # build.sh — Clean build of production binary (standard or with UI).
 #
 # Usage:
-#   scripts/build.sh                              # Standard binary
+#   scripts/build.sh                              # Версия из текущей ветки выпуска
 #   scripts/build.sh --with-ui                    # Binary with the UI embedded
 #   scripts/build.sh --help                       # Full usage
-#   scripts/build.sh --version v0.8.0             # With version stamp
+#   scripts/build.sh --version v0.8.0             # Явно заданная версия
 #   scripts/build.sh --arch x86_64                # Force x86_64 build
 #   scripts/build.sh CC=gcc-14 CXX=g++-14        # Override compiler
 #
@@ -30,7 +30,7 @@ construction (CCACHE_COMPILERCHECK=content).
 
 Options:
   --with-ui       Build the web UI as a content-addressed sidecar (needs node).
-  --version V     Stamp the version string (release venue passes the tag).
+  --version V     Явно задать версию вместо определения из ветки.
   --arch ARCH     Force target arch (arm64 | x86_64), e.g. under Rosetta.
   -h, --help      This text.
 
@@ -131,7 +131,26 @@ for arg in "$@"; do
     prev_arg="$arg"
 done
 
-# Version flag
+if [[ "${prev_arg:-}" == "--version" ]]; then
+    echo "build.sh: '--version' needs a value. Please consult --help." >&2
+    exit 2
+fi
+
+# Без явного `--version` версия локальной сборки берётся из имени ветки
+# выпуска. Суффикс fork-ветки `-lora` не входит в публичную версию бинарника.
+# Другие ветки и detached HEAD сохраняют прежнее значение `dev`, потому что
+# PR/CI тоже вызывают этот скрипт без `--version`, а произвольное имя ветки
+# нельзя выдавать за версию.
+if [[ -z "$VERSION" ]]; then
+    CURRENT_BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    if [[ "$CURRENT_BRANCH" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*)-lora$ ]]; then
+        VERSION="${BASH_REMATCH[1]}"
+    elif [[ "$CURRENT_BRANCH" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*$ ]]; then
+        VERSION="$CURRENT_BRANCH"
+    fi
+fi
+
+# Передать версию в compiler define, убрав только начальную `v`.
 CFLAGS_EXTRA=""
 if [[ -n "$VERSION" ]]; then
     CLEAN_VERSION="${VERSION#v}"
