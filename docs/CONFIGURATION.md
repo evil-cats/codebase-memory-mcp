@@ -5,7 +5,7 @@ This page documents the configuration files that `codebase-memory-mcp` reads or 
 ## At a Glance
 
 | Purpose | Path | Format | Notes |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Global custom extension mapping | `$XDG_CONFIG_HOME/codebase-memory-mcp/config.json` | JSON | Falls back to `~/.config/codebase-memory-mcp/config.json` when `XDG_CONFIG_HOME` is unset. |
 | Проектные расширения и настройки C++-препроцессора | `{repo_root}/.codebase-memory.json` | JSON | Переопределяет глобальные `extra_extensions` и настраивает C++/CUDA-препроцессинг. |
 | CLI-managed runtime settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/_config.db` | SQLite | Written by `codebase-memory-mcp config set/reset`. |
@@ -14,7 +14,8 @@ This page documents the configuration files that `codebase-memory-mcp` reads or 
 | Admission conflict log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/daemon-conflicts.ndjson` | NDJSON | Exact-build, ABI, and canonical-cache conflicts. |
 | Activation log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/activation-events.ndjson` | NDJSON | Install/update/uninstall activation progress and outcomes. |
 
-CBM resolves `CBM_CACHE_DIR` to a canonical per-account path before using any of these locations. The log directory and files are private to the account.
+CBM resolves `CBM_CACHE_DIR` to a canonical per-account path before using any of these locations.
+The log directory and files are private to the account.
 
 ## 1. Custom File Extension Mapping
 
@@ -98,6 +99,18 @@ C++ и CUDA:
 - Изменение `.codebase-memory.json` меняет semantic input manifest, поэтому
   следующий запуск не переиспользует поколение с прежними настройками.
 
+Для C++ хотя бы один корректный элемент `cpp.defines` или `cpp.include_paths`
+включает основное извлечение из препроцессированного текста. Классы, функции и
+связи берутся из активных условных веток; число ошибок разбора оригинала не
+ограничивает их извлечение. Определения подключённых заголовков не копируются
+в подключающий файл. `get_code_snippet` продолжает показывать оригинальный код.
+
+При недоступных заголовках пригодный результат используется с сигналом неполного
+покрытия. Фатальная ошибка препроцессинга или невозможность установить физические
+координаты включают резервный разбор оригинала с тем же сигналом. Успешный пустой
+результат не возвращает отключённые классы. Без явных настроек сохраняется прежний
+порядок разбора C++; порядок проходов C и CUDA не меняется.
+
 ## 3. CLI-Managed Runtime Settings
 
 The `config` subcommand stores runtime settings in a small SQLite database:
@@ -119,7 +132,7 @@ codebase-memory-mcp config reset auto_index
 Current keys:
 
 | Key | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `auto_index` | `false` | Automatically index new projects when an MCP session starts. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
 
@@ -142,16 +155,19 @@ Current format:
 
 Notes:
 
-- If a UI-enabled binary finds its verified external asset pack and no UI config file exists yet, the UI auto-enables on first run. Missing or invalid assets leave the MCP/daemon service available and keep the UI disabled.
+- If a UI-enabled binary finds its verified external asset pack and no UI config file exists yet,
+  the UI auto-enables on first run. Missing or invalid assets leave the MCP/daemon service available
+  and keep the UI disabled.
 - `CBM_CACHE_DIR` changes both the UI config location and the runtime settings database location.
-- CBM resolves `CBM_CACHE_DIR` to one canonical per-account cache root. A process configured with a different root fails while any CBM session or command is active; close them before switching roots.
+- CBM resolves `CBM_CACHE_DIR` to one canonical per-account cache root. A process configured with
+  a different root fails while any CBM session or command is active; close them before switching roots.
 
 ## 5. Environment Variables
 
 These environment variables affect runtime behavior:
 
 | Variable | Default | Description |
-|---|---|---|
+| --- | --- | --- |
 | `CBM_ALLOWED_ROOT` | *(unset)* | Confine `index_repository` to paths within this directory. When set, a `repo_path` that resolves (after symlink / `..` resolution) outside this root is refused, and the same check now applies to the graph UI's `POST /api/index` route rather than only to the MCP tool. Unset imposes no *containment* restriction — but see the always-on limits below, which apply whether or not this is set. Useful when the server may be driven by an untrusted caller, e.g. agentic or multi-tenant deployments. |
 | `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the cache directory used for indexes, `_config.db`, and UI `config.json`. |
 | `CBM_DIAGNOSTICS` | `false` | Enable periodic `snapshot.json` and retained `trajectory.ndjson` below a fresh owner-private directory in the system temp directory. The daemon records the randomized paths in the `diagnostics.start` discovery record (a single JSON line) in `${CBM_CACHE_DIR}/logs/cbm-daemon.log`; that one record is emitted even when `CBM_LOG_LEVEL` suppresses ordinary logging, so the paths always remain discoverable. |
@@ -197,8 +213,12 @@ process that should share one daemon must see the same value — set it in the
 environment of your MCP client and your shell alike, or a CLI invocation without
 it will coordinate through the default location instead.
 
-Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and one-shot CLI commands use their own current environment without starting the daemon.
-
+Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide
+indexing resource limits—is captured from the first daemon-backed session that starts the daemon.
+Later sessions join the existing process and cannot replace those values. To change them, close
+every daemon-backed session, update the relevant agent configurations consistently, and restart
+a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected,
+and one-shot CLI commands use their own current environment without starting the daemon.
 
 ### Roots that are always refused
 
@@ -220,7 +240,8 @@ not name is permitted.
 
 ## 6. Agent and Editor Integration Files
 
-The `install` command can also write MCP entries and instruction blocks into agent/editor config files such as Claude Code, Codex, Gemini, VS Code, Cursor, Zed, and others.
+The `install` command can also write MCP entries and instruction blocks into agent/editor config
+files such as Claude Code, Codex, Gemini, VS Code, Cursor, Zed, and others.
 
 Those target paths vary by tool and platform, so the easiest way to inspect the exact files for your machine is:
 

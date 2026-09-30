@@ -1,3 +1,5 @@
+// Разрешение типов и вызовов C/C++. Имена областей видимости нормализуются
+// независимо от пробелов исходника или препроцессора; позиции остаются в буфере контекста.
 #include "c_lsp.h"
 #include "lsp_node_iter.h"
 #include "../helpers.h"
@@ -668,6 +670,9 @@ static bool is_inline_abi_ns(const char *seg, size_t seg_len) {
            (seg_len == 9 && memcmp(seg, "__gnu_cxx", 9) == 0);
 }
 
+// Строит QN в арене контекста. Пробелы около :: не меняют имя; остальные
+// пробелы сохраняются. Преобразование сокращает строку, поэтому второй проход
+// безопасно использует тот же буфер. При отказе арены возвращается исходный текст.
 static const char *c_build_qn(CLSPContext *ctx, const char *text) {
     if (!text)
         return NULL;
@@ -676,6 +681,29 @@ static const char *c_build_qn(CLSPContext *ctx, const char *text) {
     char *buf = (char *)cbm_arena_alloc(ctx->arena, len + 1);
     if (!buf)
         return text;
+    // Допустимые пробелы около :: не входят в имя. simplecpp расставляет их
+    // между токенами; пробелы внутри других конструкций (unsigned long) сохраняются.
+    size_t compact_len = 0;
+    for (size_t i = 0; i < len;) {
+        if (isspace((unsigned char)text[i])) {
+            size_t end = i + 1;
+            while (end < len && isspace((unsigned char)text[end]))
+                ++end;
+            bool before_scope = end + 1 < len && text[end] == ':' && text[end + 1] == ':';
+            bool after_scope =
+                compact_len >= 2 && buf[compact_len - 1] == ':' && buf[compact_len - 2] == ':';
+            if (!before_scope && !after_scope) {
+                memcpy(buf + compact_len, text + i, end - i);
+                compact_len += end - i;
+            }
+            i = end;
+            continue;
+        }
+        buf[compact_len++] = text[i++];
+    }
+    buf[compact_len] = '\0';
+    text = buf;
+    len = compact_len;
     size_t j = 0;
     for (size_t i = 0; i < len; i++) {
         if (text[i] == ':' && i + 1 < len && text[i + 1] == ':') {

@@ -6,6 +6,8 @@
  * (CBMDefinition / CBMImport / IMPORTS-edge gbuf state) into the input
  * shape each language LSP's cbm_run_X_lsp_cross expects, then merges
  * the resulting CBMResolvedCall entries back into per-file results.
+ * Основной C++-проход передаёт сохранённое дерево вместе с его подготовленным
+ * буфером; точные позиции новых связей сохраняют соответствующее происхождение.
  *
  * The pass is a no-op for any file whose CBMFileResult is missing or
  * whose language has no cross-file LSP entry registered (e.g. Rust /
@@ -898,10 +900,13 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
  * that adds up to O(N×project_size) memory if we used cache[i]->arena
  * directly across N files (test_incremental.c saw 3.5 GB peak on a
  * 1100-file repo before this fix). Output gets copied into the file's own
- * arena and merged into result->resolved_calls. */
+ * arena and merged into result->resolved_calls.
+ * Для основного C++-прохода дерево читается только вместе с подготовленным
+ * буфером; точные позиции результата сохраняют происхождение PREPROCESSED. */
 void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
                      const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
                      const char **imp_qns, int imp_count) {
+    source = cbm_file_result_cached_source(r, source, &source_len);
     TSTree *tree = r->cached_tree; /* may be NULL — LSP re-parses then */
 
     CBMArena scratch;
@@ -920,12 +925,12 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
     case CBM_LANG_CPP:
     case CBM_LANG_CUDA: {
         bool cpp_mode = (lang != CBM_LANG_C);
-        /* C/C++ cross LSP takes include_paths/include_ns_qns instead of
-         * imports — the existing pipeline doesn't carry C-style include
-         * resolution as a separate map, so pass NULL/0 and let the LSP
-         * fall back to its own #include scan. */
+        /* В подготовленном C++-буфере директив уже нет: используем карту
+         * include из оригинала. Старый путь по-прежнему сканирует исходник. */
         cbm_run_c_lsp_cross(&scratch, source, source_len, module_qn, cpp_mode, defs, def_count,
-                            NULL, NULL, 0, tree, &out);
+                            r->cpp_preprocessed ? imp_names : NULL,
+                            r->cpp_preprocessed ? imp_qns : NULL,
+                            r->cpp_preprocessed ? imp_count : 0, tree, &out);
         break;
     }
     case CBM_LANG_PYTHON:
@@ -960,6 +965,10 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
         break;
     }
 
+    if (r->cpp_preprocessed) {
+        for (int i = 0; i < out.count; ++i)
+            out.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+    }
     pxc_append_results(&r->arena, &r->resolved_calls, &out);
     pxc_append_synthetic_calls(&r->arena, &r->calls, &synthetic_calls);
     cbm_arena_destroy(&scratch);
@@ -1030,6 +1039,10 @@ void cbm_pxc_filter_stats(uint64_t *defs_registered, uint64_t *build_files, uint
         *filter_failed = atomic_load_explicit(&g_pxc_filter_failed, memory_order_relaxed);
 }
 
+/* Общая диспетчеризация для последовательного и параллельного маршрутов.
+ * Буфер выбирается по сохранённому дереву; новые C++-связи не смешивают позиции
+ * развёртки с оригиналом. Результат владеет добавленными связями, входные реестры
+ * и текст заимствуются и не изменяются. */
 void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *source,
                            int source_len, const char *rel, const char *def_module,
                            const CBMCrossLspRegistries *cross_registries,
@@ -1040,6 +1053,7 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
     if (!result) {
         return;
     }
+    source = cbm_file_result_cached_source(result, source, &source_len);
     bool used_prebuilt = false;
     CBMTypeRegistry *prebuilt =
         cross_registries ? cbm_pxc_registry_for_lang(cross_registries, lang) : NULL;
@@ -1067,12 +1081,18 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
         }
         case CBM_LANG_C:
         case CBM_LANG_CPP:
-        case CBM_LANG_CUDA:
+        case CBM_LANG_CUDA: {
+            int before = result->resolved_calls.count;
             cbm_run_c_lsp_cross_with_registry(
                 &result->arena, source, source_len, def_module, (lang != CBM_LANG_C), prebuilt,
                 imp_keys, imp_vals, imp_count, result->cached_tree, &result->resolved_calls);
+            if (result->cpp_preprocessed) {
+                for (int i = before; i < result->resolved_calls.count; ++i)
+                    result->resolved_calls.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+            }
             used_prebuilt = true;
             break;
+        }
         case CBM_LANG_CSHARP:
             cbm_run_cs_lsp_cross_with_registry(&result->arena, source, source_len, def_module,
                                                prebuilt, imp_vals, imp_count, result->cached_tree,

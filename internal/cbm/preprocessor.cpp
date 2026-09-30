@@ -1,5 +1,7 @@
-// Unity build: include simplecpp implementation directly since CGo only
-// compiles .cpp files from the immediate package directory, not subdirs.
+// Обёртка simplecpp: legacy-развёртка для дополнительного прохода и подготовка
+// основного C++-представления с картой исходных строк. Ошибки и пустой успешный
+// результат различаются; токены подключённых файлов не выдаются за основной файл.
+// Реализация simplecpp включается в ту же единицу трансляции для CGo и Makefile.
 #include "vendored/simplecpp/simplecpp.cpp"
 
 #include "preprocessor.h"
@@ -11,6 +13,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <climits>
+#include <memory>
+#include <cctype>
 
 extern "C" {
 
@@ -50,6 +55,38 @@ static int count_expanded_lines(const std::string &text) {
         }
     }
     return count;
+}
+
+// Консервативная проверка до simplecpp: лексер может удалить короткий #line
+// вместе с доказательством смены координат. Строка, похожая на такую директиву
+// даже внутри многострочного текста, требует резерва, пока нет физической карты.
+static bool has_source_line_control(const std::string &source) {
+    std::istringstream lines(source);
+    std::string line;
+    while (std::getline(lines, line)) {
+        size_t pos = line.find_first_not_of(" \t\r\v\f");
+        if (pos == std::string::npos)
+            continue;
+        if (line[pos] == '#')
+            ++pos;
+        else if (line.compare(pos, 2, "%:") == 0)
+            pos += 2;
+        else
+            continue;
+        pos = line.find_first_not_of(" \t\r\v\f", pos);
+        if (pos == std::string::npos)
+            continue;
+        if (std::isdigit((unsigned char)line[pos]) || line[pos] == '\\' || line[pos] == '/')
+            return true;
+        size_t end = pos;
+        while (end < line.size() && (std::isalnum((unsigned char)line[end]) || line[end] == '_'))
+            ++end;
+        const std::string name = line.substr(pos, end - pos);
+        if (name == "line" || name == "file" || name == "endfile" ||
+            (end < line.size() && line[end] == '\\'))
+            return true;
+    }
+    return false;
 }
 
 static bool parse_line_directive(const char *line, size_t len, uint32_t *out_line,
@@ -143,11 +180,23 @@ static bool build_line_map(const std::string &expanded, const std::string &main_
     return true;
 }
 
-CBMPreprocessedSource *cbm_preprocess_with_map(const char *source, int source_len,
-                                               const char *filename, const char **extra_defines,
-                                               const char **include_paths, int cpp_mode) {
-    if (!has_preprocessor_work(source, source_len)) {
-        return NULL; // NULL = no expansion needed, use original
+// Общая подготовка. Основной проход с явным контекстом не использует эвристику
+// поиска директив: макрос может встречаться и без `#define` в самом файле.
+// `primary` исключает чужие токены до сериализации; библиотечные объекты имеют
+// автоматическое время жизни, итоговые C-буферы передаются вызывающему.
+static CBMPreprocessedSource *preprocess_with_map_impl(const char *source, int source_len,
+                                                       const char *filename,
+                                                       const char **extra_defines,
+                                                       const char **include_paths, int cpp_mode,
+                                                       bool primary, CBMPreprocessStatus *status) {
+    if (status)
+        *status = CBM_PREPROCESS_FAILED;
+    if (!source || source_len < 0)
+        return NULL;
+    if (source_len == 0 || (!primary && !has_preprocessor_work(source, source_len))) {
+        if (status)
+            *status = CBM_PREPROCESS_UNCHANGED;
+        return NULL;
     }
 
     try {
@@ -163,22 +212,83 @@ CBMPreprocessedSource *cbm_preprocess_with_map(const char *source, int source_le
         dui.std = cpp_mode ? "c++17" : "c11";
 
         std::string src(source, source_len);
+        if (primary && has_source_line_control(src))
+            return NULL;
         std::istringstream istr(src);
         std::vector<std::string> files;
         files.push_back(filename ? filename : "<input>");
 
-        simplecpp::TokenList rawtokens(istr, files, files[0]);
+        simplecpp::OutputList diagnostics;
+        simplecpp::OutputList *messages = primary ? &diagnostics : nullptr;
+        simplecpp::TokenList rawtokens(istr, files, files[0], messages);
+        if (primary) {
+            // Пользовательский #line может переименовать файл или задать
+            // виртуальные строки. Пока нет физической карты таких директив,
+            // используем явный резерв вместо выдуманных исходных координат.
+            const unsigned original_lines = (unsigned)count_expanded_lines(src);
+            for (const simplecpp::Token *tok = rawtokens.cfront(); tok; tok = tok->next) {
+                if (tok->location.fileIndex != 0 || tok->location.line > original_lines)
+                    return NULL;
+                if (tok->str() == "#") {
+                    const simplecpp::Token *directive = tok->next;
+                    while (directive && directive->comment)
+                        directive = directive->next;
+                    if (directive && (directive->number || directive->str() == "line" ||
+                                      directive->str() == "file" || directive->str() == "endfile"))
+                        return NULL;
+                }
+            }
+        }
         simplecpp::TokenList output(files);
-        simplecpp::FileDataCache filedata = simplecpp::load(rawtokens, files, dui);
+        simplecpp::FileDataCache filedata = simplecpp::load(rawtokens, files, dui, messages);
 
-        simplecpp::preprocess(output, rawtokens, files, filedata, dui);
+        simplecpp::preprocess(output, rawtokens, files, filedata, dui, messages);
+        if (primary) {
+            // #line в заголовке не должен выдавать его токены за основной файл.
+            // Проверяется и кеш, дополненный ленивыми include при preprocess.
+            for (const auto &header : filedata) {
+                for (const simplecpp::Token *tok = header->tokens.cfront(); tok; tok = tok->next) {
+                    if (tok->location.fileIndex == 0)
+                        return NULL;
+                }
+            }
+        }
 
-        std::string result = output.stringify();
+        bool missing_headers = false;
+        for (const auto &message : diagnostics) {
+            switch (message.type) {
+            case simplecpp::Output::WARNING:
+            case simplecpp::Output::PORTABILITY_BACKSLASH:
+                break;
+            case simplecpp::Output::MISSING_HEADER:
+                missing_headers = true;
+                break;
+            default:
+                return NULL;
+            }
+        }
 
-        // Clean up loaded file data
+        // Заголовки уже предоставили определения макросов. Их C++-токены должны
+        // индексироваться в собственных файлах, а не повторно в каждом include.
+        simplecpp::TokenList own_tokens(files);
+        if (primary) {
+            for (const simplecpp::Token *tok = output.cfront(); tok; tok = tok->next) {
+                if (tok->location.fileIndex == 0) {
+                    own_tokens.push_back(
+                        new simplecpp::Token(tok->str(), tok->location, tok->whitespaceahead));
+                }
+            }
+        }
+        std::string result = primary ? own_tokens.stringify() : output.stringify();
+        if (result.size() > INT_MAX - 1u)
+            return NULL;
+
+        // Загруженные заголовки больше не нужны; строки имён остаются в files.
         simplecpp::cleanup(filedata);
 
-        CBMPreprocessedSource *pp = (CBMPreprocessedSource *)calloc(1, sizeof(*pp));
+        std::unique_ptr<CBMPreprocessedSource, decltype(&cbm_preprocessed_source_free)> pp(
+            (CBMPreprocessedSource *)calloc(1, sizeof(CBMPreprocessedSource)),
+            cbm_preprocessed_source_free);
         if (!pp) {
             return NULL;
         }
@@ -188,21 +298,52 @@ CBMPreprocessedSource *cbm_preprocess_with_map(const char *source, int source_le
             (uint32_t *)calloc((size_t)line_count + 1u, sizeof(uint32_t));
         pp->belongs_to_main_file = (uint8_t *)calloc((size_t)line_count + 1u, sizeof(uint8_t));
         pp->expanded_line_count = line_count;
+        pp->source_len = (int)result.size();
+        pp->missing_headers = missing_headers;
         if (!pp->source || !pp->original_line_by_expanded_line || !pp->belongs_to_main_file) {
-            cbm_preprocessed_source_free(pp);
             return NULL;
         }
         memcpy(pp->source, result.c_str(), result.size() + 1);
         if (!build_line_map(result, files[0], pp->original_line_by_expanded_line,
                             pp->belongs_to_main_file)) {
-            cbm_preprocessed_source_free(pp);
             return NULL;
         }
-        return pp;
+        if (primary) {
+            // Служебные #line нужны карте, но не являются C++-кодом. Пробелы
+            // сохраняют смещения; карта уже построена по исходной сериализации.
+            int line = 1;
+            for (int i = 0; i < pp->source_len; ++i) {
+                if (pp->source[i] == '\n')
+                    ++line;
+                else if (!pp->belongs_to_main_file[line])
+                    pp->source[i] = ' ';
+            }
+        }
+        if (status)
+            *status = CBM_PREPROCESS_OK;
+        return pp.release();
     } catch (...) {
-        // Graceful fallback: return NULL = use original source
+        // Отказ с сохранённым статусом FAILED разрешает вызывающему взять оригинал.
         return NULL;
     }
+}
+
+// Совместимый дополнительный проход C/CUDA и C++ без явно заданного контекста.
+CBMPreprocessedSource *cbm_preprocess_with_map(const char *source, int source_len,
+                                               const char *filename, const char **extra_defines,
+                                               const char **include_paths, int cpp_mode) {
+    return preprocess_with_map_impl(source, source_len, filename, extra_defines, include_paths,
+                                    cpp_mode, false, nullptr);
+}
+
+// Успешный пустой текст сохраняет статус OK; отказ не маскируется пустой строкой.
+CBMPreprocessedSource *cbm_preprocess_cpp(const char *source, int source_len, const char *filename,
+                                          const char **extra_defines, const char **include_paths,
+                                          CBMPreprocessStatus *status) {
+    if (!status)
+        return NULL;
+    return preprocess_with_map_impl(source, source_len, filename, extra_defines, include_paths, 1,
+                                    true, status);
 }
 
 char *cbm_preprocess(const char *source, int source_len, const char *filename,

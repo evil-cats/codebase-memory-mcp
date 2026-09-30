@@ -287,6 +287,11 @@ ZSTD_SRCS = $(CBM_DIR)/zstd_store.c
 
 # Preprocessor (C++)
 PREPROCESSOR_SRC = $(CBM_DIR)/preprocessor.cpp
+# Карта строк и статус входят в ABI результата: все варианты объекта должны
+# пересобираться после изменения заголовка или включённой реализации simplecpp.
+PREPROCESSOR_DEPS = $(PREPROCESSOR_SRC) $(CBM_DIR)/preprocessor.h \
+                    $(CBM_DIR)/vendored/simplecpp/simplecpp.h \
+                    $(CBM_DIR)/vendored/simplecpp/simplecpp.cpp
 
 # SQLite writer
 SQLITE_WRITER_SRC = $(CBM_DIR)/sqlite_writer.c
@@ -753,7 +758,7 @@ $(BUILD_DIR)/ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
 $(BUILD_DIR)/lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TEST) $(SANITIZE) -c -o $@ $<
 
-$(BUILD_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
+$(BUILD_DIR)/preprocessor.o: $(PREPROCESSOR_DEPS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_TEST) -w -I$(CBM_DIR)/vendored -c -o $@ $<
 
 $(BUILD_DIR)/tsan_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
@@ -765,7 +770,7 @@ $(BUILD_DIR)/tsan_ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
 $(BUILD_DIR)/tsan_lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TSAN) -c -o $@ $<
 
-$(BUILD_DIR)/tsan_preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
+$(BUILD_DIR)/tsan_preprocessor.o: $(PREPROCESSOR_DEPS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_TSAN) -w -I$(CBM_DIR)/vendored -c -o $@ $<
 
 # ── Full test binary ─────────────────────────────────────────────
@@ -995,7 +1000,7 @@ $(BUILD_DIR)/prod_ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
 $(BUILD_DIR)/prod_lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/prod_preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
+$(BUILD_DIR)/prod_preprocessor.o: $(PREPROCESSOR_DEPS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_PROD) -w -I$(CBM_DIR)/vendored -c -o $@ $<
 
 # Vendored LZ4 (compiled separately, not unity-built via lz4_store.c)

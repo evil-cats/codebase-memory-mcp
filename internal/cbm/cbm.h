@@ -179,6 +179,8 @@ typedef enum {
 
 // --- Extraction result structs ---
 
+struct CBMPreprocessedSource;
+
 typedef struct {
     const char *name;           // short name
     const char *qualified_name; // локальный QN вида path.name
@@ -496,19 +498,16 @@ typedef struct CBMFileResult {
 
     bool has_error;
     const char *error_msg;
-    /* Best-effort parse-coverage signal (experimental). parse_incomplete is true
-     * when the parse tree contains tree-sitter ERROR/MISSING nodes — constructs
-     * in those regions are silently absent from the graph. error_ranges is a
-     * compact "start-end,start-end" list of 1-based line ranges (arena-owned) or
-     * NULL. This only marks what we can DETECT: the absence of a flag is NOT a
-     * completeness guarantee. Callers should treat a flagged file as "prefer
-     * grep here", never treat an unflagged file as provably complete. */
+    /* Приблизительный сигнал покрытия: оставшиеся ERROR/MISSING, неполный
+     * контекст C++ или отказ его препроцессора. error_ranges — исходные строки
+     * с единицы в формате "start-end,start-end" (в арене) либо NULL. Отсутствие
+     * флага не доказывает полноты графа; наличие требует проверки оригинала. */
     bool parse_incomplete;
     const char *error_ranges;
     int error_region_count;
     bool is_test_file;
     int imports_count;
-    TSTree *cached_tree;     // retained parse tree (caller frees via cbm_free_tree)
+    TSTree *cached_tree;     // дерево буфера, возвращаемого cbm_file_result_cached_source()
     CBMLanguage cached_lang; // language of cached tree (for parser selection)
 
     // Retained source bytes — copied into `arena` by the parallel
@@ -526,7 +525,17 @@ typedef struct CBMFileResult {
     // by cbm_free_result(); ordinary single-file results leave these zeroed.
     struct CBMFileResult **owned_results;
     int owned_result_count;
+    // Основной C++-проход сохраняет подготовленный текст вместе с деревом.
+    // Владелец — результат; исходные source/source_len по-прежнему описывают
+    // оригинал. Освобождается cbm_free_result(), не разделяется между файлами.
+    struct CBMPreprocessedSource *cpp_preprocessed;
 } CBMFileResult;
+
+// Возвращает заимствованный текст, соответствующий cached_tree. Для обычного
+// результата использует переданные исходные байты; указатель действителен не
+// дольше самого результата. `source_len` служит входом и выходом и обязателен.
+const char *cbm_file_result_cached_source(const CBMFileResult *result, const char *source,
+                                          int *source_len);
 
 // --- Enclosing function cache ---
 // Avoids repeated parent-chain walks for nodes within the same function body.

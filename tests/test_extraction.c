@@ -4,6 +4,8 @@
  * Port of internal/cbm/regression_test.go (1282 LOC, ~80 test cases).
  * Exercises cbm_extract_file() on code snippets across 30+ languages,
  * verifying definitions, calls, and imports are correctly extracted.
+ * C++-регрессии также проверяют основной разбор с проектными макросами:
+ * активные ветки, полное извлечение и исходные координаты без внешних зависимостей.
  */
 #include "test_framework.h"
 #include "cbm.h"
@@ -211,7 +213,7 @@ TEST(extract_cpp_functionlike_macro_type_arg_no_false_parse_partial_issue1071) {
 
 /* #1071 guard: the suppression must be tight. A REAL parse error inside a
  * function (not a macro call) must STILL be flagged, and a top-level macro
- * invocation is covered by extract_cpp_preproc_macro_generated_callable_skipped_issue949. */
+ * invocation is covered by extract_cpp_preproc_macro_generated_callable_mapped_issue949. */
 TEST(extract_cpp_real_in_body_error_still_flagged_issue1071) {
     /* `int x = ;` is a genuine syntax error inside foo()'s body — no macro
      * involved, so the coverage gap must not be suppressed. */
@@ -4695,8 +4697,9 @@ static const char *CPP_PREPROC_SIGNATURE_GAP_SRC =
     "\n"
     "void SurfaceFlinger::composite() {}\n";
 
-/* #946 fixture from the original report: both preprocessor choices must keep
- * raw definitions primary while recovering later methods at original lines. */
+/* Проектное определение выбирает реальную сигнатуру. Для обеих веток методы
+ * сохраняют координаты оригинала; при отсутствии настроек действует прежний
+ * резервный разбор с восстановлением. */
 TEST(extract_cpp_preproc_signature_gap_issue946) {
     const char *defines[] = {"FLYME_GRAPHICS_EXTEND_LUMARGB", NULL};
     for (int enabled = 0; enabled < 2; enabled++) {
@@ -4710,7 +4713,7 @@ TEST(extract_cpp_preproc_signature_gap_issue946) {
         ASSERT_NOT_NULL(add);
         ASSERT_NOT_NULL(commit);
         ASSERT_NOT_NULL(composite);
-        ASSERT_EQ(add->start_line, 22u);
+        ASSERT_EQ(add->start_line, enabled ? 17u : 22u);
         ASSERT_EQ(add->end_line, 27u);
         ASSERT_EQ(commit->start_line, 29u);
         ASSERT_EQ(commit->end_line, 29u);
@@ -4721,9 +4724,9 @@ TEST(extract_cpp_preproc_signature_gap_issue946) {
     PASS();
 }
 
-/* Macro expansion can produce callable-looking AST nodes, but no callable
- * definition exists in the original span; recovery must fail closed. */
-TEST(extract_cpp_preproc_macro_generated_callable_skipped_issue949) {
+/* Основной разбор с явным контекстом извлекает реальную макрогенерацию, но её
+ * диапазон указывает на вызов макроса, а не на чужое определение или развёртку. */
+TEST(extract_cpp_preproc_macro_generated_callable_mapped_issue949) {
     const char *src = "#define MAKE_FN(name) int name() { return 1; }\n"
                       "#ifdef ENABLE_GENERATED\n"
                       "MAKE_FN(generated)\n"
@@ -4733,12 +4736,240 @@ TEST(extract_cpp_preproc_macro_generated_callable_skipped_issue949) {
     CBMFileResult *r =
         cbm_extract_file(src, (int)strlen(src), CBM_LANG_CPP, "t", "macro.cpp", 0, defines, NULL);
     ASSERT_NOT_NULL(r);
-    ASSERT_NULL(find_def(r, "generated"));
+    const CBMDefinition *generated = find_def(r, "generated");
+    ASSERT_NOT_NULL(generated);
+    ASSERT_EQ(generated->start_line, 3u);
+    ASSERT_EQ(generated->end_line, 3u);
     ASSERT_NOT_NULL(find_def(r, "visible"));
-    ASSERT_TRUE(r->parse_incomplete);
-    ASSERT_GTE(r->error_region_count, 1);
-    ASSERT_NOT_NULL(r->error_ranges);
+    ASSERT_FALSE(r->parse_incomplete);
     cbm_free_result(r);
+    PASS();
+}
+
+/* Даже чистое дерево оригинала содержит обе ветки. При явном контексте
+ * неактивные классы и вызовы не должны возвращаться из первого прохода. */
+TEST(extract_cpp_primary_selects_active_branch) {
+    const char *src = "#if PICK\n"
+                      "class Active { public: void run() { chosen(); } };\n"
+                      "#else\n"
+                      "class Inactive { public: void run() { rejected(); } };\n"
+                      "#endif\n";
+    const char *defines[] = {"PICK=1", NULL};
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)strlen(src), CBM_LANG_CPP, "t", "choice.hpp", 0, defines, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(has_def(r, "Class", "Active"));
+    ASSERT_FALSE(has_def(r, "Class", "Inactive"));
+    ASSERT_TRUE(has_call(r, "chosen"));
+    ASSERT_FALSE(has_call(r, "rejected"));
+    const CBMDefinition *run = find_def(r, "run");
+    ASSERT_NOT_NULL(run);
+    ASSERT_STR_EQ(run->parent_class, "choice.Active");
+    ASSERT_EQ(run->start_line, 2u);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Более 64 ошибочных участков оригинала не ограничивают основной проход.
+ * Макросы пространств имён и условные скобки воспроизводят устройство protobuf,
+ * а последний из 80 классов проверяется так же строго, как первый. */
+TEST(extract_cpp_primary_beyond_error_region_limit) {
+    char *src = calloc(1, 65536);
+    ASSERT_NOT_NULL(src);
+    int used = snprintf(src, 65536, "PB_OPEN\nclass Forward;\nPB_CLOSE\nnamespace messages {\n");
+    for (int i = 0; i < 80; ++i) {
+        used += snprintf(src + used, 65536 - (size_t)used,
+                         "class Message%d final {\npublic:\nMessage%d() {}\nvoid run() {\n"
+                         "#ifdef SAFE\nif (true) {\n#else\nif (false) {\n#endif\n"
+                         "target();\n}\n}\n};\n",
+                         i, i);
+    }
+    used += snprintf(src + used, 65536 - (size_t)used, "}\n");
+    CBMFileResult *raw = extract(src, CBM_LANG_CPP, "t", "messages.hpp");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_NOT_NULL(raw->cached_tree);
+    TSNode root = ts_tree_root_node(raw->cached_tree);
+    bool root_error = ts_node_is_error(root);
+    int raw_errors = 0;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool finished = false;
+    while (!finished) {
+        if (ts_node_is_error(ts_tree_cursor_current_node(&cursor)))
+            raw_errors++;
+        if (ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                finished = true;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    cbm_free_result(raw);
+    ASSERT_TRUE(root_error);
+    ASSERT_GT(raw_errors, 64);
+    const char *defines[] = {"PB_OPEN=namespace google { namespace protobuf {", "PB_CLOSE=} }",
+                             "SAFE=1", NULL};
+    CBMFileResult *r =
+        cbm_extract_file(src, used, CBM_LANG_CPP, "t", "messages.hpp", 0, defines, NULL);
+    free(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_with_label(r, "Class"), 80);
+    for (int i = 0; i < 80; ++i) {
+        char qn[128];
+        snprintf(qn, sizeof(qn), "messages.messages.Message%d", i);
+        ASSERT_TRUE(has_def_qn(r, qn));
+    }
+    ASSERT_TRUE(has_def_qn(r, "messages.messages.Message79.run()"));
+    ASSERT_FALSE(has_def(r, "Class", "Forward"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Пустой успешный результат не равен отказу препроцессора: отключённый класс
+ * нельзя вернуть резервным разбором. Фатальный `#error`, напротив, должен
+ * оставить доступный оригинал и явный сигнал неполного разбора. */
+TEST(extract_cpp_primary_empty_and_failed) {
+    const char *defines[] = {"PICK=0", NULL};
+    const char *empty = "#if PICK\nclass Disabled {};\n#endif\n";
+    CBMFileResult *r = cbm_extract_file(empty, (int)strlen(empty), CBM_LANG_CPP, "t", "empty.hpp",
+                                        0, defines, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(has_def(r, "Class", "Disabled"));
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_NOT_NULL(r->cpp_preprocessed);
+    cbm_free_result(r);
+    const char *failed = "#error missing context\nclass Visible {};\n";
+    r = cbm_extract_file(failed, (int)strlen(failed), CBM_LANG_CPP, "t", "failed.hpp", 0, defines,
+                         NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(has_def(r, "Class", "Visible"));
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_NOT_NULL(r->error_msg);
+    ASSERT_NULL(r->cpp_preprocessed);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Подключённый файл предоставляет макросы, но не определения текущего файла.
+ * Строки принадлежат оригиналу, а точные смещения вызовов и употреблений —
+ * подготовленному буферу, связанному с сохранённым деревом. */
+TEST(extract_cpp_primary_include_ownership_and_sites) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cbm_cpp_primary_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    char header_path[512];
+    snprintf(header_path, sizeof(header_path), "%s/support.hpp", tmpdir);
+    FILE *header = cbm_fopen(header_path, "wb");
+    ASSERT_NOT_NULL(header);
+    ASSERT_GTE(fputs("class Foreign { public: void hidden() { foreign_call(); } };\n"
+                     "#define PB_OPEN namespace wire {\n"
+                     "#define PB_CLOSE }\n"
+                     "#define INVOKE(fn, x) fn(x)\n",
+                     header),
+               0);
+    ASSERT_EQ(fclose(header), 0);
+    const char *includes[] = {tmpdir, NULL};
+    const char *src = "#include \"support.hpp\"\n"
+                      "PB_OPEN\n"
+                      "int target(int n) { return n; }\n"
+                      "// Комментарий исходного файла.\n"
+                      "class Owned {\n"
+                      "public:\n"
+                      " int value;\n"
+                      " void run() {\n"
+                      "  INVOKE(target, value);\n"
+                      " }\n"
+                      "};\n"
+                      "PB_CLOSE\n";
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)strlen(src), CBM_LANG_CPP, "t", "main.hpp", 0, NULL, includes);
+    header = cbm_fopen(header_path, "wb");
+    ASSERT_NOT_NULL(header);
+    ASSERT_GTE(fputs("#line 1 \"main.hpp\"\nclass Foreign {};\n", header), 0);
+    ASSERT_EQ(fclose(header), 0);
+    const char *spoof_source = "#include \"support.hpp\"\nclass Own {};\n";
+    CBMFileResult *spoof = cbm_extract_file(spoof_source, (int)strlen(spoof_source), CBM_LANG_CPP,
+                                            "t", "main.hpp", 0, NULL, includes);
+    cbm_unlink(header_path);
+    cbm_rmdir(tmpdir);
+    ASSERT_NOT_NULL(spoof);
+    ASSERT_NULL(spoof->cpp_preprocessed);
+    ASSERT_TRUE(spoof->parse_incomplete);
+    ASSERT_FALSE(has_def_any(spoof, "Foreign"));
+    ASSERT_TRUE(has_def(spoof, "Class", "Own"));
+    cbm_free_result(spoof);
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_FALSE(has_def_any(r, "Foreign"));
+    ASSERT_FALSE(has_def_any(r, "hidden"));
+    ASSERT_FALSE(has_call(r, "foreign_call"));
+    ASSERT_TRUE(has_import(r, "support.hpp"));
+    const CBMDefinition *owned = find_def(r, "Owned");
+    ASSERT_NOT_NULL(owned);
+    ASSERT_STR_EQ(owned->qualified_name, "main.wire.Owned");
+    ASSERT_STR_EQ(owned->file_path, "main.hpp");
+    ASSERT_EQ(owned->start_line, 5u);
+    ASSERT_EQ(owned->end_line, 11u);
+    const CBMDefinition *run = find_def(r, "run");
+    ASSERT_NOT_NULL(run);
+    ASSERT_STR_EQ(run->parent_class, owned->qualified_name);
+    ASSERT_EQ(run->start_line, 8u);
+    ASSERT_EQ(run->end_line, 10u);
+    int cached_len = (int)strlen(src);
+    const char *cached = cbm_file_result_cached_source(r, src, &cached_len);
+    ASSERT_NOT_NULL(cached);
+    ASSERT_TRUE(cached != src);
+    int target_calls = 0;
+    for (int i = 0; i < r->calls.count; ++i) {
+        const CBMCall *call = &r->calls.items[i];
+        ASSERT_EQ(call->source_origin, CBM_SOURCE_ORIGIN_PREPROCESSED);
+        ASSERT_GT(call->site_end_byte, call->site_start_byte);
+        ASSERT_LTE(call->site_end_byte, (uint32_t)cached_len);
+        if (strcmp(call->callee_name, "target") == 0) {
+            ASSERT_EQ(call->start_line, 9);
+            ASSERT_EQ(strncmp(cached + call->site_start_byte, "target", 6), 0);
+            target_calls++;
+        }
+    }
+    ASSERT_GT(target_calls, 0);
+    ASSERT_GT(r->usages.count, 0);
+    for (int i = 0; i < r->usages.count; ++i) {
+        const CBMUsage *usage = &r->usages.items[i];
+        ASSERT_EQ(usage->source_origin, CBM_SOURCE_ORIGIN_PREPROCESSED);
+        ASSERT_GT(usage->site_end_byte, usage->site_start_byte);
+        ASSERT_LTE(usage->site_end_byte, (uint32_t)cached_len);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Без контекста действует прежний режим. Отсутствующий заголовок даёт частичный
+ * основной результат; директива виртуальных строк требует явного резерва,
+ * даже когда её номера случайно попадают внутрь физического файла. */
+TEST(extract_cpp_primary_context_and_unmappable_lines) {
+    const char *plain = "class Plain {};\n";
+    const char *defines[] = {"PICK=1", NULL};
+    CBMFileResult *r =
+        cbm_extract_file(plain, (int)strlen(plain), CBM_LANG_CPP, "t", "plain.hpp", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(r->cpp_preprocessed);
+    ASSERT_TRUE(has_def(r, "Class", "Plain"));
+    cbm_free_result(r);
+    const char *sources[] = {plain, "#include <cbm_nonexistent_header.hpp>\nclass Plain {};\n",
+                             "#line 1\nclass Plain {};\n"};
+    for (int i = 0; i < 3; ++i) {
+        r = cbm_extract_file(sources[i], (int)strlen(sources[i]), CBM_LANG_CPP, "t", "plain.hpp", 0,
+                             defines, NULL);
+        ASSERT_NOT_NULL(r);
+        ASSERT_TRUE(has_def(r, "Class", "Plain"));
+        ASSERT_EQ(r->parse_incomplete, i != 0);
+        ASSERT_EQ(r->cpp_preprocessed != NULL, i != 2);
+        if (i != 0)
+            ASSERT_NOT_NULL(r->error_msg);
+        cbm_free_result(r);
+    }
     PASS();
 }
 
@@ -6331,7 +6562,12 @@ SUITE(extraction) {
     RUN_TEST(complexity_access_depth_and_params);
     RUN_TEST(extract_c_ifdef_split_brace_fn_recovered_issue961);
     RUN_TEST(extract_cpp_preproc_signature_gap_issue946);
-    RUN_TEST(extract_cpp_preproc_macro_generated_callable_skipped_issue949);
+    RUN_TEST(extract_cpp_preproc_macro_generated_callable_mapped_issue949);
+    RUN_TEST(extract_cpp_primary_selects_active_branch);
+    RUN_TEST(extract_cpp_primary_beyond_error_region_limit);
+    RUN_TEST(extract_cpp_primary_empty_and_failed);
+    RUN_TEST(extract_cpp_primary_include_ownership_and_sites);
+    RUN_TEST(extract_cpp_primary_context_and_unmappable_lines);
     RUN_TEST(extract_c_ifdef_split_brace_after_include_remapped_issue949);
     RUN_TEST(extract_c_clean_file_no_recovery_duplicates_issue961);
     RUN_TEST(walk_defs_no_truncation_over_4096_issue668);

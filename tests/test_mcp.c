@@ -2,6 +2,7 @@
  * test_mcp.c — Tests for the MCP server module.
  *
  * Covers: JSON-RPC parsing, MCP protocol, tool dispatch, tool handlers.
+ * Проверка C++-макроразвёртки связывает координаты экстрактора с показом оригинала.
  */
 #include "../src/foundation/compat.h"
 #include <sqlite3.h>
@@ -13,6 +14,7 @@
 #include "../src/mcp/compact_out.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "cbm.h"
 #include <cli/cli.h>
 #include <mcp/index_supervisor.h> /* spawn-count hook — #845 in-process guard */
 #include <mcp/mcp.h>
@@ -9044,6 +9046,55 @@ TEST(snippet_single_line_exact_range) {
     PASS();
 }
 
+/* Координаты подготовленного определения должны показывать исходный вызов
+ * макроса, а не раскрытый класс и не соседнюю строку. Узел берётся из настоящего
+ * экстрактора, а ответ — через штатный обработчик get_code_snippet. */
+TEST(snippet_cpp_primary_shows_original_macro) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    const char *src = "#define MAKE_CLASS(T) class T { public: void run() {} };\n"
+                      "MAKE_CLASS(Message)\n"
+                      "class Neighbor {};\n";
+    char path[512];
+    snprintf(path, sizeof(path), "%s/project/message.hpp", tmp);
+    ASSERT_EQ(th_write_file(path, src), 0);
+    const char *defines[] = {"CONTEXT=1", NULL};
+    cbm_init();
+    CBMFileResult *result = cbm_extract_file(src, (int)strlen(src), CBM_LANG_CPP, "test-project",
+                                             "message.hpp", 0, defines, NULL);
+    ASSERT_NOT_NULL(result);
+    int classes = 0;
+    for (int i = 0; i < result->defs.count; ++i) {
+        const CBMDefinition *def = &result->defs.items[i];
+        if (strcmp(def->label, "Class") != 0 || strcmp(def->name, "Message") != 0)
+            continue;
+        ASSERT_EQ(def->start_line, 2u);
+        ASSERT_EQ(def->end_line, 2u);
+        cbm_node_t node = {.project = "test-project",
+                           .label = def->label,
+                           .name = def->name,
+                           .qualified_name = def->qualified_name,
+                           .file_path = def->file_path,
+                           .start_line = (int)def->start_line,
+                           .end_line = (int)def->end_line};
+        ASSERT_GT(cbm_store_upsert_node(cbm_mcp_server_store(srv), &node), 0);
+        classes++;
+    }
+    ASSERT_EQ(classes, 1);
+    cbm_free_result(result);
+    char *resp = call_snippet(srv, "{\"qualified_name\":\"message.Message\","
+                                   "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_STR_EQ(resp, "qn: message.Message\npath: message.hpp\nlines: 2,2\n\n"
+                        "MAKE_CLASS(Message)\n");
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cbm_unlink(path);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 /* Физически длинная строка может читаться несколькими порциями `fgets`, но
  * остаётся одной строкой диапазона и должна попасть в ответ целиком. */
 TEST(snippet_long_single_line_is_not_partially_read) {
@@ -12562,6 +12613,7 @@ SUITE(mcp) {
     /* Snippet resolution (port of snippet_test.go) */
     RUN_TEST(snippet_exact_qn);
     RUN_TEST(snippet_single_line_exact_range);
+    RUN_TEST(snippet_cpp_primary_shows_original_macro);
     RUN_TEST(snippet_long_single_line_is_not_partially_read);
     RUN_TEST(snippet_qn_suffix);
     RUN_TEST(snippet_unique_short_name);

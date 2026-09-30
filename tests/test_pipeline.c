@@ -3,6 +3,8 @@
  *
  * Tests pipeline lifecycle, structure pass, and end-to-end indexing
  * on a temporary directory with known file layout.
+ * Для C++ также сверяются классы, владельцы методов и вызовы при основном
+ * препроцессинге, параллельном разборе и изменении проектного конфига.
  */
 #include "../src/foundation/compat.h"
 #include "foundation/platform.h" // cbm_normalize_path_sep (drive-canonicalization regression)
@@ -6068,6 +6070,152 @@ TEST(pipeline_project_cpp_preprocessor_config_recovers_class) {
     cbm_store_free_nodes(nodes, node_count);
     cbm_store_close(store);
     cbm_pipeline_free(pipeline);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* Один и тот же контракт графа проверяется после всех маршрутов: активный класс,
+ * исходные диапазоны, владелец метода и межфайловый вызов без копий из include. */
+static int assert_cpp_primary_graph(cbm_store_t *store, const char *project, bool alternate,
+                                    bool extra) {
+    const char *active = alternate ? "Other" : "Message";
+    const char *inactive = alternate ? "Message" : "Other";
+    ASSERT_EQ(named_node_count(store, project, active), 1);
+    ASSERT_EQ(named_node_count(store, project, inactive), 0);
+    ASSERT_EQ(named_node_count(store, project, "Forward"), 0);
+    ASSERT_EQ(named_node_count(store, project, "Foreign"), 1);
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, project, active, &nodes, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    char class_qn[128];
+    snprintf(class_qn, sizeof(class_qn), "message.wire.%s", active);
+    ASSERT_STR_EQ(nodes[0].label, "Class");
+    ASSERT_STR_EQ(nodes[0].qualified_name, class_qn);
+    ASSERT_STR_EQ(nodes[0].file_path, "message.hpp");
+    ASSERT_EQ(nodes[0].start_line, alternate ? 9 : 4);
+    ASSERT_EQ(nodes[0].end_line, alternate ? 12 : 7);
+    cbm_store_free_nodes(nodes, count);
+    nodes = NULL;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, project, "run", &nodes, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    char method_qn[160];
+    snprintf(method_qn, sizeof(method_qn), "%s.run()", class_qn);
+    ASSERT_STR_EQ(nodes[0].label, "Method");
+    ASSERT_STR_EQ(nodes[0].qualified_name, method_qn);
+    ASSERT_STR_EQ(nodes[0].file_path, "message.hpp");
+    ASSERT_EQ(nodes[0].start_line, alternate ? 11 : 6);
+    ASSERT_EQ(nodes[0].end_line, nodes[0].start_line);
+    cbm_store_free_nodes(nodes, count);
+    ASSERT_EQ(named_edge_count(store, project, "DEFINES_METHOD", active, "run"), 1);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "drive", "run"), 1);
+    ASSERT_EQ(named_node_count(store, project, "extra"), 1);
+    ASSERT_EQ(named_edge_count(store, project, "CALLS", "extra", "drive"), extra ? 1 : 0);
+    return 0;
+}
+
+/* Полный последовательный и параллельный проходы, правка исходника и смена
+ * проектных определений должны сходиться с чистым графом. Файлы-заполнители
+ * пересекают штатный порог параллельного режима; окружение восстанавливается
+ * до проверок, чтобы падение теста не меняло режим следующих тестов. */
+TEST(pipeline_cpp_primary_routes_and_config_change) {
+    const char *files[] = {"support.hpp", "message.hpp", "use.cpp", ".codebase-memory.json"};
+    const char *contents[] = {"#pragma once\n"
+                              "#define PB_OPEN namespace wire {\n"
+                              "#define PB_CLOSE }\n"
+                              "#define RETURN_RUN(x) return x.run()\n"
+                              "class Foreign { public: int hidden() { return 4; } };\n",
+                              "#include \"support.hpp\"\n"
+                              "PB_OPEN\n"
+                              "#if PICK\n"
+                              "class Message final {\n"
+                              "public:\n"
+                              " int run() { return 1; }\n"
+                              "};\n"
+                              "#else\n"
+                              "class Other final {\n"
+                              "public:\n"
+                              " int run() { return 2; }\n"
+                              "};\n"
+                              "#endif\n"
+                              "class Forward;\n"
+                              "PB_CLOSE\n",
+                              "#include \"message.hpp\"\n"
+                              "int drive() {\n"
+                              "#if PICK\n"
+                              " wire::Message value;\n"
+                              "#else\n"
+                              " wire::Other value;\n"
+                              "#endif\n"
+                              " RETURN_RUN(value);\n"
+                              "}\n",
+                              "{\"cpp\":{\"defines\":[\"PICK=1\"],\"include_paths\":[\".\"]}}\n"};
+    ASSERT_EQ(setup_lang_repo(files, contents, 4), 0);
+    ASSERT_EQ(th_append_file(TH_PATH(g_lang_tmpdir, "use.cpp"), "int extra() { return 0; }\n"), 0);
+    for (int i = 0; i < 50; ++i) {
+        char name[64], body[128];
+        snprintf(name, sizeof(name), "pad_%02d.cpp", i);
+        snprintf(body, sizeof(body), "int pad_%02d() { return %d; }\n", i, i);
+        ASSERT_EQ(th_write_file(TH_PATH(g_lang_tmpdir, name), body), 0);
+    }
+    const char *db_names[] = {"sequential.db", "parallel.db", "sequential.db", "sequential.db",
+                              "fresh.db"};
+    for (int phase = 0; phase < 5; ++phase) {
+        if (phase == 2) {
+            // Новое имя заставляет движок выбрать полный пересчёт; здесь нужно
+            // проверить изменение только тела и появление связи к уже известной функции.
+            ASSERT_EQ(th_write_file(TH_PATH(g_lang_tmpdir, "use.cpp"), contents[2]), 0);
+            ASSERT_EQ(th_append_file(TH_PATH(g_lang_tmpdir, "use.cpp"),
+                                     "int extra() { return drive(); }\n"),
+                      0);
+        } else if (phase == 3) {
+            ASSERT_EQ(th_write_file(TH_PATH(g_lang_tmpdir, ".codebase-memory.json"),
+                                    "{\"cpp\":{\"defines\":[\"PICK=0\"],"
+                                    "\"include_paths\":[\".\"]}}\n"),
+                      0);
+        }
+        char db[512];
+        snprintf(db, sizeof(db), "%s/%s", g_lang_tmpdir, db_names[phase]);
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(pipeline);
+        const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+        const char *old_workers = getenv("CBM_WORKERS");
+        char *saved_single = old_single ? strdup(old_single) : NULL;
+        char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+        if (phase == 1 || phase == 4) {
+            cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+            cbm_setenv("CBM_WORKERS", "2", 1);
+        } else {
+            cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+        }
+        cbm_pipeline_incremental_test_reset_faults();
+        int rc = cbm_pipeline_run(pipeline);
+        cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+        if (saved_single) {
+            cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        } else {
+            cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+        }
+        if (saved_workers) {
+            cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+        free(saved_single);
+        free(saved_workers);
+        ASSERT_EQ(rc, 0);
+        if (phase == 2)
+            ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+        if (phase == 3)
+            ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+        cbm_store_t *store = cbm_store_open_path(db);
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(assert_cpp_primary_graph(store, cbm_pipeline_project_name(pipeline), phase >= 3,
+                                           phase >= 2),
+                  0);
+        cbm_store_close(store);
+        cbm_pipeline_free(pipeline);
+    }
     teardown_lang_repo();
     PASS();
 }
@@ -12484,6 +12632,7 @@ SUITE(pipeline) {
     /* Language integration tests */
     RUN_TEST(pipeline_cpp_forward_declarations_use_definition_qn);
     RUN_TEST(pipeline_project_cpp_preprocessor_config_recovers_class);
+    RUN_TEST(pipeline_cpp_primary_routes_and_config_change);
     RUN_TEST(pipeline_python_project);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);

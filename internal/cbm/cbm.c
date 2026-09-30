@@ -1,3 +1,7 @@
+/* Извлечение символов и связей с владением деревом и его исходным буфером.
+ * Явный C++-контекст выбирает основной препроцессированный разбор; оригинал
+ * сохраняет координаты и метаданные директив. C/CUDA и режим без контекста
+ * используют прежний дополнительный проход. Ошибки не означают пустой успех. */
 #include "cbm.h"
 #include "arena.h" // CBMArena, cbm_arena_init/alloc/strdup/destroy
 #include "helpers.h"
@@ -1024,6 +1028,42 @@ static bool cbm_remap_preprocessed_def(CBMDefinition *def, const CBMPreprocessed
     return true;
 }
 
+/* Переводит границы основного C++-представления в оригинал. Служебные #line
+ * внутри определения допустимы: они не должны лишать класс права на извлечение.
+ * Не создаёт диапазон, если его происхождение или порядок установить нельзя. */
+static bool cbm_primary_original_range(const CBMPreprocessedSource *pp, uint32_t *start,
+                                       uint32_t *end) {
+    if (!pp || !start || !end || !*start || *end < *start ||
+        *end > (uint32_t)pp->expanded_line_count)
+        return false;
+    uint32_t first = *start;
+    uint32_t last = *end;
+    while (first <= last &&
+           (!pp->belongs_to_main_file[first] || !pp->original_line_by_expanded_line[first]))
+        ++first;
+    while (last >= first &&
+           (!pp->belongs_to_main_file[last] || !pp->original_line_by_expanded_line[last]))
+        --last;
+    if (first > last)
+        return false;
+    uint32_t original_first = pp->original_line_by_expanded_line[first];
+    uint32_t original_last = pp->original_line_by_expanded_line[last];
+    if (original_last < original_first)
+        return false;
+    *start = original_first;
+    *end = original_last;
+    return true;
+}
+
+/* Число исходных строк использует ту же нумерацию с единицы, что tree-sitter. */
+static uint32_t cbm_source_line_count(const char *source, int source_len) {
+    uint32_t lines = 1;
+    for (int i = 0; i < source_len; ++i)
+        if (source[i] == '\n')
+            ++lines;
+    return lines;
+}
+
 static void cbm_subtract_recovered_regions(cbm_error_regions_t *regs, const CBMDefArray *defs) {
     int kept = 0;
     for (int i = 0; i < regs->count; i++) {
@@ -1162,11 +1202,16 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
     return r;
 }
 
-CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLanguage language,
-                                   const char *project, const char *rel_path,
-                                   int64_t timeout_micros, const char **extra_defines,
-                                   const char **include_paths, const CBMMacroTable *macro_table,
-                                   const CBMReturnTypeTable *return_type_table) {
+/* Разбирает ровно выбранное представление. При primary дерево и все точные
+ * позиции относятся к подготовленному буферу; перевод строк выполняет внешний
+ * слой после расчёта метрик. Владение primary принимает только созданный result. */
+static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
+                                            CBMLanguage language, const char *project,
+                                            const char *rel_path, int64_t timeout_micros,
+                                            const char **extra_defines, const char **include_paths,
+                                            const CBMMacroTable *macro_table,
+                                            const CBMReturnTypeTable *return_type_table,
+                                            CBMPreprocessedSource *primary, bool cpp_context) {
     // Allocate result on heap (arena inside for all string data)
     enum { SINGLE = 1 };
     CBMFileResult *result = (CBMFileResult *)calloc(SINGLE, sizeof(CBMFileResult));
@@ -1175,6 +1220,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
     }
 
     cbm_arena_init(&result->arena);
+    result->cpp_preprocessed = primary;
     CBMArena *a = &result->arena;
 
     /* Crash-quarantine hard guard (Stage 3c): a file the supervisor pinned as a
@@ -1301,6 +1347,12 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         cbm_extract_imports(&ctx);
     }
     cbm_extract_unified(&ctx);
+    if (primary) {
+        for (int i = 0; i < result->calls.count; ++i)
+            result->calls.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+        for (int i = 0; i < result->usages.count; ++i)
+            result->usages.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+    }
 
     // Channel detection (Socket.IO / EventEmitter) — JS/TS only.
     cbm_extract_channels(&ctx);
@@ -1319,7 +1371,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         }
         if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
             cbm_run_c_lsp(a, result, source, source_len, root, language != CBM_LANG_C,
-                          CBM_SOURCE_ORIGIN_RAW);
+                          primary ? CBM_SOURCE_ORIGIN_PREPROCESSED : CBM_SOURCE_ORIGIN_RAW);
         }
         if (language == CBM_LANG_PHP) {
             cbm_run_php_lsp(a, result, source, source_len, root);
@@ -1364,15 +1416,15 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
     }
     atomic_fetch_add(&total_lsp_ns, now_ns() - lsp_start);
 
-    // Calls extracted so far all carry ORIGINAL-source line numbers; the C/C++
-    // preprocessor second pass below appends calls with EXPANDED-source lines,
-    // which must not be used for the def line-range attribution of the bottleneck
-    // metrics. Remember the boundary.
+    // Вызовы и определения пока используют строки выбранного представления.
+    // Дополнительные вызовы старого резервного прохода имеют другую карту строк
+    // и не участвуют в расчёте метрик по диапазонам определений.
     int orig_calls_count = result->calls.count;
 
-    // Second pass: preprocess C/C++/CUDA and extract additional macro-hidden calls.
-    // Defs keep original-source line numbers; only CALLS are extracted from expanded source.
-    if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
+    // Совместимый резервный проход C/CUDA и C++ без заданного контекста:
+    // раскрытые вызовы и ограниченное восстановление определений по ошибкам оригинала.
+    if (language == CBM_LANG_C || (language == CBM_LANG_CPP && !cpp_context) ||
+        language == CBM_LANG_CUDA) {
         uint64_t pp_start = now_ns();
         CBMPreprocessedSource *preprocessed = cbm_preprocess_with_map(
             source, source_len, rel_path, extra_defines, include_paths, language != CBM_LANG_C);
@@ -1620,6 +1672,17 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         /* #1071: don't flag a benign function-like-macro call (defined in-file)
          * that tree-sitter can't parse without the preprocessor. */
         cbm_subtract_macro_invocation_regions(&regs, &result->defs, source, source_len);
+        if (primary) {
+            int kept = 0;
+            for (int i = 0; i < regs.count; ++i) {
+                uint32_t start = regs.starts[i], end = regs.ends[i];
+                if (cbm_primary_original_range(primary, &start, &end)) {
+                    regs.starts[kept] = start;
+                    regs.ends[kept++] = end;
+                }
+            }
+            regs.count = kept;
+        }
         if (regs.count > 0) {
             result->parse_incomplete = true;
             result->error_region_count = regs.count;
@@ -1641,6 +1704,164 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
     return result;
 }
 
+/* Сведения о директивах принадлежат оригиналу, а не развёрнутому C++-коду:
+ * include-связи и Macro описывают написанный исходник. Остальные определения
+ * отсюда не добавляются. Docstring возвращается только при совпадении имени и
+ * исходной строки. Все строки копируются экстракторами в общую арену result. */
+static bool cbm_cpp_original_metadata(CBMFileResult *result, const char *source, int source_len,
+                                      const char *project, const char *rel_path,
+                                      int64_t timeout_micros) {
+    TSParser *parser = get_thread_parser(cbm_ts_language(CBM_LANG_CPP), CBM_LANG_CPP);
+    if (!parser)
+        return false;
+    ts_parser_reset(parser);
+    CBMStringInput input = {source, (uint32_t)source_len};
+    TSInput ts_input = {&input, cbm_string_read, TSInputEncodingUTF8, NULL};
+    TSParseOptions options = {0};
+    uint64_t deadline = 0;
+    if (timeout_micros > 0) {
+        deadline = now_ns() + (uint64_t)timeout_micros * USEC_TO_NSEC;
+        options.payload = &deadline;
+        options.progress_callback = cbm_timeout_cb;
+    }
+    TSTree *tree = ts_parser_parse_with_options(parser, NULL, ts_input, options);
+    if (!tree)
+        return false;
+    CBMFileResult original = {.is_test_file = result->is_test_file};
+    CBMExtractCtx ctx = {.arena = &result->arena,
+                         .result = &original,
+                         .source = source,
+                         .source_len = source_len,
+                         .language = CBM_LANG_CPP,
+                         .project = project,
+                         .rel_path = rel_path,
+                         .module_qn = result->module_qn,
+                         .root = ts_tree_root_node(tree)};
+    cbm_extract_imports(&ctx);
+    cbm_extract_definitions(&ctx);
+    result->imports = original.imports;
+    result->imports_count = original.imports.count;
+    // Индекс комментариев исключает квадратичный поиск по большому заголовку.
+    // Ключи и значения живут в арене результата, таблица — только до конца копирования.
+    CBMHashTable *docs = cbm_ht_create((uint32_t)original.defs.count);
+    if (docs) {
+        for (int i = 0; i < original.defs.count; ++i) {
+            const CBMDefinition *def = &original.defs.items[i];
+            if (def->docstring && def->name) {
+                const char *key =
+                    cbm_arena_sprintf(&result->arena, "%u:%s", def->start_line, def->name);
+                if (key)
+                    cbm_ht_set(docs, key, (void *)def->docstring);
+            }
+        }
+        for (int i = 0; i < result->defs.count; ++i) {
+            CBMDefinition *def = &result->defs.items[i];
+            if (!def->name)
+                continue;
+            const char *key =
+                cbm_arena_sprintf(&result->arena, "%u:%s", def->start_line, def->name);
+            const char *doc = key ? cbm_ht_get(docs, key) : NULL;
+            if (doc)
+                def->docstring = doc;
+        }
+        cbm_ht_free(docs);
+    }
+    for (int i = 0; i < original.defs.count; ++i) {
+        const CBMDefinition *def = &original.defs.items[i];
+        if (def->label && strcmp(def->label, "Macro") == 0) {
+            cbm_defs_push(&result->defs, &result->arena, *def);
+        }
+    }
+    ts_tree_delete(tree);
+    return true;
+}
+
+/* Явный C++-контекст выбирает основной проход. Неполные заголовки допускают
+ * частичное извлечение с сигналом покрытия; фатальная ошибка оставляет оригинал
+ * как резерв. Ни один успешно подготовленный символ не отбирается по ошибкам
+ * оригинала. Пустой успешный результат не запускает восстановление отключённого кода. */
+CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLanguage language,
+                                   const char *project, const char *rel_path,
+                                   int64_t timeout_micros, const char **extra_defines,
+                                   const char **include_paths, const CBMMacroTable *macro_table,
+                                   const CBMReturnTypeTable *return_type_table) {
+    bool cpp_context = language == CBM_LANG_CPP &&
+                       ((extra_defines && extra_defines[0]) || (include_paths && include_paths[0]));
+    if (!cpp_context || cbm_index_is_quarantined(rel_path)) {
+        return cbm_extract_file_impl(source, source_len, language, project, rel_path,
+                                     timeout_micros, extra_defines, include_paths, macro_table,
+                                     return_type_table, NULL, false);
+    }
+    cbm_index_mark_start(rel_path);
+    CBMPreprocessStatus status;
+    uint64_t pp_start = now_ns();
+    CBMPreprocessedSource *pp =
+        cbm_preprocess_cpp(source, source_len, rel_path, extra_defines, include_paths, &status);
+    atomic_fetch_add(&total_preprocess_ns, now_ns() - pp_start);
+    if (pp)
+        atomic_fetch_add(&total_files_preprocessed, 1);
+    CBMFileResult *result = cbm_extract_file_impl(
+        pp ? pp->source : source, pp ? pp->source_len : source_len, language, project, rel_path,
+        timeout_micros, extra_defines, include_paths, macro_table, return_type_table, pp, true);
+    if (!result) {
+        cbm_preprocessed_source_free(pp);
+        cbm_index_mark_done(rel_path);
+        return NULL;
+    }
+    if (result->has_error || !result->cached_tree)
+        return result;
+    uint32_t original_lines = cbm_source_line_count(source, source_len);
+    bool metadata_ok = true;
+    if (pp) {
+        int kept = 0;
+        for (int i = 0; i < result->defs.count; ++i) {
+            CBMDefinition def = result->defs.items[i];
+            if (def.label && strcmp(def.label, "Module") == 0) {
+                def.start_line = 1;
+                def.end_line = original_lines;
+            } else if (!cbm_primary_original_range(pp, &def.start_line, &def.end_line)) {
+                continue;
+            }
+            def.lines = (int)(def.end_line - def.start_line + 1);
+            result->defs.items[kept++] = def;
+        }
+        result->defs.count = kept;
+        for (int i = 0; i < result->calls.count; ++i) {
+            CBMCall *call = &result->calls.items[i];
+            uint32_t start = call->start_line > 0 ? (uint32_t)call->start_line : 0;
+            uint32_t end = start;
+            call->start_line = cbm_primary_original_range(pp, &start, &end) ? (int)start : 0;
+        }
+        cbm_index_mark_start(rel_path);
+        metadata_ok = cbm_cpp_original_metadata(result, source, source_len, project, rel_path,
+                                                timeout_micros);
+        cbm_index_mark_done(rel_path);
+    }
+    if (status == CBM_PREPROCESS_FAILED || (pp && pp->missing_headers) || !metadata_ok) {
+        result->parse_incomplete = true;
+        result->error_region_count = 1;
+        result->error_ranges = cbm_arena_sprintf(&result->arena, "1-%u", original_lines);
+        result->error_msg = cbm_arena_strdup(
+            &result->arena, status == CBM_PREPROCESS_FAILED
+                                ? "C++ preprocessing failed; using raw source"
+                            : !metadata_ok ? "C++ raw directive metadata unavailable"
+                                           : "C++ preprocessing: missing include headers");
+    }
+    return result;
+}
+
+// Связывает сохранённое дерево с правильным буфером без копирования исходника.
+const char *cbm_file_result_cached_source(const CBMFileResult *result, const char *source,
+                                          int *source_len) {
+    if (result && result->cpp_preprocessed) {
+        *source_len = result->cpp_preprocessed->source_len;
+        return result->cpp_preprocessed->source;
+    }
+    return source;
+}
+
+// Освобождает дерево, дочерние результаты, подготовленный C++-буфер и арену.
+// NULL допустим; заимствованные потребителями указатели после вызова недействительны.
 void cbm_free_result(CBMFileResult *result) {
     if (!result) {
         return;
@@ -1655,6 +1876,7 @@ void cbm_free_result(CBMFileResult *result) {
     free(result->owned_results);
     result->owned_results = NULL;
     result->owned_result_count = 0;
+    cbm_preprocessed_source_free(result->cpp_preprocessed);
     cbm_arena_destroy(&result->arena);
     free(result);
 }
